@@ -6,17 +6,19 @@ import time
 import urllib.request
 import gradio as gr
 
-try:
-    import spaces  # noqa: F401
-except ImportError:
-    spaces = None
+os.environ["GRADIO_SSR_MODE"] = "false"
 
 RELEASE_BASE = os.environ.get(
     "FALKEAI_RELEASE_BASE",
     "https://github.com/komfalcon/falkeai-bot/releases/download/latest",
 )
 
-bot_status = {"state": "Starting...", "started_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}
+bot_status = {
+    "state": "Starting...",
+    "started_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+}
+_started = False
+_lock = threading.Lock()
 
 
 def log(line: str):
@@ -32,7 +34,9 @@ def log(line: str):
 def download_binary(name: str):
     url = f"{RELEASE_BASE}/{name}"
     log(f"[launcher] Downloading {name} from {url} ...")
-    urllib.request.urlretrieve(url, name)
+    req = urllib.request.Request(url, headers={"User-Agent": "FalkeAI-Launcher/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(name, "wb") as out:
+        out.write(resp.read())
     st = os.stat(name)
     os.chmod(name, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     log(f"[launcher] {name} ready ({st.st_size} bytes).")
@@ -41,9 +45,9 @@ def download_binary(name: str):
 def supervisor_loop():
     while True:
         try:
-            if not os.path.exists("wa-bridge"):
+            if not os.path.exists("wa-bridge") or os.path.getsize("wa-bridge") < 1024:
                 download_binary("wa-bridge")
-            if not os.path.exists("falkeai-core"):
+            if not os.path.exists("falkeai-core") or os.path.getsize("falkeai-core") < 1024:
                 download_binary("falkeai-core")
 
             env = os.environ.copy()
@@ -65,16 +69,22 @@ def supervisor_loop():
             bot_status["state"] = f"Restarting (exit {proc.returncode})..."
             log(f"[launcher] falkeai-core exited with code {proc.returncode}. Restarting in 5s...")
         except Exception as exc:
-            bot_status["state"] = "Waiting for GitHub Release binaries..."
-            log(f"[launcher] Error: {exc}. Retrying in 10s...")
-            time.sleep(5)
+            bot_status["state"] = f"Waiting for GitHub Release binaries ({exc})..."
+            log(f"[launcher] Waiting for binaries ({exc}). Retrying in 15s...")
+            time.sleep(10)
         time.sleep(5)
 
 
-threading.Thread(target=supervisor_loop, daemon=True).start()
+def ensure_supervisor():
+    global _started
+    with _lock:
+        if not _started:
+            _started = True
+            threading.Thread(target=supervisor_loop, daemon=True).start()
 
 
 def get_status():
+    ensure_supervisor()
     return f"Status: {bot_status['state']}\nInstance Booted: {bot_status['started_at']}"
 
 
@@ -89,4 +99,5 @@ with gr.Blocks(title="FalkeAI — Personal Symbiotic Agent") as demo:
     refresh_btn.click(fn=get_status, outputs=status_box)
 
 if __name__ == "__main__":
-    demo.launch()
+    ensure_supervisor()
+    demo.launch(ssr_mode=False)
