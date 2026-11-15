@@ -98,9 +98,6 @@ func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string) {
 		if ext.GetMatchedText() != "" {
 			urls = append(urls, ext.GetMatchedText())
 		}
-		if ext.GetCanonicalURL() != "" {
-			urls = append(urls, ext.GetCanonicalURL())
-		}
 		return strings.TrimSpace(ext.GetText()), false, urls
 	}
 	if img := msg.GetImageMessage(); img != nil {
