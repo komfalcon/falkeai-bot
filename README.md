@@ -1,3 +1,12 @@
+---
+title: FalkeAI Bot
+emoji: 🦅
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8080
+---
+
 # Aurikrex WhatsApp Bot — FalkeAI (Rust Core + Go `whatsmeow` Bridge + Turso)
 
 **FalkeAI** is Falcon's personal AI assistant, digital representative, and Aurikrex Learning Systems assistant on WhatsApp, built on a low-memory (~30–40 MB RAM) **Rust + Go Hybrid** architecture with zero Node.js:
