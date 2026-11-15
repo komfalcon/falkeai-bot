@@ -4,31 +4,38 @@ import subprocess
 import threading
 import time
 import urllib.request
-from collections import deque
 import gradio as gr
+
+try:
+    import spaces  # noqa: F401
+except ImportError:
+    spaces = None
 
 RELEASE_BASE = os.environ.get(
     "FALKEAI_RELEASE_BASE",
     "https://github.com/komfalcon/falkeai-bot/releases/download/latest",
 )
 
-log_buffer = deque(maxlen=200)
+bot_status = {"state": "Starting...", "started_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}
 
 
-def append_log(line: str):
+def log(line: str):
     text = line.rstrip()
     if text:
         print(text, flush=True)
-        log_buffer.append(text)
+        if "WhatsApp connected" in text:
+            bot_status["state"] = "Connected & Active (24/7)"
+        elif "PAIRING CODE:" in text:
+            bot_status["state"] = "Waiting for WhatsApp Pairing Code (Check Space 'Logs' tab at the top)"
 
 
 def download_binary(name: str):
     url = f"{RELEASE_BASE}/{name}"
-    append_log(f"[launcher] Downloading {name} from {url} ...")
+    log(f"[launcher] Downloading {name} from {url} ...")
     urllib.request.urlretrieve(url, name)
     st = os.stat(name)
     os.chmod(name, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    append_log(f"[launcher] {name} ready ({st.st_size} bytes).")
+    log(f"[launcher] {name} ready ({st.st_size} bytes).")
 
 
 def supervisor_loop():
@@ -43,7 +50,7 @@ def supervisor_loop():
             env["WA_BRIDGE_BIN"] = "./wa-bridge"
             env["PORT"] = "0"
 
-            append_log("[launcher] Starting FalkeAI Rust Core (./falkeai-core)...")
+            log("[launcher] Starting FalkeAI Rust Core (./falkeai-core)...")
             proc = subprocess.Popen(
                 ["./falkeai-core"],
                 stdout=subprocess.PIPE,
@@ -53,11 +60,13 @@ def supervisor_loop():
                 env=env,
             )
             for line in proc.stdout:
-                append_log(line)
+                log(line)
             proc.wait()
-            append_log(f"[launcher] falkeai-core exited with code {proc.returncode}. Restarting in 5s...")
+            bot_status["state"] = f"Restarting (exit {proc.returncode})..."
+            log(f"[launcher] falkeai-core exited with code {proc.returncode}. Restarting in 5s...")
         except Exception as exc:
-            append_log(f"[launcher] Error: {exc}. Retrying in 10s...")
+            bot_status["state"] = "Waiting for GitHub Release binaries..."
+            log(f"[launcher] Error: {exc}. Retrying in 10s...")
             time.sleep(5)
         time.sleep(5)
 
@@ -65,18 +74,19 @@ def supervisor_loop():
 threading.Thread(target=supervisor_loop, daemon=True).start()
 
 
-def get_logs():
-    return "\n".join(log_buffer) if log_buffer else "Starting FalkeAI..."
+def get_status():
+    return f"Status: {bot_status['state']}\nInstance Booted: {bot_status['started_at']}"
 
 
 with gr.Blocks(title="FalkeAI — Personal Symbiotic Agent") as demo:
     gr.Markdown(
         "# 🦅 FalkeAI — Falcon's Personal Symbiotic Agent\n"
-        "Running **Rust Core (`falkeai-core`) + Go `whatsmeow` Bridge (`wa-bridge`) + Turso**."
+        "Powered by **Rust Core (`falkeai-core`) + Go `whatsmeow` Bridge (`wa-bridge`) + Turso + Cloudflare Workers AI**.\n\n"
+        "> **Owner Note:** Open the **Logs** button at the top of this Space to view your 8-character WhatsApp Pairing Code."
     )
-    refresh_btn = gr.Button("Refresh Live Logs / Pairing Code")
-    logs_box = gr.Textbox(label="Live Logs", value=get_logs, lines=22, interactive=False)
-    refresh_btn.click(fn=get_logs, outputs=logs_box)
+    status_box = gr.Textbox(label="System Status", value=get_status, lines=3, interactive=False)
+    refresh_btn = gr.Button("Refresh Status")
+    refresh_btn.click(fn=get_status, outputs=status_box)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")))
+    demo.launch()
