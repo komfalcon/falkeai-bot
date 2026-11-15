@@ -1,0 +1,399 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+)
+
+var stdoutMu sync.Mutex
+var botReadMu sync.Mutex
+var botMarkedReadChats = make(map[string]time.Time)
+var botMarkedReadMsgs = make(map[string]time.Time)
+
+func recordBotMarkRead(chatJID string, msgID string) {
+	botReadMu.Lock()
+	defer botReadMu.Unlock()
+	now := time.Now()
+	if chatJID != "" {
+		botMarkedReadChats[chatJID] = now
+	}
+	if msgID != "" {
+		botMarkedReadMsgs[msgID] = now
+	}
+	for k, t := range botMarkedReadChats {
+		if now.Sub(t) > 30*time.Second {
+			delete(botMarkedReadChats, k)
+		}
+	}
+	for k, t := range botMarkedReadMsgs {
+		if now.Sub(t) > 30*time.Second {
+			delete(botMarkedReadMsgs, k)
+		}
+	}
+}
+
+func wasMarkedReadByBot(chatJID string, msgIDs []types.MessageID) bool {
+	botReadMu.Lock()
+	defer botReadMu.Unlock()
+	now := time.Now()
+	if t, ok := botMarkedReadChats[chatJID]; ok && now.Sub(t) < 10*time.Second {
+		return true
+	}
+	for _, id := range msgIDs {
+		if t, ok := botMarkedReadMsgs[string(id)]; ok && now.Sub(t) < 15*time.Second {
+			return true
+		}
+	}
+	return false
+}
+
+func emit(payload map[string]any) {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	os.Stdout.Write(append(b, '\n'))
+}
+
+type BridgeCommand struct {
+	Cmd            string   `json:"cmd"`
+	ChatJID        string   `json:"chat_jid"`
+	GroupJID       string   `json:"group_jid"`
+	ParticipantJID string   `json:"participant_jid"`
+	SenderJID      string   `json:"sender_jid"`
+	MessageID      string   `json:"message_id"`
+	RequestID      string   `json:"request_id"`
+	Text           string   `json:"text"`
+	State          string   `json:"state"`
+	Mentions       []string `json:"mentions"`
+}
+
+func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string) {
+	if msg == nil {
+		return "", false, nil
+	}
+	var urls []string
+	if msg.GetConversation() != "" {
+		return strings.TrimSpace(msg.GetConversation()), false, urls
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		if ext.GetMatchedText() != "" {
+			urls = append(urls, ext.GetMatchedText())
+		}
+		if ext.GetCanonicalURL() != "" {
+			urls = append(urls, ext.GetCanonicalURL())
+		}
+		return strings.TrimSpace(ext.GetText()), false, urls
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return strings.TrimSpace(img.GetCaption()), false, urls
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return strings.TrimSpace(vid.GetCaption()), false, urls
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return strings.TrimSpace(doc.GetCaption()), false, urls
+	}
+	if msg.GetAudioMessage() != nil {
+		return "", true, urls
+	}
+	return "", false, urls
+}
+
+func main() {
+	ctx := context.Background()
+	dbPath := os.Getenv("WA_SESSION_DB")
+	if dbPath == "" {
+		dbPath = "file:wa_session.db?_foreign_keys=on"
+	}
+
+	container, err := sqlstore.New(ctx, "sqlite3", dbPath, waLog.Noop)
+	if err != nil {
+		emit(map[string]any{"event": "error", "message": "sqlstore init failed: " + err.Error()})
+		os.Exit(1)
+	}
+
+	deviceStore, err := container.GetFirstDevice(ctx)
+	if err != nil {
+		emit(map[string]any{"event": "error", "message": "get device failed: " + err.Error()})
+		os.Exit(1)
+	}
+
+	client := whatsmeow.NewClient(deviceStore, waLog.Noop)
+
+	client.AddEventHandler(func(evt any) {
+		switch v := evt.(type) {
+		case *events.Connected:
+			selfJID := ""
+			selfLID := ""
+			if client.Store.ID != nil {
+				selfJID = client.Store.ID.ToNonAD().String()
+			}
+			if !client.Store.LID.IsEmpty() {
+				selfLID = client.Store.LID.ToNonAD().String()
+			}
+			emit(map[string]any{
+				"event":    "connected",
+				"self_jid": selfJID,
+				"self_lid": selfLID,
+			})
+			// Sync saved contacts from whatsmeow store
+			if contacts, err := client.Store.Contacts.GetAllContacts(ctx); err == nil {
+				list := make([]map[string]any, 0, len(contacts))
+				for jid, info := range contacts {
+					name := strings.TrimSpace(info.FullName)
+					if name == "" {
+						name = strings.TrimSpace(info.FirstName)
+					}
+					if name != "" {
+						list = append(list, map[string]any{
+							"jid":  jid.String(),
+							"name": name,
+						})
+					}
+				}
+				if len(list) > 0 {
+					emit(map[string]any{
+						"event":    "contacts_sync",
+						"contacts": list,
+					})
+				}
+			}
+
+		case *events.Message:
+			text, isVoice, matchedURLs := extractTextAndURLs(v.Message)
+			senderAlt := ""
+			if !v.Info.SenderAlt.IsEmpty() {
+				senderAlt = v.Info.SenderAlt.ToNonAD().String()
+			}
+			emit(map[string]any{
+				"event":          "message",
+				"id":             v.Info.ID,
+				"chat_jid":       v.Info.Chat.ToNonAD().String(),
+				"chat_alt_jid":   nil,
+				"sender_jid":     v.Info.Sender.ToNonAD().String(),
+				"sender_alt_jid": senderAlt,
+				"from_me":        v.Info.IsFromMe,
+				"is_group":       v.Info.IsGroup,
+				"timestamp":      v.Info.Timestamp.Unix(),
+				"text":           text,
+				"is_voice":       isVoice,
+				"matched_urls":   matchedURLs,
+			})
+
+		case *events.GroupInfo:
+			emit(map[string]any{
+				"event":     "group_invalidate",
+				"group_jid": v.JID.ToNonAD().String(),
+			})
+
+		case *events.Receipt:
+			if !v.IsGroup && (v.Type == types.ReceiptTypeReadSelf || (v.Type == types.ReceiptTypeRead && v.IsFromMe)) {
+				chatJID := v.Chat.ToNonAD().String()
+				if chatJID != "" && !wasMarkedReadByBot(chatJID, v.MessageIDs) {
+					emit(map[string]any{
+						"event":        "chat_read_by_owner",
+						"chat_jid":     chatJID,
+						"chat_alt_jid": nil,
+					})
+				}
+			}
+
+		case *events.MarkChatAsRead:
+			if v.Action != nil && v.Action.GetRead() {
+				chatJID := v.JID.ToNonAD().String()
+				if chatJID != "" && !strings.HasSuffix(chatJID, "@g.us") && !wasMarkedReadByBot(chatJID, nil) {
+					emit(map[string]any{
+						"event":        "chat_read_by_owner",
+						"chat_jid":     chatJID,
+						"chat_alt_jid": nil,
+					})
+				}
+			}
+
+		case *events.LoggedOut:
+			emit(map[string]any{"event": "logged_out"})
+			os.Exit(1)
+		}
+	})
+
+	if err := client.Connect(); err != nil {
+		emit(map[string]any{"event": "error", "message": "connect failed: " + err.Error()})
+		os.Exit(1)
+	}
+
+	if client.Store.ID == nil {
+		pairPhone := strings.TrimSpace(os.Getenv("PAIR_PHONE"))
+		if pairPhone != "" {
+			go func() {
+				time.Sleep(2 * time.Second)
+				code, err := client.PairPhone(ctx, pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+				if err != nil {
+					emit(map[string]any{"event": "error", "message": "pair code failed: " + err.Error()})
+					return
+				}
+				emit(map[string]any{"event": "pairing_code", "code": code})
+			}()
+		} else {
+			emit(map[string]any{"event": "error", "message": "Not linked yet. Set PAIR_PHONE and restart."})
+		}
+	}
+
+	// Read commands from Rust Core over stdin
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 1024*64), 1024*1024)
+		for scanner.Scan() {
+			var cmd BridgeCommand
+			if err := json.Unmarshal(scanner.Bytes(), &cmd); err != nil {
+				continue
+			}
+			handleCommand(ctx, client, cmd)
+		}
+		os.Exit(0)
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
+	client.Disconnect()
+}
+
+func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeCommand) {
+	switch cmd.Cmd {
+	case "send_message":
+		chatJID, err := types.ParseJID(cmd.ChatJID)
+		if err != nil {
+			return
+		}
+		msg := &waE2E.Message{Conversation: proto.String(cmd.Text)}
+		if len(cmd.Mentions) > 0 {
+			msg = &waE2E.Message{
+				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+					Text: proto.String(cmd.Text),
+					ContextInfo: &waE2E.ContextInfo{
+						MentionedJID: cmd.Mentions,
+					},
+				},
+			}
+		}
+		_, _ = client.SendMessage(ctx, chatJID, msg)
+
+	case "send_presence":
+		chatJID, err := types.ParseJID(cmd.ChatJID)
+		if err != nil {
+			return
+		}
+		state := types.ChatPresenceComposing
+		if cmd.State == "paused" {
+			state = types.ChatPresencePaused
+		}
+		_ = client.SendChatPresence(chatJID, state, types.ChatPresenceMediaText)
+
+	case "mark_read":
+		chatJID, err := types.ParseJID(cmd.ChatJID)
+		if err != nil {
+			return
+		}
+		recordBotMarkRead(chatJID.ToNonAD().String(), cmd.MessageID)
+		var senderJID types.JID
+		if cmd.SenderJID != "" {
+			senderJID, _ = types.ParseJID(cmd.SenderJID)
+		}
+		_ = client.MarkRead([]types.MessageID{cmd.MessageID}, time.Now(), chatJID, senderJID)
+
+	case "delete_message":
+		groupJID, err1 := types.ParseJID(cmd.GroupJID)
+		senderJID, err2 := types.ParseJID(cmd.SenderJID)
+		if err1 != nil || err2 != nil {
+			return
+		}
+		revokeMsg := client.BuildRevoke(groupJID, senderJID, cmd.MessageID)
+		_, _ = client.SendMessage(ctx, groupJID, revokeMsg)
+
+	case "remove_participant":
+		groupJID, err1 := types.ParseJID(cmd.GroupJID)
+		partJID, err2 := types.ParseJID(cmd.ParticipantJID)
+		if err1 != nil || err2 != nil {
+			return
+		}
+		_, _ = client.UpdateGroupParticipants(groupJID, []types.JID{partJID}, whatsmeow.ParticipantChangeRemove)
+
+	case "fetch_group_roster":
+		groupJID, err := types.ParseJID(cmd.GroupJID)
+		if err != nil {
+			return
+		}
+		info, err := client.GetGroupInfo(groupJID)
+		if err != nil {
+			emit(map[string]any{"event": "error", "message": "GetGroupInfo failed: " + err.Error()})
+			return
+		}
+		participants := make([]map[string]any, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			lid := ""
+			if !p.LID.IsEmpty() {
+				lid = p.LID.ToNonAD().String()
+			}
+			pn := ""
+			if !p.PhoneNumber.IsEmpty() {
+				pn = p.PhoneNumber.ToNonAD().String()
+			}
+			participants = append(participants, map[string]any{
+				"jid":          p.JID.ToNonAD().String(),
+				"lid":          lid,
+				"phone_number": pn,
+				"is_admin":     p.IsAdmin || p.IsSuperAdmin,
+			})
+		}
+		linkedParent := ""
+		if !info.LinkedParentJID.IsEmpty() {
+			linkedParent = info.LinkedParentJID.ToNonAD().String()
+		}
+		emit(map[string]any{
+			"event":         "group_roster",
+			"request_id":    cmd.RequestID,
+			"group_jid":     cmd.GroupJID,
+			"subject":       info.Name,
+			"description":   info.Topic,
+			"linked_parent": linkedParent,
+			"participants":  participants,
+		})
+
+	case "fetch_joined_groups":
+		groups, err := client.GetJoinedGroups()
+		if err != nil {
+			return
+		}
+		out := make([]map[string]any, 0, len(groups))
+		for _, g := range groups {
+			out = append(out, map[string]any{
+				"jid":     g.JID.ToNonAD().String(),
+				"subject": g.Name,
+			})
+		}
+		emit(map[string]any{
+			"event":      "groups_list",
+			"request_id": cmd.RequestID,
+			"groups":     out,
+		})
+	}
+}

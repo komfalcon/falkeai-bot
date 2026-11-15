@@ -1,0 +1,15 @@
+services:
+  falkeai:
+    build: .
+    container_name: falkeai-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - WA_SESSION_DB=file:/app/data/wa_session.db?_foreign_keys=on
+      - PORT=8080
+      - WEBSITES_PORT=8080

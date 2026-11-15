@@ -1,0 +1,10 @@
+/target
+/.cargo-cache
+/bridge/wa-bridge
+/bridge/wa-bridge.exe
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+node_modules/
