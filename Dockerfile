@@ -1,9 +1,9 @@
 # Stage 1: Build the thin Go whatsmeow bridge
-FROM golang:1.23-bookworm AS go-builder
+FROM golang:1.24-bookworm AS go-builder
 WORKDIR /build/bridge
 COPY bridge/go.mod ./
-RUN go mod edit -replace go.mau.fi/whatsmeow=go.mau.fi/whatsmeow@latest && go mod tidy && go mod download
 COPY bridge/main.go ./
+RUN go get github.com/mattn/go-sqlite3@latest && go get go.mau.fi/whatsmeow@latest && go get google.golang.org/protobuf@latest && go mod tidy
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /out/wa-bridge .
 
 # Stage 2: Build the Rust Core (falkeai-core)

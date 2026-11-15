@@ -306,7 +306,7 @@ func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeComm
 		if cmd.State == "paused" {
 			state = types.ChatPresencePaused
 		}
-		_ = client.SendChatPresence(chatJID, state, types.ChatPresenceMediaText)
+		_ = client.SendChatPresence(ctx, chatJID, state, types.ChatPresenceMediaText)
 
 	case "mark_read":
 		chatJID, err := types.ParseJID(cmd.ChatJID)
@@ -318,7 +318,7 @@ func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeComm
 		if cmd.SenderJID != "" {
 			senderJID, _ = types.ParseJID(cmd.SenderJID)
 		}
-		_ = client.MarkRead([]types.MessageID{cmd.MessageID}, time.Now(), chatJID, senderJID)
+		_ = client.MarkRead(ctx, []types.MessageID{cmd.MessageID}, time.Now(), chatJID, senderJID)
 
 	case "delete_message":
 		groupJID, err1 := types.ParseJID(cmd.GroupJID)
@@ -335,14 +335,14 @@ func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeComm
 		if err1 != nil || err2 != nil {
 			return
 		}
-		_, _ = client.UpdateGroupParticipants(groupJID, []types.JID{partJID}, whatsmeow.ParticipantChangeRemove)
+		_, _ = client.UpdateGroupParticipants(ctx, groupJID, []types.JID{partJID}, whatsmeow.ParticipantChangeRemove)
 
 	case "fetch_group_roster":
 		groupJID, err := types.ParseJID(cmd.GroupJID)
 		if err != nil {
 			return
 		}
-		info, err := client.GetGroupInfo(groupJID)
+		info, err := client.GetGroupInfo(ctx, groupJID)
 		if err != nil {
 			emit(map[string]any{"event": "error", "message": "GetGroupInfo failed: " + err.Error()})
 			return
@@ -379,7 +379,7 @@ func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeComm
 		})
 
 	case "fetch_joined_groups":
-		groups, err := client.GetJoinedGroups()
+		groups, err := client.GetJoinedGroups(ctx)
 		if err != nil {
 			return
 		}

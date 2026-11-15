@@ -18,12 +18,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.24"
 
       - name: Build Go whatsmeow bridge (wa-bridge)
         working-directory: bridge
         run: |
-          go mod edit -replace go.mau.fi/whatsmeow=go.mau.fi/whatsmeow@latest
+          go get github.com/mattn/go-sqlite3@latest
+          go get go.mau.fi/whatsmeow@latest
+          go get google.golang.org/protobuf@latest
           go mod tidy
           CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o ../wa-bridge .
 
