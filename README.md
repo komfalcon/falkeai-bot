@@ -27,12 +27,10 @@
 ### 2. AI Key (Cloudflare Workers AI Free Tier — 10,000 Neurons/Day)
 Set `CF_ACCOUNT_ID`, `AI_API_KEY`, and `AI_MODEL=@cf/mistralai/mistral-small-3.1-24b-instruct` (or any OpenAI-compatible provider).
 
-### 3. Deploy on Azure for Students ($0 Cost)
-FalkeAI is pre-configured for **Azure for Students** with two zero-cost options (see [`DEPLOYMENT.md`](DEPLOYMENT.md) for step-by-step instructions):
-- **Option A — Zero-Maintenance Azure App Service (`B1` Free Student Tier)**:
-  - Push this repo to GitHub -> `.github/workflows/azure-deploy.yml` automatically builds the Docker image on GitHub Actions (`ghcr.io`) -> Azure App Service runs the container 24/7 with its built-in `:8080` health probe and Turso session persistence.
-- **Option B — Azure Free Student VM (`Standard_B1s` Ubuntu)**:
-  - Run `docker compose up -d --build` using [`docker-compose.yml`](docker-compose.yml) (`restart: unless-stopped`).
+### 3. Deploy on Heroku (GitHub Student Developer Pack — $0 Cost)
+1. Set your Heroku stack to container (`heroku stack:set container -a falkeai-bot`).
+2. Add config vars from `.env.example` (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `PAIR_PHONE`, `CF_ACCOUNT_ID`, `AI_API_KEY`, `AI_MODEL`).
+3. Push and enable the `worker` process (`git push heroku main && heroku ps:scale worker=1:basic -a falkeai-bot`). See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full step-by-step guide.
 
 ## Control FalkeAI from WhatsApp
 Open **"Message yourself"** and send:
