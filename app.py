@@ -1,3 +1,4 @@
+import fcntl
 import os
 import stat
 import subprocess
@@ -5,6 +6,13 @@ import threading
 import time
 import urllib.request
 import gradio as gr
+
+try:
+    import spaces
+    gpu_decorator = spaces.GPU
+except Exception:
+    def gpu_decorator(fn):
+        return fn
 
 os.environ["GRADIO_SSR_MODE"] = "false"
 
@@ -19,6 +27,7 @@ bot_status = {
 }
 _started = False
 _lock = threading.Lock()
+_lock_file = None
 
 
 def log(line: str):
@@ -76,16 +85,27 @@ def supervisor_loop():
 
 
 def ensure_supervisor():
-    global _started
+    global _started, _lock_file
     with _lock:
-        if not _started:
-            _started = True
-            threading.Thread(target=supervisor_loop, daemon=True).start()
+        if _started:
+            return
+        _started = True
+        try:
+            _lock_file = open("/tmp/falkeai_supervisor.lock", "w")
+            fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        threading.Thread(target=supervisor_loop, daemon=True).start()
 
 
 def get_status():
     ensure_supervisor()
     return f"Status: {bot_status['state']}\nInstance Booted: {bot_status['started_at']}"
+
+
+@gpu_decorator
+def gpu_healthcheck():
+    return f"ZeroGPU Runtime Active — {bot_status['state']}"
 
 
 with gr.Blocks(title="FalkeAI — Personal Symbiotic Agent") as demo:
@@ -95,8 +115,11 @@ with gr.Blocks(title="FalkeAI — Personal Symbiotic Agent") as demo:
         "> **Owner Note:** Open the **Logs** button at the top of this Space to view your 8-character WhatsApp Pairing Code."
     )
     status_box = gr.Textbox(label="System Status", value=get_status, lines=3, interactive=False)
-    refresh_btn = gr.Button("Refresh Status")
+    with gr.Row():
+        refresh_btn = gr.Button("Refresh Status")
+        gpu_btn = gr.Button("ZeroGPU Health Check")
     refresh_btn.click(fn=get_status, outputs=status_box)
+    gpu_btn.click(fn=gpu_healthcheck, outputs=status_box)
 
 if __name__ == "__main__":
     ensure_supervisor()
