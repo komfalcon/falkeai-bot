@@ -440,12 +440,23 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             if let Ok(mut guard) = ctx.self_identity.lock() {
                 *guard = (self_jid, self_lid);
             }
-            // Snapshot WhatsApp session SQLite file into Turso so Heroku dyno restarts never lose login
+            // Snapshot WhatsApp session SQLite file into Turso so container restarts never lose login
             if let Ok(bytes) = std::fs::read("wa_session.db") {
                 if !bytes.is_empty() {
                     let _ = ctx.db.save_session_blob("wa_session_db", &bytes).await;
                 }
             }
+            let ctx_snap = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                for delay_secs in [5u64, 30, 120] {
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    if let Ok(bytes) = std::fs::read("wa_session.db") {
+                        if !bytes.is_empty() {
+                            let _ = ctx_snap.db.save_session_blob("wa_session_db", &bytes).await;
+                        }
+                    }
+                }
+            });
             // Resume any pending 5-minute replies across restarts
             let pending_list = ctx.db.list_pending_replies().await?;
             let now_ms = Utc::now().timestamp_millis();
@@ -594,6 +605,14 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                 }
             }
 
+            if from_me && sender_jid.ends_with("@lid") {
+                if let Ok(mut guard) = ctx.self_identity.lock() {
+                    if guard.1.as_deref().unwrap_or("").is_empty() {
+                        guard.1 = Some(sender_jid.clone());
+                    }
+                }
+            }
+
             let (self_jid, self_lid) = ctx
                 .self_identity
                 .lock()
@@ -602,13 +621,16 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
 
             // 1) Owner messages (self-chat commands OR manual DM replies)
             if from_me {
-                if is_self_chat(
-                    true,
-                    &self_jid,
-                    self_lid.as_deref(),
-                    &chat_jid,
-                    chat_alt_jid.as_deref(),
-                ) {
+                let is_self_lid_dm = !is_group && !chat_jid.is_empty() && chat_jid == sender_jid;
+                if is_self_lid_dm
+                    || is_self_chat(
+                        true,
+                        &self_jid,
+                        self_lid.as_deref(),
+                        &chat_jid,
+                        chat_alt_jid.as_deref(),
+                    )
+                {
                     if text.trim().is_empty() {
                         return Ok(());
                     }

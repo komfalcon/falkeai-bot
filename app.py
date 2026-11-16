@@ -54,10 +54,8 @@ def download_binary(name: str):
 def supervisor_loop():
     while True:
         try:
-            if not os.path.exists("wa-bridge") or os.path.getsize("wa-bridge") < 1024:
-                download_binary("wa-bridge")
-            if not os.path.exists("falkeai-core") or os.path.getsize("falkeai-core") < 1024:
-                download_binary("falkeai-core")
+            download_binary("wa-bridge")
+            download_binary("falkeai-core")
 
             env = os.environ.copy()
             env["WA_BRIDGE_BIN"] = "./wa-bridge"

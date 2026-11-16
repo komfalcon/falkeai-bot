@@ -100,40 +100,43 @@ func cleanPhone(raw string) string {
 	return digits
 }
 
-func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string) {
+func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string, bool) {
+	urls := make([]string, 0)
 	if msg == nil {
-		return "", false, nil
+		return "", false, urls, false
 	}
-	var urls []string
 	if msg.GetConversation() != "" {
-		return strings.TrimSpace(msg.GetConversation()), false, urls
+		return strings.TrimSpace(msg.GetConversation()), false, urls, true
 	}
 	if ext := msg.GetExtendedTextMessage(); ext != nil {
 		if ext.GetMatchedText() != "" {
 			urls = append(urls, ext.GetMatchedText())
 		}
-		return strings.TrimSpace(ext.GetText()), false, urls
+		return strings.TrimSpace(ext.GetText()), false, urls, true
 	}
 	if img := msg.GetImageMessage(); img != nil {
-		return strings.TrimSpace(img.GetCaption()), false, urls
+		return strings.TrimSpace(img.GetCaption()), false, urls, true
 	}
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return strings.TrimSpace(vid.GetCaption()), false, urls
+		return strings.TrimSpace(vid.GetCaption()), false, urls, true
 	}
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		return strings.TrimSpace(doc.GetCaption()), false, urls
+		return strings.TrimSpace(doc.GetCaption()), false, urls, true
 	}
 	if msg.GetAudioMessage() != nil {
-		return "", true, urls
+		return "", true, urls, true
 	}
-	return "", false, urls
+	if msg.GetStickerMessage() != nil {
+		return "", false, urls, true
+	}
+	return "", false, urls, false
 }
 
 func main() {
 	ctx := context.Background()
 	dbPath := os.Getenv("WA_SESSION_DB")
 	if dbPath == "" {
-		dbPath = "file:wa_session.db?_foreign_keys=on"
+		dbPath = "file:wa_session.db?_foreign_keys=on&_journal_mode=DELETE&_synchronous=FULL"
 	}
 
 	container, err := sqlstore.New(ctx, "sqlite3", dbPath, waLog.Noop)
@@ -190,16 +193,27 @@ func main() {
 			}
 
 		case *events.Message:
-			text, isVoice, matchedURLs := extractTextAndURLs(v.Message)
+			text, isVoice, matchedURLs, isUserMsg := extractTextAndURLs(v.Message)
+			if !isUserMsg {
+				return
+			}
 			senderAlt := ""
 			if !v.Info.SenderAlt.IsEmpty() {
 				senderAlt = v.Info.SenderAlt.ToNonAD().String()
+			}
+			var chatAlt any = nil
+			if !v.Info.IsGroup {
+				if v.Info.IsFromMe && !v.Info.RecipientAlt.IsEmpty() {
+					chatAlt = v.Info.RecipientAlt.ToNonAD().String()
+				} else if !v.Info.IsFromMe && !v.Info.SenderAlt.IsEmpty() {
+					chatAlt = v.Info.SenderAlt.ToNonAD().String()
+				}
 			}
 			emit(map[string]any{
 				"event":          "message",
 				"id":             v.Info.ID,
 				"chat_jid":       v.Info.Chat.ToNonAD().String(),
-				"chat_alt_jid":   nil,
+				"chat_alt_jid":   chatAlt,
 				"sender_jid":     v.Info.Sender.ToNonAD().String(),
 				"sender_alt_jid": senderAlt,
 				"from_me":        v.Info.IsFromMe,

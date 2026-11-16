@@ -1,4 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactEntry {
@@ -42,23 +51,31 @@ pub enum BridgeEvent {
         from_me: bool,
         is_group: bool,
         timestamp: i64,
+        #[serde(default)]
         text: String,
+        #[serde(default)]
         is_voice: bool,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
         matched_urls: Vec<String>,
     },
     ContactsSync {
+        #[serde(default, deserialize_with = "deserialize_null_default")]
         contacts: Vec<ContactEntry>,
     },
     GroupRoster {
         request_id: String,
         group_jid: String,
+        #[serde(default)]
         subject: String,
+        #[serde(default)]
         description: String,
         linked_parent: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
         participants: Vec<GroupParticipant>,
     },
     GroupsList {
         request_id: String,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
         groups: Vec<GroupSummary>,
     },
     GroupInvalidate {
