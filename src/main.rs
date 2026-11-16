@@ -9,6 +9,7 @@ pub mod util;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -442,21 +443,15 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             if let Ok(mut guard) = ctx.self_identity.lock() {
                 *guard = (self_jid, self_lid);
             }
-            // Snapshot WhatsApp session SQLite file into Turso so container restarts never lose login
-            if let Ok(bytes) = std::fs::read("wa_session.db") {
-                if !bytes.is_empty() {
-                    let _ = ctx.db.save_session_blob("wa_session_db", &bytes).await;
-                }
-            }
+            // Snapshot WhatsApp session SQLite file into Turso shortly after connecting
             let ctx_snap = Arc::clone(&ctx);
             tokio::spawn(async move {
-                for delay_secs in [5u64, 30, 120] {
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    if let Ok(bytes) = std::fs::read("wa_session.db") {
-                        if !bytes.is_empty() {
-                            let _ = ctx_snap.db.save_session_blob("wa_session_db", &bytes).await;
-                        }
+                let mut last_hash = Vec::new();
+                for delay_secs in [0u64, 5, 30] {
+                    if delay_secs > 0 {
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     }
+                    let _ = snapshot_wa_session_if_changed(&ctx_snap.db, &mut last_hash).await;
                 }
             });
             // Resume any pending 5-minute replies across restarts
@@ -919,9 +914,31 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
     Ok(())
 }
 
+async fn snapshot_wa_session_if_changed(db: &Database, last_hash: &mut Vec<u8>) -> bool {
+    if std::path::Path::new("wa_session.db-journal").exists() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read("wa_session.db") else {
+        return false;
+    };
+    if bytes.len() < 16_384 || !bytes.starts_with(b"SQLite format 3\0") {
+        return false;
+    }
+    let hash = Sha256::digest(&bytes).to_vec();
+    if hash == *last_hash {
+        return false;
+    }
+    if db.save_session_blob("wa_session_db", &bytes).await.is_ok() {
+        *last_hash = hash;
+        return true;
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -937,12 +954,23 @@ async fn main() -> Result<()> {
     let loop_guard = Arc::new(LoopGuard::new());
     let echo_guard = Arc::new(OutboundEchoGuard::new());
 
-    // Lightweight HTTP health listener for Azure App Service / Container Apps probes
+    // Periodic Signal session backup so Heroku dyno restarts never lose rotated WhatsApp keys
+    let db_sync = db.clone();
+    tokio::spawn(async move {
+        let mut last_hash = Vec::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let _ = snapshot_wa_session_if_changed(&db_sync, &mut last_hash).await;
+        }
+    });
+
+    // Lightweight HTTP health listener for Heroku / Container probes
     if cfg.health_port > 0 {
         let port = cfg.health_port;
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
-                info!("Azure health probe listening on 0.0.0.0:{}", port);
+                info!("Health probe listening on 0.0.0.0:{}", port);
                 while let Ok((mut stream, _)) = listener.accept().await {
                     tokio::spawn(async move {
                         let mut buf = [0u8; 512];
@@ -1037,7 +1065,11 @@ async fn main() -> Result<()> {
                     });
                 }
                 Err(e) => {
-                    warn!("Ignored non-IPC bridge output: {} ({})", trimmed, e);
+                    if trimmed.contains("Unable to verify ciphertext mac") {
+                        warn!("Signal MAC mismatch on stale/queued WhatsApp packet (bridge will request key retry).");
+                    } else {
+                        warn!("Ignored non-IPC bridge output: {} ({})", trimmed, e);
+                    }
                 }
             }
         }
