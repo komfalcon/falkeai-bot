@@ -1356,6 +1356,55 @@ impl Database {
         }
     }
 
+    pub async fn get_latest_flag_for_chat(&self, chat: &str) -> Result<Option<FlagRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .flags
+                    .iter()
+                    .rev()
+                    .find(|f| f.chat == chat)
+                    .cloned())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM flags WHERE chat = ? ORDER BY id DESC LIMIT 1",
+                        vec![SqlParam::from(chat)],
+                    )
+                    .await?;
+                Ok(res.rows.first().map(|r| FlagRecord {
+                    timestamp: row_str(r, "timestamp").unwrap_or_default(),
+                    chat: row_str(r, "chat").unwrap_or_default(),
+                    name: row_str(r, "name"),
+                    reason: row_str(r, "reason").unwrap_or_default(),
+                    last_message: row_str(r, "last_message").unwrap_or_default(),
+                }))
+            }
+        }
+    }
+
+    pub async fn delete_flags_for_chat(&self, chat: &str) -> Result<u64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let before = guard.data.flags.len();
+                guard.data.flags.retain(|f| f.chat != chat);
+                let removed = (before - guard.data.flags.len()) as u64;
+                guard.flush()?;
+                Ok(removed)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote("DELETE FROM flags WHERE chat = ?", vec![SqlParam::from(chat)])
+                    .await?;
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
     // ---- Blocked, Contacts, Guarded Groups, Safe Domains, Settings ----
     pub async fn is_blocked(&self, ids: &[String]) -> Result<bool> {
         match &self.backend {

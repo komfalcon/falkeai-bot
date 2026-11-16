@@ -1,11 +1,64 @@
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::brain::merge_unique_strings;
+use crate::brain::{merge_unique_strings, HISTORY_MAX};
 use crate::config::{Config, BOT_NAME};
-use crate::db::{ContactMemory, ConversationState, Database};
+use crate::db::{ChatTurn, ContactMemory, ConversationState, Database};
 use crate::ipc::GroupSummary;
 use crate::util::{normalize_number, number_of_jid};
+
+async fn resolve_contact_target(db: &Database, query: &str) -> Result<Option<String>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(None);
+    }
+    let norm = normalize_number(q);
+    if norm.len() >= 7 && q.chars().all(|c| c.is_ascii_digit() || "+ -()".contains(c)) {
+        return Ok(Some(norm));
+    }
+    if let Ok(hits) = db.find_contact_memories(q).await {
+        if let Some(first) = hits.first() {
+            return Ok(Some(first.sender.clone()));
+        }
+    }
+    if let Ok(flags) = db.list_flags(25).await {
+        let lower_q = q.to_lowercase();
+        if let Some(f) = flags.into_iter().find(|f| {
+            f.chat.contains(&norm)
+                || f.name
+                    .as_deref()
+                    .map(|n| n.to_lowercase().contains(&lower_q))
+                    .unwrap_or(false)
+        }) {
+            return Ok(Some(f.chat));
+        }
+    }
+    Ok(None)
+}
+
+pub async fn take_approved_outbounds(db: &Database) -> Result<Vec<(String, String)>> {
+    let Some(raw) = db.get_setting("pending_approved_outbounds").await? else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() || raw.trim() == "[]" {
+        return Ok(Vec::new());
+    }
+    let items: Vec<(String, String)> = serde_json::from_str(&raw).unwrap_or_default();
+    db.set_setting("pending_approved_outbounds", "[]").await?;
+    Ok(items)
+}
+
+async fn queue_approved_outbound(db: &Database, number: &str, text: &str) -> Result<()> {
+    let mut current: Vec<(String, String)> = db
+        .get_setting("pending_approved_outbounds")
+        .await?
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    current.push((format!("{}@s.whatsapp.net", number), text.to_string()));
+    let serialized = serde_json::to_string(&current).unwrap_or_else(|_| "[]".to_string());
+    db.set_setting("pending_approved_outbounds", &serialized)
+        .await
+}
 
 pub fn is_self_chat(
     from_me: bool,
@@ -96,6 +149,99 @@ where
             list.join(", ")
         };
         return Ok(Some(format!("✅ Ignored numbers ({}): {}", list.len(), joined)));
+    }
+
+    // approve <phone/name>: <reply> | reply <phone/name>: <reply> | reject <phone/name>
+    if lower == "approve" || lower == "reply" || lower == "reject" {
+        return Ok(Some(
+            "⚠️ Usage: `approve <phone/name>: <reply to send>` or `reject <phone/name>`".to_string(),
+        ));
+    }
+    if lower.starts_with("reject ") {
+        let target_raw = raw["reject ".len()..].trim();
+        let Some(num) = resolve_contact_target(db, target_raw).await? else {
+            return Ok(Some(format!(
+                "⚠️ Could not find a contact matching \"{}\". Usage: `reject 2348012345678`",
+                target_raw
+            )));
+        };
+        let now = Utc::now().timestamp_millis();
+        let mut state = db
+            .get_conversation(&num)
+            .await?
+            .unwrap_or_else(|| ConversationState::new(&num));
+        state.bot_active = false;
+        state.owner_read_unanswered = true;
+        state.paused_until = now + cfg.takeover_pause_ms;
+        state.updated_at = now;
+        db.save_conversation(&state).await?;
+        db.delete_pending_reply(&num).await?;
+        let _ = db.delete_flags_for_chat(&num).await;
+        return Ok(Some(format!(
+            "✅ Rejected held request for +{}. {} stays paused in that chat so you can take over whenever ready.",
+            num, BOT_NAME
+        )));
+    }
+    if lower.starts_with("approve ") || lower.starts_with("reply ") {
+        let idx = raw.find(' ').unwrap_or(0);
+        let body = raw[idx + 1..].trim();
+        let (target_part, custom_reply) = match body.find(':') {
+            Some(c_idx) => (body[..c_idx].trim(), Some(body[c_idx + 1..].trim())),
+            None => (body, None),
+        };
+        let Some(num) = resolve_contact_target(db, target_part).await? else {
+            return Ok(Some(format!(
+                "⚠️ Could not find a contact matching \"{}\". Usage: `approve 2348012345678: <message>`",
+                target_part
+            )));
+        };
+        let reply_to_send = match custom_reply.filter(|s| !s.is_empty()) {
+            Some(r) => r.to_string(),
+            None => {
+                let latest_flag = db.get_latest_flag_for_chat(&num).await?;
+                let suggested = latest_flag.and_then(|f| {
+                    f.reason
+                        .split("Suggested reply:")
+                        .nth(1)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+                match suggested {
+                    Some(s) => s,
+                    None => {
+                        return Ok(Some(format!(
+                            "⚠️ Specify the message to send: `approve {}: <your reply>`",
+                            num
+                        )));
+                    }
+                }
+            }
+        };
+        let now = Utc::now().timestamp_millis();
+        let mut state = db
+            .get_conversation(&num)
+            .await?
+            .unwrap_or_else(|| ConversationState::new(&num));
+        state.history.push(ChatTurn {
+            role: "assistant".to_string(),
+            content: format!("[Falcon]: {}", reply_to_send),
+        });
+        if state.history.len() > HISTORY_MAX {
+            let excess = state.history.len() - HISTORY_MAX;
+            state.history.drain(0..excess);
+        }
+        state.owner_read_unanswered = false;
+        state.paused_until = 0;
+        state.bot_active = true;
+        state.updated_at = now;
+        db.save_conversation(&state).await?;
+        db.delete_pending_reply(&num).await?;
+        let _ = db.delete_flags_for_chat(&num).await;
+        queue_approved_outbound(db, &num, &reply_to_send).await?;
+        return Ok(Some(format!(
+            "✅ Approved & sent to +{}:\n\"{}\"",
+            num, reply_to_send
+        )));
     }
 
     // pause / resume <numbers or name>
@@ -458,7 +604,7 @@ where
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands*:\n• remember <fact> | remember <no>: <fact>\n• teach <rule> | learn <rule>\n• profile <no/name> | memories [no/name] | forget <id/word>\n• pause <no/name> | resume <no/name>\n• block <no> | unblock <no> | blocked\n• guard <group> | unguard <group> | guarded\n• allow <site> | disallow <site> | safelist\n• mode everyone | mode unsaved\n• bookings | flagged | status",
+            "✅ *{} Commands*:\n• approve <no/name>: <reply> | reject <no/name>\n• remember <fact> | remember <no>: <fact>\n• teach <rule> | learn <rule>\n• profile <no/name> | memories [no/name] | forget <id/word>\n• pause <no/name> | resume <no/name>\n• block <no> | unblock <no> | blocked\n• guard <group> | unguard <group> | guarded\n• allow <site> | disallow <site> | safelist\n• mode everyone | mode unsaved\n• bookings | flagged | status",
             BOT_NAME
         )));
     }
