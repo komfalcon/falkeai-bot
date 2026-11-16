@@ -1,5 +1,5 @@
 # Stage 1: Build the thin Go whatsmeow bridge
-FROM golang:1.24-bookworm AS go-builder
+FROM golang:1.26-bookworm AS go-builder
 WORKDIR /build/bridge
 COPY bridge/go.mod ./
 COPY bridge/main.go ./

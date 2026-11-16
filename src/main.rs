@@ -19,11 +19,11 @@ use tokio::task::AbortHandle;
 use tracing::{error, info, warn};
 
 use crate::brain::{
-    call_llm_http, handle_customer_message, is_greeting_only, record_owner_read,
-    record_owner_reply, HandleMessageResult, HISTORY_MAX,
+    call_llm_http, handle_customer_message, record_owner_read, record_owner_reply,
+    HandleMessageResult, HISTORY_MAX,
 };
 use crate::commands::{get_reply_mode, is_self_chat, run_owner_command};
-use crate::config::{Config, BOT_NAME, INTRO_MESSAGE};
+use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, Database, PendingReply};
 use crate::ipc::{BridgeCommand, BridgeEvent, GroupSummary};
 use crate::moderation::{
@@ -102,31 +102,7 @@ where
         }
     }
 
-    let is_session_start = existing_state
-        .as_ref()
-        .map(|s| !s.bot_active || (now_ms - s.updated_at >= cfg.bot_session_idle_ms))
-        .unwrap_or(true);
-
-    let mut res = handle_customer_message(db, cfg, sender, text, aliases, now_ms, llm_fn).await?;
-
-    if is_session_start {
-        if is_greeting_only(text) && !res.flagged && res.booking_saved.is_none() {
-            res.reply = INTRO_MESSAGE.to_string();
-        } else if !res.reply.starts_with(INTRO_MESSAGE) {
-            res.reply = format!("{}\n\n{}", INTRO_MESSAGE, res.reply);
-        }
-        if let Some(mut updated_state) = db.get_conversation(sender).await? {
-            if let Some(last_turn) = updated_state
-                .history
-                .iter_mut()
-                .rev()
-                .find(|t| t.role == "assistant")
-            {
-                last_turn.content = res.reply.clone();
-                db.save_conversation(&updated_state).await?;
-            }
-        }
-    }
+    let res = handle_customer_message(db, cfg, sender, text, aliases, now_ms, llm_fn).await?;
 
     send_fn(
         remote_jid.to_string(),
@@ -576,6 +552,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             chat_alt_jid,
             sender_jid,
             sender_alt_jid,
+            push_name,
             from_me,
             is_group,
             timestamp,
@@ -772,6 +749,20 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             let Some(number) = ids.first().cloned() else {
                 return Ok(());
             };
+
+            if let Some(pname) = push_name.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if ctx.db.get_saved_contact_name(&ids).await.ok().flatten().is_none() {
+                    let mut cm = ctx
+                        .db
+                        .get_contact_memory(&number)
+                        .await?
+                        .unwrap_or_else(|| crate::db::ContactMemory::new(&number));
+                    if cm.display_name.is_none() {
+                        cm.display_name = Some(pname.to_string());
+                        let _ = ctx.db.save_contact_memory(&cm).await;
+                    }
+                }
+            }
 
             if ctx.db.is_blocked(&ids).await? {
                 return Ok(());
@@ -1322,9 +1313,10 @@ mod tests {
             &[],
             1_300_000,
             |msgs| async move {
+                assert!(msgs[0].content.contains("FIRST MESSAGE STEPPING IN FOR FALCON"));
                 assert!(msgs.last().unwrap().content.contains("Hello Falcon\nCan we talk"));
                 Ok(json!({
-                    "reply": "I'll leave this one for Falcon.",
+                    "reply": "Hey! FalkeAI here stepping in while Falcon's tied up. I've flagged your partnership note for him so he can look it over personally as soon as he's free.",
                     "flag_human": true,
                     "flag_reason": "Partnership request"
                 })
@@ -1345,7 +1337,7 @@ mod tests {
 
         assert_eq!(
             res.reply,
-            format!("{}\n\nI'll leave this one for Falcon.", INTRO_MESSAGE)
+            "Hey! FalkeAI here stepping in while Falcon's tied up. I've flagged your partnership note for him so he can look it over personally as soon as he's free."
         );
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(alerts.lock().unwrap().len(), 1);
@@ -1362,7 +1354,8 @@ mod tests {
             &[],
             300_000,
             1_330_000,
-            |_| async {
+            |msgs| async move {
+                assert!(msgs[0].content.contains("ACTIVE ONGOING CONVERSATION"));
                 Ok(json!({
                     "reply": "Yes, we run Physics classes for JAMB between 11am and 6pm."
                 })

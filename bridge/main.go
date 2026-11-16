@@ -209,6 +209,16 @@ func main() {
 					chatAlt = v.Info.SenderAlt.ToNonAD().String()
 				}
 			}
+			pushName := strings.TrimSpace(v.Info.PushName)
+			if !v.Info.IsFromMe && client.Store != nil && client.Store.Contacts != nil {
+				if c, err := client.Store.Contacts.GetContact(ctx, v.Info.Chat.ToNonAD()); err == nil && c.Found {
+					if strings.TrimSpace(c.FullName) != "" {
+						pushName = strings.TrimSpace(c.FullName)
+					} else if strings.TrimSpace(c.FirstName) != "" {
+						pushName = strings.TrimSpace(c.FirstName)
+					}
+				}
+			}
 			emit(map[string]any{
 				"event":          "message",
 				"id":             v.Info.ID,
@@ -216,6 +226,7 @@ func main() {
 				"chat_alt_jid":   chatAlt,
 				"sender_jid":     v.Info.Sender.ToNonAD().String(),
 				"sender_alt_jid": senderAlt,
+				"push_name":      pushName,
 				"from_me":        v.Info.IsFromMe,
 				"is_group":       v.Info.IsGroup,
 				"timestamp":      v.Info.Timestamp.Unix(),

@@ -1623,24 +1623,39 @@ impl Database {
     }
 
     pub async fn is_saved_contact(&self, ids: &[String]) -> Result<bool> {
+        Ok(self.get_saved_contact_name(ids).await?.is_some())
+    }
+
+    pub async fn get_saved_contact_name(&self, ids: &[String]) -> Result<Option<String>> {
         match &self.backend {
             TursoBackend::Local(s) => {
                 let guard = s.lock().unwrap();
-                Ok(ids.iter().any(|id| guard.data.saved_contacts.contains_key(id)))
+                for id in ids {
+                    if let Some(name) = guard.data.saved_contacts.get(id) {
+                        if !name.trim().is_empty() {
+                            return Ok(Some(name.clone()));
+                        }
+                    }
+                }
+                Ok(None)
             }
             TursoBackend::Remote { .. } => {
                 for id in ids {
                     let res = self
                         .execute_remote(
-                            "SELECT id FROM saved_contacts WHERE id = ? LIMIT 1",
+                            "SELECT name FROM saved_contacts WHERE id = ? LIMIT 1",
                             vec![SqlParam::from(id.clone())],
                         )
                         .await?;
-                    if !res.rows.is_empty() {
-                        return Ok(true);
+                    if let Some(row) = res.rows.first() {
+                        if let Some(name) = row_str(row, "name") {
+                            if !name.trim().is_empty() {
+                                return Ok(Some(name));
+                            }
+                        }
                     }
                 }
-                Ok(false)
+                Ok(None)
             }
         }
     }

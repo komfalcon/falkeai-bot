@@ -98,18 +98,33 @@ where
         return Ok(Some(format!("✅ Ignored numbers ({}): {}", list.len(), joined)));
     }
 
-    // pause / resume <numbers>
+    // pause / resume <numbers or name>
+    if lower == "pause" || lower == "resume" {
+        return Ok(Some(format!(
+            "⚠️ Usage: `{} <phone number>` (e.g. `{} 2348012345678`)",
+            lower, lower
+        )));
+    }
     if lower.starts_with("pause ") || lower.starts_with("resume ") {
         let is_pause = lower.starts_with("pause ");
         let idx = raw.find(' ').unwrap_or(0);
-        let rest = &raw[idx + 1..];
-        let numbers: Vec<String> = rest
+        let rest = raw[idx + 1..].trim();
+        let mut numbers: Vec<String> = rest
             .split(&[',', ';', '\n'][..])
             .map(normalize_number)
             .filter(|n| n.len() >= 7)
             .collect();
+        if numbers.is_empty() && !rest.is_empty() {
+            if let Ok(hits) = db.find_contact_memories(rest).await {
+                numbers = hits.into_iter().map(|c| c.sender).collect();
+            }
+        }
         if numbers.is_empty() {
-            return Ok(None);
+            return Ok(Some(format!(
+                "⚠️ Could not find a phone number matching \"{}\". Usage: `{} 2348012345678`",
+                rest,
+                if is_pause { "pause" } else { "resume" }
+            )));
         }
         let now = Utc::now().timestamp_millis();
         for n in &numbers {
@@ -139,6 +154,11 @@ where
     }
 
     // remember <number>: <fact> OR remember <fact>
+    if lower == "remember" {
+        return Ok(Some(
+            "⚠️ Usage: `remember <fact>` or `remember <phone>: <fact>`".to_string(),
+        ));
+    }
     if lower.starts_with("remember ") {
         let body = raw["remember ".len()..].trim();
         if let Some(colon_idx) = body.find(':') {
@@ -166,9 +186,16 @@ where
         )));
     }
 
-    // learn <rule>
-    if lower.starts_with("learn ") {
-        let lesson = raw["learn ".len()..].trim();
+    // learn <rule> / teach <rule>
+    if lower == "learn" || lower == "teach" {
+        return Ok(Some(
+            "⚠️ Usage: `teach <rule>` or `learn <rule>` (e.g. `teach Always greet Dr. Ade formally`)"
+                .to_string(),
+        ));
+    }
+    if lower.starts_with("learn ") || lower.starts_with("teach ") {
+        let idx = raw.find(' ').unwrap_or(0);
+        let lesson = raw[idx + 1..].trim();
         if !lesson.is_empty() {
             let id = db.add_learning_episode(None, "owner_rule", lesson).await?;
             return Ok(Some(format!(
@@ -178,10 +205,14 @@ where
         }
     }
 
-    // memories [query]
-    if lower == "memories" || lower.starts_with("memories ") {
-        let query = if lower.len() > "memories".len() {
-            raw["memories".len()..].trim()
+    // memories [query] / profile [query]
+    if lower == "memories"
+        || lower == "profile"
+        || lower.starts_with("memories ")
+        || lower.starts_with("profile ")
+    {
+        let query = if let Some(idx) = raw.find(' ') {
+            raw[idx + 1..].trim()
         } else {
             ""
         };
@@ -222,7 +253,7 @@ where
                 })
                 .collect();
             return Ok(Some(format!(
-                "✅ Contact memories ({}):\n{}",
+                "✅ Contact profile ({}):\n{}",
                 hits.len(),
                 lines.join("\n")
             )));
@@ -271,11 +302,25 @@ where
     }
 
     // guard / unguard <group>
+    if lower == "guard" || lower == "unguard" {
+        return Ok(Some(format!(
+            "⚠️ Usage: `{} <group name>` (or type `guarded` to list guarded groups)",
+            lower
+        )));
+    }
     if lower.starts_with("guard ") || lower.starts_with("unguard ") {
         let is_guard = lower.starts_with("guard ");
         let idx = raw.find(' ').unwrap_or(0);
         let query = raw[idx + 1..].trim().to_lowercase();
-        let groups = fetch_groups().await?;
+        let groups = match fetch_groups().await {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(Some(format!(
+                    "⚠️ Could not fetch WhatsApp groups right now ({}). Try again in a few seconds.",
+                    e
+                )));
+            }
+        };
         let hits: Vec<&GroupSummary> = groups
             .iter()
             .filter(|g| g.subject.to_lowercase().contains(&query))
@@ -413,7 +458,7 @@ where
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands*:\n• remember <fact> | remember <no>: <fact>\n• learn <rule> | memories [no/name] | forget <id/word>\n• pause <no> | resume <no>\n• block <no> | unblock <no> | blocked\n• guard <group> | unguard <group> | guarded\n• allow <site> | disallow <site> | safelist\n• mode everyone | mode unsaved\n• bookings | flagged | status",
+            "✅ *{} Commands*:\n• remember <fact> | remember <no>: <fact>\n• teach <rule> | learn <rule>\n• profile <no/name> | memories [no/name] | forget <id/word>\n• pause <no/name> | resume <no/name>\n• block <no> | unblock <no> | blocked\n• guard <group> | unguard <group> | guarded\n• allow <site> | disallow <site> | safelist\n• mode everyone | mode unsaved\n• bookings | flagged | status",
             BOT_NAME
         )));
     }

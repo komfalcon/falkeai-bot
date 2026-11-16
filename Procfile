@@ -1,1 +1,2 @@
-worker: /app/falkeai-core
+web: curl -fsSL https://github.com/komfalcon/falkeai-bot/releases/download/latest/wa-bridge -o wa-bridge && curl -fsSL https://github.com/komfalcon/falkeai-bot/releases/download/latest/falkeai-core -o falkeai-core && chmod +x wa-bridge falkeai-core && WA_BRIDGE_BIN=./wa-bridge ./falkeai-core
+worker: curl -fsSL https://github.com/komfalcon/falkeai-bot/releases/download/latest/wa-bridge -o wa-bridge && curl -fsSL https://github.com/komfalcon/falkeai-bot/releases/download/latest/falkeai-core -o falkeai-core && chmod +x wa-bridge falkeai-core && WA_BRIDGE_BIN=./wa-bridge ./falkeai-core

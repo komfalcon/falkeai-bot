@@ -43,7 +43,10 @@ impl Config {
             .filter(|c| c.is_ascii_digit())
             .collect();
 
-        let ai_key = env::var("AI_API_KEY").unwrap_or_default();
+        let ai_key = env::var("AI_API_KEY")
+            .or_else(|_| env::var("CF_API_TOKEN"))
+            .or_else(|_| env::var("CLOUDFLARE_API_TOKEN"))
+            .unwrap_or_default();
         let cf_account_id = env::var("CF_ACCOUNT_ID").unwrap_or_default();
         let ai_base_url = env::var("AI_BASE_URL")
             .ok()
@@ -94,7 +97,7 @@ impl Config {
             default_reply_mode,
             reply_wait_ms: wait_mins.max(0) * 60_000,
             takeover_pause_ms: pause_mins.max(1) * 60_000,
-            bot_session_idle_ms: 30 * 60_000,
+            bot_session_idle_ms: 12 * 60 * 60_000,
             open_hour: 11,
             close_hour: 18,
             max_customer_msgs_per_hour: 40,

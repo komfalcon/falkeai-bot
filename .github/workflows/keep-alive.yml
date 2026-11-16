@@ -1,25 +1,10 @@
-name: Keep Hugging Face Space Awake
+name: Keep Hugging Face Space Awake (Disabled - Migrated to Heroku)
 
 on:
-  schedule:
-    # Runs every 6 hours to reset Hugging Face's 48-hour inactivity timer
-    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
-  ping-space:
+  noop:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Private Hugging Face Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          SPACE_URL: "https://aurikrexacademy-falke-bot.hf.space"
-        run: |
-          if [ -n "$HF_TOKEN" ]; then
-            curl -s -L -o /dev/null -w "HTTP Status: %{http_code}\n" \
-              -H "Authorization: Bearer $HF_TOKEN" \
-              "$SPACE_URL"
-          else
-            curl -s -L -o /dev/null -w "HTTP Status: %{http_code}\n" \
-              "$SPACE_URL"
-          fi
+      - run: echo "Migrated to Heroku"

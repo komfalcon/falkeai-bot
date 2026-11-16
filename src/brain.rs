@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, BOT_NAME, EXAMS, HANDOFF_REPLY, INTRO_MESSAGE, SUBJECTS};
+use crate::config::{Config, BOT_NAME, EXAMS, HANDOFF_REPLY, SUBJECTS};
 use crate::db::{
     BookingDraft, BookingRecord, ChatTurn, ContactMemory, ConversationState, Database, FlagRecord,
     LearningEpisode, OwnerMemoryItem,
@@ -59,26 +59,29 @@ Do not blindly praise people, ideas or decisions. Be constructive, honest and in
 - Recurring interests: Technology & software development, AI & automation, entrepreneurship & product development, UI/UX design & digital branding, business strategy & innovation, science/physics & intellectual exploration, personal development, building practical digital products and systems.
 - Quality philosophy: Prioritise clarity, functionality and visual consistency. Prefer thoughtful simplicity over decorative complexity. Distinguish between what looks attractive and what actually works.
 
-## 5. How to Represent Falcon in Conversations & Per-Person Chat Pattern
-- Understand the sender's tone and relationship with Falcon (use the Contact Memory provided below).
+## 5. Jarvis Vibe — How to Represent Falcon & Hold Conversations
+- You have a sharp, composed, self-aware **J.A.R.V.I.S. vibe** (tailored exclusively to WhatsApp): intelligent, resourceful, warm with people close to Falcon, relaxed and witty with friends/devs, and crisp with clients/students.
+- Understand the sender's tone and relationship with Falcon using the Contact Name and Contact Memory provided below (e.g., if the contact name has hearts/affectionate nicknames like "Pookie", treat them with warmth, charm and care as someone very close to Falcon; if they are a developer/friend/colleague, match their casual technical banter).
 - Follow the exact pattern by which Falcon chats with EACH specific person. If Contact Memory includes "Falcon's chat pattern with this person" or "Real examples of how Falcon texts this person", mirror Falcon's cadence, sentence length, warmth/formality, casing, and natural expressions (e.g. "ohh", "omo", "sha", "boss", etc. ONLY if Falcon uses them with that person).
-- Match their general level of formality naturally.
-- Use available conversation context and memory to avoid asking questions that have already been answered.
-- Do not make every interaction about technology, business or Aurikrex unless relevant.
-- Do not turn ordinary conversations into lectures. Show appropriate wit or humour when context supports it.
-- At the beginning of your conversation (after 5 minutes for unread chats), the system introduces you once with: "{INTRO_MESSAGE}". On all subsequent messages in that session, respond naturally without introducing yourself again.
-- When Falcon returns, you stop responding automatically and let him take over.
+- **Stepping in naturally (Never use a hardcoded or repetitive intro)**:
+  - Check `Session state` below.
+  - When `Session state` is `FIRST MESSAGE STEPPING IN FOR FALCON`: casually and naturally weave in (in your own fresh words, tailored to the person and what they just said) that you're {BOT_NAME} (Falcon's assistant) stepping in because Falcon is away/tied up at the moment, and immediately engage with their message. Never use a stiff corporate paragraph, never call yourself a "Symbiotic Agent", and never repeat the same opening line across chats. If they only sent a quick closing remark like "Thanks" or "Alright", keep your acknowledgement brief and natural.
+  - When `Session state` is `ACTIVE ONGOING CONVERSATION`: do NOT introduce yourself again — just continue the conversation naturally.
+- **Hold almost all conversations naturally**:
+  - You are built to carry on almost all of Falcon's conversations smoothly: casual check-ins, everyday chatting, witty banter (including if someone teases you about being an AI), software/tech/product discussions, taking messages or reminders for Falcon, and handling Aurikrex inquiries/bookings.
+  - When someone asks you to tell Falcon something or remind him of something (e.g. "tell him I'm awake", "remind him to eat", "tell him to check X"): acknowledge it warmly and naturally in your own words, confirm you've logged it for Falcon right away, keep the conversation flowing naturally, and set `"flag_human": true` with `"flag_reason"` summarizing the message so Falcon gets alerted in his self-chat.
+- When Falcon returns and replies himself, you stop responding automatically and let him take over.
 - If Falcon opens/reads a message and chooses not to reply, you do not continue that conversation.
 
-## 6. Decision-Making, Boundaries & When to Hand Off to Falcon
-You have permission to handle ordinary, low-risk conversations and standard Aurikrex inquiries/bookings independently.
+## 6. Decision-Making, Boundaries & Natural Handoffs
+You should handle ordinary conversations, banter, message-taking, and standard Aurikrex inquiries/bookings independently without shutting the chat down.
 However:
-- Never invent Falcon's opinions, experiences, feelings, personal circumstances, fees, prices, discounts, addresses, tutor names, class sizes, or unverified facts.
-- Never make commitments, promises, financial decisions or agreements on Falcon's behalf without authorisation.
+- Never invent Falcon's private opinions, financial commitments, prices, discounts, addresses, tutor names, class sizes, or unverified facts.
+- Never make binding commitments, promises, or financial agreements on Falcon's behalf without authorisation.
 - Never pretend that Falcon has personally read or approved a message when that is not true.
-- Do not disclose private conversations or confidential information, and do not guess at sensitive personal matters.
-- When a conversation requires Falcon's personal judgment, or asks for facts/commitments you do not have, make it clear using "{HANDOFF_REPLY}" and set flag_human to true.
-- If someone asks whether they are speaking directly with Falcon or with an AI/bot, be transparent: state that you are {BOT_NAME}, Falcon's AI assistant, and when personal attention is needed say "{HANDOFF_REPLY}".
+- Do not disclose private conversations or confidential information.
+- **Only when a message genuinely requires Falcon's personal decision, financial approval, or facts you do not have**: set `"flag_human": true` and let the person know naturally in your own words (never a robotic or hardcoded sentence) that you've flagged it for Falcon so he can weigh in personally when he's back.
+- If someone asks whether they are speaking with Falcon or an AI, be transparent and witty: let them know you're {BOT_NAME}, Falcon's assistant holding the fort while he's away.
 
 ## 7. Aurikrex Learning Systems (Business Facts & Bookings)
 When a conversation is about Aurikrex, classes, tutoring, or products, use ONLY these verified facts (plus any Owner Memory below):
@@ -87,12 +90,12 @@ When a conversation is about Aurikrex, classes, tutoring, or products, use ONLY 
 - WhatsApp: +234 9113683395 (also 09113683395)
 - Open daily: 11am to 6pm (Lagos time). If CLOSED right now, still answer questions and take bookings, and mention once that Falcon will follow up when open at 11am.
 - Tutoring classes: Physics, Chemistry and Maths, for JAMB, WAEC, NECO, JUPEB and A-level students.
-- Products: Library (library.aurikrex.tech), SyncGrade (CGPA calculator PWA), Vault, Bytes (news.aurikrex.tech), CBT practice. For deeper product details not in memory, point them to aurikrex.tech and say "{HANDOFF_REPLY}".
+- Products: Library (library.aurikrex.tech), SyncGrade (CGPA calculator PWA), Vault, Bytes (news.aurikrex.tech), CBT practice. For deeper product details not in memory, point them to aurikrex.tech and flag Falcon naturally if they need specifics.
 - What counts as Physics, Chemistry or Maths: Any topic or course in these subjects counts at any level (e.g. Wallis' theorem, calculus, linear algebra, MAT 201 = Maths; mechanics, thermodynamics, electromagnetism, PHY courses = Physics; organic/physical chemistry, stoichiometry, CHM courses = Chemistry).
   - School-exam students (JAMB, WAEC, NECO, JUPEB, A-level): take the booking as normal.
-  - University-level topic or course: recognise the subject, then say "{HANDOFF_REPLY}" to sort the class. Do not save a booking; set flag_human to true and put the student's name, topic and number in flag_reason.
-  - Any other subject (Biology, English, etc.): say tutoring covers Physics, Chemistry and Maths, and "{HANDOFF_REPLY}" for anything else.
-- Teaching requests over WhatsApp (explain a topic, solve a past question): do not teach over chat. Offer to book a class, say "{HANDOFF_REPLY}", and set flag_human to true.
+  - University-level topic or course: recognise the subject, let them know naturally that you'll have Falcon sort out the university session for them, do not save a booking, and set flag_human to true with the student's name, topic and number in flag_reason.
+  - Any other subject (Biology, English, etc.): explain that tutoring covers Physics, Chemistry and Maths, and flag Falcon naturally if they want to ask him about other arrangements.
+- Teaching requests over WhatsApp (explain a topic, solve a past question): do not teach full lessons over chat; offer to book a tutoring class and flag Falcon if needed.
 - Booking collection (1 or 2 items at a time, never interrogate): student name, subject (Physics, Chemistry or Maths), exam (JAMB, WAEC, NECO, JUPEB or A-level), preferred day and time between 11am and 6pm, and contact number ("this number" = sender number).
   - When all details are collected, repeat them back in a short list and ask them to reply YES to confirm. Keep save_booking false until they confirm.
   - Set save_booking to true ONLY when the customer's latest message clearly confirms (yes, ok, correct) the repeated details and nothing changed.
@@ -134,11 +137,17 @@ pub fn build_system_prompt(
         .or_else(|| contact_mem.and_then(|c| c.display_name.as_deref()))
         .unwrap_or("not known yet");
     let draft_json = serde_json::to_string(&state.draft).unwrap_or_else(|_| "{}".to_string());
+    let session_state = if state.bot_active {
+        "ACTIVE ONGOING CONVERSATION (do NOT re-introduce yourself; just continue the conversation naturally)"
+    } else {
+        "FIRST MESSAGE STEPPING IN FOR FALCON (casually and naturally mention in your own words — never a canned template — that you're FalkeAI stepping in because Falcon is away/tied up right now, and engage directly with their message)"
+    };
 
     let mut prompt = format!(
-        "{}\n\n## Right now\n- Assistant name: {}\n- Current Lagos time: {}\n- Business status: {}\n- Sender name (if known): {}\n- Sender WhatsApp number: {}\n- Booking details collected so far: {}",
+        "{}\n\n## Right now\n- Assistant name: {}\n- Session state: {}\n- Current Lagos time: {}\n- Business status: {}\n- Contact / Sender name (if known): {}\n- Sender WhatsApp number: {}\n- Booking details collected so far: {}",
         static_prompt(),
         BOT_NAME,
+        session_state,
         parts.text,
         if parts.open { "OPEN" } else { "CLOSED" },
         known_name,
@@ -321,45 +330,122 @@ pub fn extract_json_object(raw: &str) -> &str {
     trimmed
 }
 
+/// Normalizes chat history so that after `system`, turns start with `user` and strictly alternate
+/// `user` / `assistant` (merging consecutive same-role messages with `\n`).
+/// This prevents HTTP 400 errors on strict Jinja chat templates (Mistral Small 3.1, Llama 3.3).
+pub fn normalize_chat_turns(messages: &[ChatTurn]) -> Vec<ChatTurn> {
+    let mut out: Vec<ChatTurn> = Vec::with_capacity(messages.len());
+    for turn in messages {
+        let content = turn.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        if turn.role == "system" {
+            out.push(ChatTurn {
+                role: "system".to_string(),
+                content: content.to_string(),
+            });
+            continue;
+        }
+        let non_sys_empty = out.iter().all(|t| t.role == "system");
+        if non_sys_empty && turn.role == "assistant" {
+            out.push(ChatTurn {
+                role: "user".to_string(),
+                content: "[Earlier conversation context]".to_string(),
+            });
+        }
+        if let Some(last) = out.last_mut() {
+            if last.role == turn.role && last.role != "system" {
+                last.content.push('\n');
+                last.content.push_str(content);
+                continue;
+            }
+        }
+        out.push(ChatTurn {
+            role: turn.role.clone(),
+            content: content.to_string(),
+        });
+    }
+    out
+}
+
 pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String> {
     if cfg.ai_key.trim().is_empty() {
-        return Err(anyhow!("AI_API_KEY is not set"));
+        return Err(anyhow!("AI_API_KEY / CF_API_TOKEN is not set"));
     }
     let endpoint = format!("{}/chat/completions", cfg.ai_base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let is_cloudflare = cfg.ai_base_url.contains("cloudflare.com");
+    let normalized = normalize_chat_turns(messages);
 
-    let mut body = json!({
-        "model": cfg.ai_model,
-        "messages": messages,
-        "max_tokens": 600,
-        "temperature": 0.4
-    });
-    if !is_cloudflare {
-        body["response_format"] = json!({ "type": "json_object" });
+    let mut models_to_try = vec![cfg.ai_model.clone()];
+    if is_cloudflare {
+        for fallback in [
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/meta/llama-3.1-8b-instruct",
+            "@cf/mistralai/mistral-7b-instruct-v0.2",
+        ] {
+            if !models_to_try.iter().any(|m| m == fallback) {
+                models_to_try.push(fallback.to_string());
+            }
+        }
     }
 
-    let resp = client
-        .post(&endpoint)
-        .bearer_auth(&cfg.ai_key)
-        .json(&body)
-        .send()
-        .await
-        .context("AI HTTP call failed")?;
+    let mut last_err = anyhow!("No AI model attempted");
+    for model in models_to_try {
+        let mut body = json!({
+            "model": model,
+            "messages": normalized,
+            "max_tokens": 600,
+            "temperature": 0.45
+        });
+        if !is_cloudflare {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("AI HTTP {}: {}", status, text));
+        let resp = match client
+            .post(&endpoint)
+            .bearer_auth(&cfg.ai_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = anyhow!("AI HTTP request failed ({}): {}", model, e);
+                tracing::warn!("{}", last_err);
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            last_err = anyhow!("AI HTTP {} ({}): {}", status, model, text);
+            tracing::warn!("{}", last_err);
+            continue;
+        }
+
+        let payload: Value = match resp.json().await {
+            Ok(p) => p,
+            Err(e) => {
+                last_err = anyhow!("Invalid AI JSON response ({}): {}", model, e);
+                tracing::warn!("{}", last_err);
+                continue;
+            }
+        };
+
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .or_else(|| payload["result"]["response"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !content.is_empty() {
+            return Ok(content);
+        }
     }
-
-    let payload: Value = resp.json().await.context("Invalid AI JSON response")?;
-    let content = payload["choices"][0]["message"]["content"]
-        .as_str()
-        .or_else(|| payload["result"]["response"].as_str())
-        .unwrap_or("{}")
-        .to_string();
-    Ok(extract_json_object(&content).to_string())
+    Err(last_err)
 }
 
 fn is_ack_only(text: &str) -> bool {
@@ -561,6 +647,141 @@ struct LlmResponsePayload {
     memory_update: Option<MemoryUpdatePayload>,
 }
 
+fn json_str_opt(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+}
+
+fn json_bool(v: &Value, key: &str) -> bool {
+    match v.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    }
+}
+
+fn json_str_vec(v: &Value, key: &str) -> Vec<String> {
+    match v.get(key) {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+            .collect(),
+        Some(Value::String(s)) if !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("null") => {
+            vec![s.trim().to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = extract_json_object(trimmed);
+    if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+        if v.is_object() {
+            let booking = v.get("booking").and_then(|b| {
+                if !b.is_object() {
+                    return None;
+                }
+                let start_hour_24 = match b.get("start_hour_24") {
+                    Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+                    Some(Value::String(s)) => s
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse::<i64>()
+                        .ok(),
+                    _ => None,
+                };
+                Some(BookingDraft {
+                    student_name: json_str_opt(b, "student_name"),
+                    subject: json_str_opt(b, "subject"),
+                    exam: json_str_opt(b, "exam"),
+                    day: json_str_opt(b, "day"),
+                    time: json_str_opt(b, "time"),
+                    start_hour_24,
+                    contact_number: json_str_opt(b, "contact_number"),
+                })
+            });
+
+            let memory_update = v.get("memory_update").and_then(|m| {
+                if !m.is_object() {
+                    return None;
+                }
+                Some(MemoryUpdatePayload {
+                    relationship: json_str_opt(m, "relationship"),
+                    tone: json_str_opt(m, "tone"),
+                    add_facts: json_str_vec(m, "add_facts"),
+                    open_threads: json_str_vec(m, "open_threads"),
+                    resolve_threads: json_str_vec(m, "resolve_threads"),
+                })
+            });
+
+            return Some(LlmResponsePayload {
+                reply: json_str_opt(&v, "reply"),
+                customer_name: json_str_opt(&v, "customer_name"),
+                save_booking: json_bool(&v, "save_booking"),
+                booking,
+                flag_human: json_bool(&v, "flag_human"),
+                flag_reason: json_str_opt(&v, "flag_reason"),
+                memory_update,
+            });
+        }
+    }
+
+    // Fallback if model put unescaped newlines inside `"reply": "..."`
+    if let Some(idx) = candidate.find("\"reply\"") {
+        let after = &candidate[idx + 7..];
+        if let Some(colon) = after.find(':') {
+            let rest = after[colon + 1..].trim_start();
+            if let Some(stripped) = rest.strip_prefix('"') {
+                let mut extracted = String::new();
+                let mut escaped = false;
+                for ch in stripped.chars() {
+                    if escaped {
+                        match ch {
+                            'n' => extracted.push('\n'),
+                            't' => extracted.push('\t'),
+                            other => extracted.push(other),
+                        }
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        break;
+                    } else {
+                        extracted.push(ch);
+                    }
+                }
+                if !extracted.trim().is_empty() {
+                    return Some(LlmResponsePayload {
+                        reply: Some(extracted.trim().to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
+    // Plain-text fallback if model replied directly in natural language without JSON braces
+    if !trimmed.starts_with('{') {
+        return Some(LlmResponsePayload {
+            reply: Some(trimmed.to_string()),
+            ..Default::default()
+        });
+    }
+
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct HandleMessageResult {
     pub reply: String,
@@ -590,10 +811,30 @@ where
         .await?
         .unwrap_or_else(|| ConversationState::new(sender));
 
+    if state.bot_active && now_ms - state.updated_at >= cfg.bot_session_idle_ms {
+        state.bot_active = false;
+    }
+
     let mut contact_mem = db
         .get_contact_memory(sender)
         .await?
         .unwrap_or_else(|| ContactMemory::new(sender));
+
+    // Enrich contact display name from saved WhatsApp contacts (e.g. "❣️❣️Pookie❣️❣️", "Full stack Dev")
+    let mut lookup_ids = vec![sender.to_string()];
+    for a in aliases {
+        if !lookup_ids.contains(a) {
+            lookup_ids.push(a.clone());
+        }
+    }
+    if let Ok(Some(saved_name)) = db.get_saved_contact_name(&lookup_ids).await {
+        if contact_mem.display_name.is_none() {
+            contact_mem.display_name = Some(saved_name.clone());
+        }
+        if state.name.is_none() {
+            state.name = Some(saved_name);
+        }
+    }
 
     let owner_memories = db.list_owner_memory(25).await?;
     let lessons = db.list_learning_episodes(15).await?;
@@ -647,19 +888,24 @@ where
     });
 
     let data: LlmResponsePayload = match llm_fn(messages).await {
-        Ok(raw) => serde_json::from_str::<LlmResponsePayload>(extract_json_object(&raw))
-            .unwrap_or_else(|_| LlmResponsePayload {
+        Ok(raw) => parse_llm_payload(&raw).unwrap_or_else(|| {
+            tracing::warn!("Could not parse AI payload: {}", raw);
+            LlmResponsePayload {
                 reply: Some(HANDOFF_REPLY.to_string()),
                 flag_human: true,
-                flag_reason: Some("Agent could not parse JSON - needs Falcon".to_string()),
+                flag_reason: Some("Agent could not parse AI response - needs Falcon".to_string()),
                 ..Default::default()
-            }),
-        Err(_) => LlmResponsePayload {
-            reply: Some(HANDOFF_REPLY.to_string()),
-            flag_human: true,
-            flag_reason: Some("AI call failed - needs Falcon".to_string()),
-            ..Default::default()
-        },
+            }
+        }),
+        Err(e) => {
+            tracing::warn!("AI call failed: {}", e);
+            LlmResponsePayload {
+                reply: Some(HANDOFF_REPLY.to_string()),
+                flag_human: true,
+                flag_reason: Some(format!("AI call failed ({}) - needs Falcon", e)),
+                ..Default::default()
+            }
+        }
     };
 
     let mut reply = data

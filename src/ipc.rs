@@ -48,6 +48,8 @@ pub enum BridgeEvent {
         chat_alt_jid: Option<String>,
         sender_jid: String,
         sender_alt_jid: Option<String>,
+        #[serde(default)]
+        push_name: Option<String>,
         from_me: bool,
         is_group: bool,
         timestamp: i64,

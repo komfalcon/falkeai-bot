@@ -1,0 +1,1 @@
+# FalkeAI Heroku buildpack trigger (actual runtime is Rust falkeai-core + Go wa-bridge via Procfile)
