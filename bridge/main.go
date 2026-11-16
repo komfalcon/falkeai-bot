@@ -86,6 +86,20 @@ type BridgeCommand struct {
 	Mentions       []string `json:"mentions"`
 }
 
+func cleanPhone(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	digits := b.String()
+	if len(digits) == 11 && strings.HasPrefix(digits, "0") {
+		digits = "234" + digits[1:]
+	}
+	return digits
+}
+
 func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string) {
 	if msg == nil {
 		return "", false, nil
@@ -232,25 +246,41 @@ func main() {
 		}
 	})
 
-	if err := client.Connect(); err != nil {
-		emit(map[string]any{"event": "error", "message": "connect failed: " + err.Error()})
-		os.Exit(1)
-	}
-
 	if client.Store.ID == nil {
-		pairPhone := strings.TrimSpace(os.Getenv("PAIR_PHONE"))
+		qrChan, _ := client.GetQRChannel(ctx)
+		if err := client.Connect(); err != nil {
+			emit(map[string]any{"event": "error", "message": "connect failed: " + err.Error()})
+			os.Exit(1)
+		}
+		pairPhone := cleanPhone(os.Getenv("PAIR_PHONE"))
+		if pairPhone == "" {
+			pairPhone = cleanPhone(os.Getenv("OWNER_PHONE"))
+		}
 		if pairPhone != "" {
 			go func() {
-				time.Sleep(2 * time.Second)
-				code, err := client.PairPhone(ctx, pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-				if err != nil {
-					emit(map[string]any{"event": "error", "message": "pair code failed: " + err.Error()})
-					return
+				paired := false
+				for evt := range qrChan {
+					if evt.Event == "code" && !paired {
+						paired = true
+						code, err := client.PairPhone(ctx, pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+						if err != nil {
+							emit(map[string]any{"event": "error", "message": "pair code failed for " + pairPhone + ": " + err.Error()})
+						} else {
+							emit(map[string]any{"event": "pairing_code", "code": code + " (Phone: +" + pairPhone + ")"})
+						}
+					} else if evt.Event == "timeout" || evt.Event == "err-client-outdated" {
+						emit(map[string]any{"event": "error", "message": "Pairing code expired, requesting a fresh code..."})
+						os.Exit(1)
+					}
 				}
-				emit(map[string]any{"event": "pairing_code", "code": code})
 			}()
 		} else {
 			emit(map[string]any{"event": "error", "message": "Not linked yet. Set PAIR_PHONE and restart."})
+		}
+	} else {
+		if err := client.Connect(); err != nil {
+			emit(map[string]any{"event": "error", "message": "connect failed: " + err.Error()})
+			os.Exit(1)
 		}
 	}
 
