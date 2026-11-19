@@ -25,6 +25,156 @@ pub struct OwnerChatOutcome {
     pub outbounds: Vec<(String, String)>,
 }
 
+fn looks_like_raw_json(s: &str) -> bool {
+    let t = s.trim();
+    if t.starts_with('{') || t.starts_with("```json") {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    (lower.contains("\"actions\"") && lower.contains("\"reply\""))
+        || lower.contains("\"save_owner_memory\"")
+        || lower.contains("\"private_internal\"")
+        || (lower.contains("\"type\":") && lower.contains("\"visibility\":"))
+}
+
+/// Extracts and decodes a single JSON string property (e.g. `"reply": "..."`) even from truncated JSON.
+fn extract_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\"", field);
+    let key_idx = raw.find(&key)?;
+    let rest = &raw[key_idx + key.len()..];
+    let colon_idx = rest.find(':')?;
+    let after_colon = rest[colon_idx + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let bytes = after_colon.as_bytes();
+    let mut i = 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            let literal = &after_colon[..=i];
+            return serde_json::from_str::<String>(literal).ok();
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Salvages every complete `{...}` JSON object inside `"actions": [ ...` even if the array was truncated.
+fn salvage_actions_array(raw: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(act_idx) = raw.find("\"actions\"") else {
+        return out;
+    };
+    let rest = &raw[act_idx + "\"actions\"".len()..];
+    let Some(bracket_idx) = rest.find('[') else {
+        return out;
+    };
+    let slice = &rest[bracket_idx + 1..];
+    let bytes = slice.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut depth: i32 = 0;
+    let mut obj_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => {
+                    if depth == 0 {
+                        obj_start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            if let Some(start) = obj_start.take() {
+                                if let Ok(v) = serde_json::from_str::<Value>(&slice[start..=i]) {
+                                    if v.is_object() {
+                                        out.push(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                b']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parses J.A.R.V.I.S. self-chat JSON strictly, salvaging partial replies & complete actions
+/// on token truncation and guaranteeing raw JSON never leaks into WhatsApp.
+pub fn parse_owner_chat_response(raw: &str) -> (String, Vec<Value>) {
+    let candidate = extract_json_object(raw);
+    if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
+        if parsed.is_object() {
+            let actions = parsed["actions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let reply = parsed["reply"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && !looks_like_raw_json(s));
+            let clean_reply = reply.unwrap_or_else(|| {
+                if !actions.is_empty() {
+                    "Done — saved that for you.".to_string()
+                } else {
+                    "Got it.".to_string()
+                }
+            });
+            return (clean_reply, actions);
+        }
+    }
+
+    // Truncated or slightly malformed JSON: salvage `"reply"` and every completed action object
+    let salvaged_reply = extract_json_string_field(raw, "reply")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !looks_like_raw_json(s));
+    let salvaged_actions = salvage_actions_array(raw);
+
+    if let Some(r) = salvaged_reply {
+        return (r, salvaged_actions);
+    }
+    if !salvaged_actions.is_empty() {
+        return (
+            "Got it — saved what you shared. What else would you like to add?".to_string(),
+            salvaged_actions,
+        );
+    }
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && !looks_like_raw_json(trimmed) {
+        return (trimmed.to_string(), Vec::new());
+    }
+    (
+        "Hit a brief formatting snag on my reply — send that again and I've got you.".to_string(),
+        Vec::new(),
+    )
+}
+
 pub async fn handle_owner_self_chat<F, Fut>(
     db: &Database,
     cfg: &Config,
@@ -176,14 +326,14 @@ Think J.A.R.V.I.S.: sharp, concise, witty when natural, completely loyal, zero f
    - Add a reminder: `{{"type": "add_reminder", "in_minutes": 60, "text": "reminder text"}}`
    - Acknowledge active urgent alerts: `{{"type": "ack_alerts", "target": null}}`
    - Show full briefing: `{{"type": "briefing"}}`
-3. If Falcon says he wants you to "interview" him or learn more about him, ask 1–2 thoughtful, crisp questions at a time (e.g. his current projects, communication boundaries, close people, daily rhythm, Aurikrex offerings), and save every answer he gives using `save_owner_memory` with the right visibility!
+3. If Falcon says he wants you to "interview" him or learn more about him, ask 1–2 thoughtful, crisp questions at a time (e.g. his current projects, communication boundaries, close people, daily rhythm, Aurikrex offerings), and save his answers concisely using `save_owner_memory` with the right visibility (bundle related points into at most 4 short `save_owner_memory` entries per turn so your JSON stays compact).
 4. Never fabricate messages or facts that aren't in the live data below. Never expose API keys, tokens, or `NTFY_TOPIC`.
 
 ## Live Workspace Context
 {}
 
 ## Output Format
-Reply with ONE JSON object only (no markdown fences):
+Reply with ONE valid, compact JSON object only (no markdown fences):
 {{
   "reply": "your direct J.A.R.V.I.S.-style message to Falcon",
   "actions": []
@@ -195,6 +345,10 @@ Reply with ONE JSON object only (no markdown fences):
         .get_conversation(OWNER_SELF_CHAT_KEY)
         .await?
         .unwrap_or_else(|| ConversationState::new(OWNER_SELF_CHAT_KEY));
+    // Strip any legacy malformed JSON assistant turns so they can never poison future context.
+    self_state
+        .history
+        .retain(|t| !(t.role == "assistant" && looks_like_raw_json(&t.content)));
 
     let mut messages = Vec::with_capacity(self_state.history.len() + 2);
     messages.push(ChatTurn {
@@ -221,26 +375,13 @@ Reply with ONE JSON object only (no markdown fences):
         }
     };
 
-    let candidate = extract_json_object(&raw);
-    let parsed: Value = serde_json::from_str(candidate).unwrap_or_else(|_| {
-        serde_json::json!({
-            "reply": raw.trim(),
-            "actions": []
-        })
-    });
-
-    let mut reply_text = parsed["reply"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Got it.".to_string());
+    let (mut reply_text, actions) = parse_owner_chat_response(&raw);
 
     let mut outbounds: Vec<(String, String)> = Vec::new();
     let mut action_notes: Vec<String> = Vec::new();
 
-    if let Some(actions) = parsed["actions"].as_array() {
-        for act in actions.iter().take(6) {
-            let kind = act["type"].as_str().unwrap_or("").trim().to_lowercase();
+    for act in actions.iter().take(6) {
+        let kind = act["type"].as_str().unwrap_or("").trim().to_lowercase();
             match kind.as_str() {
                 "send_dm" => {
                     let target = act["target"].as_str().unwrap_or("").trim();
@@ -343,7 +484,6 @@ Reply with ONE JSON object only (no markdown fences):
                 }
                 _ => {}
             }
-        }
     }
 
     if !action_notes.is_empty() {

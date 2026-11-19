@@ -187,7 +187,13 @@ fn looks_like_secret_token(word: &str) -> bool {
     if w.starts_with("eyJ") && w.len() >= 24 {
         return true; // JWT (Turso tokens)
     }
-    if w.starts_with("hf_") || w.starts_with("sk-") || w.starts_with("ghp_") || w.starts_with("github_pat_") {
+    if w.starts_with("hf_")
+        || w.starts_with("sk-")
+        || w.starts_with("gsk_")
+        || w.starts_with("nvapi-")
+        || w.starts_with("ghp_")
+        || w.starts_with("github_pat_")
+    {
         return w.len() >= 16;
     }
     if w.len() < 32 {
@@ -205,6 +211,14 @@ pub fn redact_secrets(text: &str, cfg: &Config) -> String {
     let mut secrets: Vec<String> = Vec::new();
     if !cfg.ai_key.trim().is_empty() {
         secrets.push(cfg.ai_key.trim().to_string());
+    }
+    if !cfg.cf_api_token.trim().is_empty() {
+        secrets.push(cfg.cf_api_token.trim().to_string());
+    }
+    for attempt in &cfg.ai_attempts {
+        if !attempt.api_key.trim().is_empty() {
+            secrets.push(attempt.api_key.trim().to_string());
+        }
     }
     if let Some(t) = cfg.turso_auth_token.as_deref() {
         if !t.trim().is_empty() {

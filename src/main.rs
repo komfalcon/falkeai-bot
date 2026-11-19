@@ -737,7 +737,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                             text: reply_text,
                             mentions: vec![],
                         });
-                    } else if !ctx.cfg.ai_key.trim().is_empty() {
+                    } else if ctx.cfg.has_ai() {
                         // Conversational J.A.R.V.I.S. Self-Chat fallback for natural-language requests
                         let cfg_clone = ctx.cfg.clone();
                         let now_ms = Utc::now().timestamp_millis();
@@ -786,7 +786,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                         text.as_str()
                     };
                     let cfg_clone = ctx.cfg.clone();
-                    let has_text = !text.trim().is_empty() && !cfg_clone.ai_key.is_empty();
+                    let has_text = !text.trim().is_empty() && cfg_clone.has_ai();
                     let learn_cb = if has_text {
                         Some(|msgs: Vec<ChatTurn>| async move { call_llm_http(&cfg_clone, &msgs).await })
                     } else {
@@ -1106,7 +1106,17 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env();
     let db = Database::connect(&cfg.turso_url, cfg.turso_auth_token.as_deref()).await?;
-    info!("Connected to Turso database ({} ready).", BOT_NAME);
+    let provider_summary: Vec<String> = cfg
+        .ai_attempts
+        .iter()
+        .map(|a| format!("{}:{}", a.provider, a.model))
+        .collect();
+    info!(
+        "Connected to Turso database ({} ready). AI failover chain ({} slots): {}",
+        BOT_NAME,
+        provider_summary.len(),
+        provider_summary.join(" -> ")
+    );
 
     let scheduler = Arc::new(DmTakeoverScheduler::new());
     let mod_tracker = Arc::new(ModerationTracker::new());
@@ -1321,8 +1331,10 @@ mod tests {
             pair_phone: "2349113683395".to_string(),
             ai_key: "test-key".to_string(),
             cf_account_id: "test-cf-acct-12345678".to_string(),
+            cf_api_token: "test-cf-token-12345678".to_string(),
             ai_base_url: "https://api.openai.com/v1".to_string(),
             ai_model: "gpt-4o".to_string(),
+            ai_attempts: Vec::new(),
             whisper_model: "@cf/openai/whisper-large-v3-turbo".to_string(),
             vision_model: "@cf/mistralai/mistral-small-3.1-24b-instruct".to_string(),
             ntfy_url: "https://ntfy.sh".to_string(),
@@ -2620,5 +2632,145 @@ mod tests {
             let _guard = TempFileGuard::new(&tmp);
         }
         assert!(!tmp.exists());
+    }
+
+    #[tokio::test]
+    async fn test_multi_provider_failover_and_truncated_self_chat_salvage() {
+        use crate::brain::build_chat_completion_body;
+        use crate::config::build_ai_attempts;
+        use crate::db::{ChatTurn, ConversationState};
+        use crate::owner_chat::{handle_owner_self_chat, parse_owner_chat_response, OWNER_SELF_CHAT_KEY};
+        use crate::safety::redact_secrets;
+
+        // 1) 2 Groq keys + 1 Cloudflare backup -> 9 model-first slots
+        let attempts = build_ai_attempts(
+            &[
+                "gsk_fake_key_one_1234567890".to_string(),
+                "gsk_fake_key_two_1234567890".to_string(),
+            ],
+            Some("@cf/mistralai/mistral-small-3.1-24b-instruct"), // ignored on Groq
+            "https://api.cloudflare.com/client/v4/accounts/acct123456/ai/v1",
+            "cf-token-secret-123456",
+            "@cf/mistralai/mistral-small-3.1-24b-instruct",
+            None,
+            None,
+            None,
+            "acct123456",
+            "cf-token-secret-123456",
+        );
+        assert_eq!(attempts.len(), 9);
+        let order: Vec<String> = attempts
+            .iter()
+            .map(|a| format!("{}:{}", a.provider, a.model))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "groq#1:qwen/qwen3.8-27b",
+                "groq#2:qwen/qwen3.8-27b",
+                "groq#1:openai/gpt-oss-120b",
+                "groq#2:openai/gpt-oss-120b",
+                "groq#1:openai/gpt-oss-20b",
+                "groq#2:openai/gpt-oss-20b",
+                "cloudflare:@cf/mistralai/mistral-small-3.1-24b-instruct",
+                "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "cloudflare:@cf/meta/llama-3.1-8b-instruct-fast",
+            ]
+        );
+
+        // 2) Provider-aware request body construction
+        let sample_turns = vec![ChatTurn {
+            role: "user".to_string(),
+            content: "Return JSON".to_string(),
+        }];
+        let qwen_body = build_chat_completion_body(&attempts[0], &sample_turns, 1400);
+        assert_eq!(qwen_body["max_tokens"], 1400);
+        assert_eq!(qwen_body["response_format"]["type"], "json_object");
+        assert!(qwen_body.get("reasoning_effort").is_none());
+
+        let gpt_oss_body = build_chat_completion_body(&attempts[2], &sample_turns, 1400);
+        assert_eq!(gpt_oss_body["max_completion_tokens"], 1400);
+        assert_eq!(gpt_oss_body["reasoning_effort"], "low");
+        assert_eq!(gpt_oss_body["response_format"]["type"], "json_object");
+
+        let cf_body = build_chat_completion_body(&attempts[6], &sample_turns, 1400);
+        assert_eq!(cf_body["max_tokens"], 1400);
+        assert!(cf_body.get("response_format").is_none());
+
+        // 3) Secret redaction covers gsk_ keys, cf_api_token, and all ai_attempts keys
+        let mut cfg = test_cfg();
+        cfg.ai_attempts = attempts;
+        let leaked = redact_secrets(
+            "Keys: gsk_fake_key_one_1234567890 gsk_other_random_9999999999 cf-token-secret-123456",
+            &cfg,
+        );
+        assert!(!leaked.contains("gsk_"));
+        assert!(!leaked.contains("cf-token-secret-123456"));
+
+        // 4) Truncated self-chat JSON salvage (reproduces live 9:23 AM truncation bug)
+        let truncated = r#"{
+  "reply": "Got your projects and preferences locked in. Who are your top VIP contacts?",
+  "actions": [
+    {
+      "type": "save_owner_memory",
+      "category": "projects",
+      "visibility": "public",
+      "content": "Aurikrex Bytes (live), Aurikrex Atlas, Exam Arena"
+    },
+    {
+      "type": "save_owner_memory",
+      "category": "preferences",
+      "visibility": "private_internal",
+      "content": "Falcon prefers concise and direct communication. Wants to learn how to change my tone and"#;
+
+        let (reply, actions) = parse_owner_chat_response(truncated);
+        assert_eq!(
+            reply,
+            "Got your projects and preferences locked in. Who are your top VIP contacts?"
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["category"], "projects");
+
+        // Even when truncated before `"reply"` closes, raw JSON NEVER leaks
+        let super_truncated = r#"{"actions":[{"type":"save_owner_memory","category":"bio","visibility":"public","content":"Founder of Aurikrex"},{"type":"save_owner_memory","content":"cut off"#;
+        let (safe_reply, salvaged) = parse_owner_chat_response(super_truncated);
+        assert!(!safe_reply.contains("save_owner_memory"));
+        assert!(!safe_reply.contains('{'));
+        assert_eq!(salvaged.len(), 1);
+
+        // 5) End-to-end self-chat strips legacy poisoned JSON history & saves salvaged memory
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let mut poisoned = ConversationState::new(OWNER_SELF_CHAT_KEY);
+        poisoned.history.push(ChatTurn {
+            role: "assistant".to_string(),
+            content: r#"{"type": "save_owner_memory", "visibility": "private_internal", "content": "cut off"#.to_string(),
+        });
+        db.save_conversation(&poisoned).await.unwrap();
+
+        let captured_turns = Arc::new(Mutex::new(Vec::<ChatTurn>::new()));
+        let ct = Arc::clone(&captured_turns);
+        let outcome = handle_owner_self_chat(
+            &db,
+            &cfg,
+            "Keep interviewing me",
+            1_700_000_000_000,
+            move |msgs| {
+                *ct.lock().unwrap() = msgs;
+                async move { Ok(truncated.to_string()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        // Poisoned assistant JSON turn was stripped before calling the LLM
+        assert!(captured_turns
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|t| !(t.role == "assistant" && t.content.contains("save_owner_memory"))));
+        assert!(!outcome.reply.contains("save_owner_memory"));
+        assert!(outcome.reply.contains("VIP contacts"));
+        let mems = db.list_owner_memory(10).await.unwrap();
+        assert!(mems.iter().any(|m| m.content.contains("Aurikrex Bytes")));
     }
 }

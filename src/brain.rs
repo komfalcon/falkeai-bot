@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::alerts::{is_urgent_draft_complete, URGENT_INTAKE_MAX_TURNS};
-use crate::config::{Config, BOT_NAME, EXAMS, HANDOFF_REPLY, SUBJECTS};
+use crate::config::{AiAttempt, Config, BOT_NAME, DEFAULT_CF_MODELS, EXAMS, HANDOFF_REPLY, SUBJECTS};
 use crate::db::{
     BookingDraft, BookingRecord, ChatTurn, ContactMemory, ConversationState, Database,
     EmotionEntry, FlagRecord, LearningEpisode, OwnerMemoryItem, OwnerStatus, UrgentDraft,
@@ -507,54 +507,103 @@ pub fn normalize_chat_turns(messages: &[ChatTurn]) -> Vec<ChatTurn> {
     out
 }
 
-pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String> {
-    if cfg.ai_key.trim().is_empty() {
-        return Err(anyhow!("AI_API_KEY / CF_API_TOKEN is not set"));
+pub fn resolve_llm_attempts(cfg: &Config) -> Vec<AiAttempt> {
+    if !cfg.ai_attempts.is_empty() {
+        return cfg.ai_attempts.clone();
     }
-    let endpoint = format!("{}/chat/completions", cfg.ai_base_url.trim_end_matches('/'));
+    if cfg.ai_key.trim().is_empty() {
+        return Vec::new();
+    }
+    let is_cloudflare = cfg.ai_base_url.contains("cloudflare.com");
+    let mut models = vec![cfg.ai_model.clone()];
+    if is_cloudflare {
+        for fallback in DEFAULT_CF_MODELS {
+            if !models.iter().any(|m| m == fallback) {
+                models.push(fallback.to_string());
+            }
+        }
+    }
+    models
+        .into_iter()
+        .map(|model| AiAttempt {
+            provider: if is_cloudflare {
+                "cloudflare".to_string()
+            } else {
+                "primary".to_string()
+            },
+            base_url: cfg.ai_base_url.clone(),
+            api_key: cfg.ai_key.clone(),
+            model,
+        })
+        .collect()
+}
+
+pub fn build_chat_completion_body(
+    attempt: &AiAttempt,
+    normalized: &[ChatTurn],
+    max_tokens: u32,
+) -> Value {
+    let is_cloudflare = attempt.base_url.contains("cloudflare.com");
+    let is_gpt_oss = attempt.model.to_lowercase().contains("gpt-oss");
+    let mut body = if is_gpt_oss {
+        json!({
+            "model": attempt.model,
+            "messages": normalized,
+            "max_completion_tokens": max_tokens,
+            "reasoning_effort": "low",
+            "temperature": 0.45
+        })
+    } else {
+        json!({
+            "model": attempt.model,
+            "messages": normalized,
+            "max_tokens": max_tokens,
+            "temperature": 0.45
+        })
+    };
+    if !is_cloudflare {
+        body["response_format"] = json!({ "type": "json_object" });
+    }
+    body
+}
+
+pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String> {
+    let attempts = resolve_llm_attempts(cfg);
+    if attempts.is_empty() {
+        return Err(anyhow!("No AI provider configured (set GROQ_API_KEY / AI_API_KEY / CF_API_TOKEN)"));
+    }
     // Bounded timeouts so a slow AI call can never stall a conversation indefinitely.
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(25))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let is_cloudflare = cfg.ai_base_url.contains("cloudflare.com");
     let normalized = normalize_chat_turns(messages);
 
-    let mut models_to_try = vec![cfg.ai_model.clone()];
-    if is_cloudflare {
-        for fallback in [
-            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-            "@cf/meta/llama-3.1-8b-instruct",
-        ] {
-            if !models_to_try.iter().any(|m| m == fallback) {
-                models_to_try.push(fallback.to_string());
-            }
-        }
-    }
-
     let mut last_err = anyhow!("No AI model attempted");
-    for model in models_to_try {
-        let mut body = json!({
-            "model": model,
-            "messages": normalized,
-            "max_tokens": 600,
-            "temperature": 0.45
-        });
-        if !is_cloudflare {
-            body["response_format"] = json!({ "type": "json_object" });
-        }
+    for attempt in attempts {
+        let endpoint = format!(
+            "{}/chat/completions",
+            attempt.base_url.trim_end_matches('/')
+        );
+        let body = build_chat_completion_body(&attempt, &normalized, 1400);
 
         let resp = match client
             .post(&endpoint)
-            .bearer_auth(&cfg.ai_key)
+            .bearer_auth(&attempt.api_key)
             .json(&body)
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                last_err = anyhow!("AI HTTP request failed ({}): {}", model, e);
+                let safe_err = redact_secrets(&e.to_string(), cfg);
+                last_err = anyhow!(
+                    "AI HTTP request failed ({} / {}): {}",
+                    attempt.provider,
+                    attempt.model,
+                    safe_err
+                );
                 tracing::warn!("{}", last_err);
                 continue;
             }
@@ -563,7 +612,14 @@ pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            last_err = anyhow!("AI HTTP {} ({}): {}", status, model, text);
+            let safe_text = redact_secrets(&text, cfg);
+            last_err = anyhow!(
+                "AI HTTP {} ({} / {}): {}",
+                status,
+                attempt.provider,
+                attempt.model,
+                safe_text
+            );
             tracing::warn!("{}", last_err);
             continue;
         }
@@ -571,7 +627,12 @@ pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String
         let payload: Value = match resp.json().await {
             Ok(p) => p,
             Err(e) => {
-                last_err = anyhow!("Invalid AI JSON response ({}): {}", model, e);
+                last_err = anyhow!(
+                    "Invalid AI JSON response ({} / {}): {}",
+                    attempt.provider,
+                    attempt.model,
+                    e
+                );
                 tracing::warn!("{}", last_err);
                 continue;
             }
@@ -586,6 +647,12 @@ pub async fn call_llm_http(cfg: &Config, messages: &[ChatTurn]) -> Result<String
         if !content.is_empty() {
             return Ok(content);
         }
+        last_err = anyhow!(
+            "Empty AI content ({} / {})",
+            attempt.provider,
+            attempt.model
+        );
+        tracing::warn!("{}", last_err);
     }
     Err(last_err)
 }
