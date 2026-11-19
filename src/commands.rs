@@ -1,13 +1,14 @@
 use anyhow::Result;
 use chrono::Utc;
 
+use crate::alerts::format_digest_message;
 use crate::brain::{merge_unique_strings, HISTORY_MAX};
 use crate::config::{Config, BOT_NAME};
-use crate::db::{ChatTurn, ContactMemory, ConversationState, Database};
+use crate::db::{ChatTurn, ContactMemory, ConversationState, Database, OwnerStatus};
 use crate::ipc::GroupSummary;
 use crate::util::{normalize_number, number_of_jid};
 
-async fn resolve_contact_target(db: &Database, query: &str) -> Result<Option<String>> {
+pub(crate) async fn resolve_contact_target(db: &Database, query: &str) -> Result<Option<String>> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(None);
@@ -92,6 +93,17 @@ pub async fn get_reply_mode(db: &Database, fallback: &str) -> Result<String> {
         .unwrap_or_else(|| fallback.to_string()))
 }
 
+fn parse_duration_minutes(token: &str) -> Option<i64> {
+    let t = token.trim().to_lowercase();
+    if let Some(h) = t.strip_suffix("hr").or_else(|| t.strip_suffix("hrs")).or_else(|| t.strip_suffix('h')) {
+        return h.trim().parse::<i64>().ok().filter(|&v| v > 0).map(|v| v * 60);
+    }
+    if let Some(m) = t.strip_suffix("mins").or_else(|| t.strip_suffix("min")).or_else(|| t.strip_suffix('m')) {
+        return m.trim().parse::<i64>().ok().filter(|&v| v > 0);
+    }
+    t.parse::<i64>().ok().filter(|&v| v > 0)
+}
+
 pub async fn run_owner_command<F, Fut>(
     db: &Database,
     cfg: &Config,
@@ -107,6 +119,159 @@ where
         return Ok(None);
     }
     let lower = raw.to_lowercase();
+
+    // ack [phone/name] — stop repeating urgent ntfy alerts immediately
+    if lower == "ack" || lower.starts_with("ack ") {
+        let target = if lower.len() > 3 {
+            let q = raw[3..].trim();
+            if q.is_empty() {
+                None
+            } else {
+                Some(resolve_contact_target(db, q).await?.unwrap_or_else(|| q.to_string()))
+            }
+        } else {
+            None
+        };
+        let acked = db.ack_urgent_alerts(target.as_deref()).await?;
+        if acked == 0 {
+            return Ok(Some("✅ No active unacknowledged urgent alerts right now.".to_string()));
+        }
+        return Ok(Some(format!(
+            "✅ Acknowledged {} urgent alert(s). Stopped ntfy repeat pings.",
+            acked
+        )));
+    }
+
+    // briefing / brief / summary — on-demand digest
+    if matches!(lower.as_str(), "briefing" | "brief" | "summary" | "morning summary") {
+        let items = db.list_pending_digest_items(40).await?;
+        let unacked = db.list_unacked_urgent_alerts().await?;
+        let rems = db.list_pending_reminders(10).await?;
+        let msg = format_digest_message(
+            &items,
+            &unacked,
+            &rems,
+            &format!("📋 *{} On-Demand Briefing*", BOT_NAME),
+        );
+        return Ok(Some(msg));
+    }
+
+    // vip / silent / normal <phone/name> — per-contact autonomy tiers
+    if matches!(lower.as_str(), "vip" | "silent" | "normal") {
+        return Ok(Some(format!(
+            "⚠️ Usage: `{} <phone or name>` (tiers: `vip`, `normal`, `silent`)",
+            lower
+        )));
+    }
+    if lower.starts_with("vip ") || lower.starts_with("silent ") || lower.starts_with("normal ") {
+        let idx = raw.find(' ').unwrap_or(0);
+        let tier = lower[..idx].trim();
+        let target_raw = raw[idx + 1..].trim();
+        let Some(num) = resolve_contact_target(db, target_raw).await? else {
+            return Ok(Some(format!(
+                "⚠️ Could not find a contact matching \"{}\". Usage: `{} 2348012345678`",
+                target_raw, tier
+            )));
+        };
+        let cm = db.set_contact_tier(&num, tier).await?;
+        let desc = match cm.tier.as_str() {
+            "vip" => "VIP (urgent-alert priority + close memory scope)",
+            "silent" => "Silent / Observe-Only (logs messages for your digest, never auto-replies)",
+            _ => "Normal (standard 5-minute takeover behavior)",
+        };
+        return Ok(Some(format!("✅ Updated +{} -> *{}*", num, desc)));
+    }
+
+    // Availability modes: busy / deep / sleep / available
+    if matches!(lower.as_str(), "available" | "back" | "im back" | "i'm back") {
+        db.set_owner_status(&OwnerStatus::available()).await?;
+        return Ok(Some("✅ Availability set to *available* (normal 5-minute wait restored).".to_string()));
+    }
+    if lower == "busy"
+        || lower == "sleep"
+        || lower == "sleeping"
+        || lower == "deep"
+        || lower.starts_with("busy ")
+        || lower.starts_with("sleep ")
+        || lower.starts_with("sleeping ")
+        || lower.starts_with("deep ")
+    {
+        let mut parts_iter = raw.split_whitespace();
+        let cmd_word = parts_iter.next().unwrap_or("busy").to_lowercase();
+        let mode = match cmd_word.as_str() {
+            "sleep" | "sleeping" => "sleeping",
+            "deep" => "deep_work",
+            _ => "busy",
+        };
+        let default_mins = if mode == "sleeping" { 420 } else { 120 };
+        let rest_tokens: Vec<&str> = parts_iter.collect();
+        let (mins, note_tokens) = if let Some(first) = rest_tokens.first() {
+            if let Some(m) = parse_duration_minutes(first) {
+                (m, &rest_tokens[1..])
+            } else {
+                (default_mins, &rest_tokens[..])
+            }
+        } else {
+            (default_mins, &rest_tokens[..])
+        };
+        let note_str = note_tokens.join(" ");
+        let note = if note_str.trim().is_empty() {
+            None
+        } else {
+            Some(note_str.trim().to_string())
+        };
+        let now = Utc::now().timestamp_millis();
+        let until_ms = now + mins * 60_000;
+        db.set_owner_status(&OwnerStatus {
+            mode: mode.to_string(),
+            until_ms,
+            note: note.clone(),
+        })
+        .await?;
+        let note_fmt = note.map(|n| format!(" ({})", n)).unwrap_or_default();
+        return Ok(Some(format!(
+            "✅ Availability set to *{}* for {} min{}. {} will step in immediately while you're away.",
+            mode, mins, note_fmt, BOT_NAME
+        )));
+    }
+
+    // remind <in Xm/Xh>: <message>
+    if lower == "remind" || lower == "reminders" {
+        let rems = db.list_pending_reminders(10).await?;
+        if rems.is_empty() {
+            return Ok(Some(
+                "✅ No upcoming reminders. Usage: `remind 30m: Call Tunde` or `remind 2h: Eat lunch`".to_string(),
+            ));
+        }
+        let lines: Vec<String> = rems.iter().map(|r| format!("• #{} {}", r.id, r.text)).collect();
+        return Ok(Some(format!("⏰ *Upcoming Reminders*:\n{}", lines.join("\n"))));
+    }
+    if lower.starts_with("remind ") {
+        let body = raw["remind ".len()..].trim();
+        let (dur_part, msg_part) = match body.find(':') {
+            Some(c) => (body[..c].trim(), body[c + 1..].trim()),
+            None => {
+                let mut sp = body.splitn(2, ' ');
+                (sp.next().unwrap_or(""), sp.next().unwrap_or("").trim())
+            }
+        };
+        let dur_clean = dur_part
+            .to_lowercase()
+            .trim_start_matches("me ")
+            .trim_start_matches("in ")
+            .trim()
+            .to_string();
+        if let Some(mins) = parse_duration_minutes(&dur_clean) {
+            if !msg_part.is_empty() {
+                let now = Utc::now().timestamp_millis();
+                let id = db.add_reminder(now + mins * 60_000, msg_part, now).await?;
+                return Ok(Some(format!(
+                    "⏰ Reminder #{} set for {} min from now: \"{}\"",
+                    id, mins, msg_part
+                )));
+            }
+        }
+    }
 
     // block / unblock <numbers>
     if lower.starts_with("block ") || lower.starts_with("unblock ") {
@@ -299,10 +464,11 @@ where
         return Ok(Some(msg));
     }
 
-    // remember <number>: <fact> OR remember <fact>
+    // remember [public|close|private] <fact> OR remember <number>: <fact>
     if lower == "remember" {
         return Ok(Some(
-            "⚠️ Usage: `remember <fact>` or `remember <phone>: <fact>`".to_string(),
+            "⚠️ Usage: `remember [public|close|private] <fact>` or `remember <phone>: <fact>`"
+                .to_string(),
         ));
     }
     if lower.starts_with("remember ") {
@@ -325,10 +491,22 @@ where
                 )));
             }
         }
-        let id = db.add_owner_memory("owner", body, "self_chat").await?;
+        let body_lower = body.to_lowercase();
+        let (visibility, content) = if body_lower.starts_with("private ") {
+            ("private_internal", body["private ".len()..].trim())
+        } else if body_lower.starts_with("close ") {
+            ("close", body["close ".len()..].trim())
+        } else if body_lower.starts_with("public ") {
+            ("public", body["public ".len()..].trim())
+        } else {
+            ("public", body)
+        };
+        let id = db
+            .add_owner_memory_scoped("owner", visibility, content, "self_chat")
+            .await?;
         return Ok(Some(format!(
-            "✅ Stored in {} memory (#{}): \"{}\"",
-            BOT_NAME, id, body
+            "✅ Stored in {} memory (#{}, {}): \"{}\"",
+            BOT_NAME, id, visibility, content
         )));
     }
 
@@ -596,15 +774,19 @@ where
         let flags = db.count_flags().await?;
         let owner_mem = db.list_owner_memory(100).await?.len();
         let lessons = db.list_learning_episodes(100).await?.len();
+        let avail = db.get_owner_status(Utc::now().timestamp_millis()).await?;
+        let unacked = db.list_unacked_urgent_alerts().await?.len();
+        let digest = db.list_pending_digest_items(50).await?.len();
+        let rems = db.list_pending_reminders(50).await?.len();
         return Ok(Some(format!(
-            "✅ {} online (Rust Core + Turso). Reply mode: {}. Saved contacts: {}. Bookings: {}. Flagged chats: {}. Memories: {} facts, {} lessons.",
-            BOT_NAME, mode, saved, bookings, flags, owner_mem, lessons
+            "✅ {} online (Rust Core + Turso). Availability: {}. Reply mode: {}. Active urgent alerts: {}. Digest queue (7am): {}. Reminders: {}. Saved contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
+            BOT_NAME, avail.mode, mode, unacked, digest, rems, saved, bookings, flags, owner_mem, lessons
         )));
     }
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands*:\n• approve <no/name>: <reply> | reject <no/name>\n• remember <fact> | remember <no>: <fact>\n• teach <rule> | learn <rule>\n• profile <no/name> | memories [no/name] | forget <id/word>\n• pause <no/name> | resume <no/name>\n• block <no> | unblock <no> | blocked\n• guard <group> | unguard <group> | guarded\n• allow <site> | disallow <site> | safelist\n• mode everyone | mode unsaved\n• bookings | flagged | status",
+            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] — stop urgent ntfy pings\n• briefing — view pending 7:00 AM digest now\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• remind <30m|2h>: <text> | reminders\n• approve <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact>\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
             BOT_NAME
         )));
     }

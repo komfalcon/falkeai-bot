@@ -1,9 +1,12 @@
+pub mod alerts;
 pub mod brain;
 pub mod commands;
 pub mod config;
 pub mod db;
 pub mod ipc;
+pub mod media;
 pub mod moderation;
+pub mod owner_chat;
 pub mod safety;
 pub mod util;
 
@@ -20,17 +23,23 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tracing::{error, info, warn};
 
+use crate::alerts::{
+    fire_urgent_alert_if_allowed, send_ntfy_http, tick_due_reminders, tick_morning_digest,
+    tick_stale_urgent_intakes, tick_urgent_alerts,
+};
 use crate::brain::{
     call_llm_http, handle_customer_message, record_owner_read, record_owner_reply,
     HandleMessageResult, HISTORY_MAX,
 };
 use crate::commands::{get_reply_mode, is_self_chat, run_owner_command, take_approved_outbounds};
 use crate::config::{Config, BOT_NAME};
-use crate::db::{ChatTurn, Database, PendingReply};
+use crate::db::{ChatTurn, Database, DigestItem, PendingReply};
 use crate::ipc::{BridgeCommand, BridgeEvent, GroupSummary};
+use crate::media::{enrich_incoming_media, MediaBudget};
 use crate::moderation::{
     moderate_group_message, CachedRoster, GroupMessageInput, ModerationOutcome, ModerationTracker,
 };
+use crate::owner_chat::handle_owner_self_chat;
 use crate::safety::{
     redact_secrets, sanitize_display_name, InboundVerdict, LoopGuard, OutboundEchoGuard,
 };
@@ -90,7 +99,7 @@ pub async fn execute_customer_reply<L, LFut, S, SFut, N, NFut>(
     now_ms: i64,
     llm_fn: L,
     mut send_fn: S,
-    mut notify_owner_fn: N,
+    notify_owner_fn: N,
 ) -> Result<Option<HandleMessageResult>>
 where
     L: FnOnce(Vec<ChatTurn>) -> LFut,
@@ -116,37 +125,85 @@ where
     )
     .await?;
 
-    if res.flagged {
-        let updated = db.get_conversation(sender).await?;
-        let display = match updated.and_then(|u| u.name) {
-            Some(n) => format!("{} (+{})", n, sender),
-            None => format!("+{}", sender),
+    let updated_state = db.get_conversation(sender).await?;
+    let contact_name = updated_state.and_then(|u| u.name);
+
+    if let Some(ref booking) = res.booking_saved {
+        let _ = db
+            .insert_digest_item(&DigestItem {
+                id: 0,
+                sender: sender.to_string(),
+                contact_name: Some(booking.name.clone()),
+                kind: "booking".to_string(),
+                summary: format!(
+                    "{} — {} {} ({}) | {}",
+                    booking.name, booking.subject, booking.exam, booking.slot, booking.number
+                ),
+                last_message: text.chars().take(180).collect(),
+                created_at: now_ms,
+                delivered: false,
+            })
+            .await;
+    }
+
+    if res.urgent_ready {
+        if let Some(ref ud) = res.urgent_draft {
+            let cfg_ntfy = cfg.clone();
+            let _ = fire_urgent_alert_if_allowed(
+                db,
+                cfg,
+                sender,
+                contact_name,
+                ud,
+                text,
+                now_ms,
+                move |title, body| {
+                    let c = cfg_ntfy.clone();
+                    async move { send_ntfy_http(&c, &title, &body).await }
+                },
+                notify_owner_fn,
+            )
+            .await;
+        }
+    } else if res.flagged {
+        // Non-urgent handoffs are batched into the 7:00 AM Africa/Lagos morning digest (never pinging ntfy)
+        let reason_line = match res.draft.as_deref() {
+            Some(d) => format!(
+                "{} | Suggested: \"{}\"",
+                res.flag_reason.as_deref().unwrap_or("Needs Falcon"),
+                d
+            ),
+            None => res
+                .flag_reason
+                .clone()
+                .unwrap_or_else(|| "Needs Falcon".to_string()),
         };
-        let snippet: String = text.chars().take(220).collect();
-        let draft_line = res
-            .draft
-            .as_deref()
-            .map(|d| format!("\nSuggested: \"{}\"", d))
-            .unwrap_or_default();
-        let alert = format!(
-            "🔔 *{} Approval Hold*\nChat: {}\nReason: {}\nMessage: \"{}\"{}\nReply `approve {}: <msg>` or `reject {}`",
-            BOT_NAME,
-            display,
-            res.flag_reason.as_deref().unwrap_or("Needs your attention"),
-            snippet,
-            draft_line,
-            sender,
-            sender
-        );
-        notify_owner_fn(alert).await?;
+        let _ = db
+            .insert_digest_item(&DigestItem {
+                id: 0,
+                sender: sender.to_string(),
+                contact_name,
+                kind: "handoff".to_string(),
+                summary: reason_line,
+                last_message: text.chars().take(220).collect(),
+                created_at: now_ms,
+                delivered: false,
+            })
+            .await;
     } else if let Some(ref note) = res.note_for_falcon {
-        let updated = db.get_conversation(sender).await?;
-        let display = match updated.and_then(|u| u.name) {
-            Some(n) => format!("{} (+{})", n, sender),
-            None => format!("+{}", sender),
-        };
-        let alert = format!("📝 *{} Note*\nFrom: {}\nNote: {}", BOT_NAME, display, note);
-        notify_owner_fn(alert).await?;
+        // Non-blocking personal notes/reminders are also batched cleanly for the 7:00 AM digest
+        let _ = db
+            .insert_digest_item(&DigestItem {
+                id: 0,
+                sender: sender.to_string(),
+                contact_name,
+                kind: "note".to_string(),
+                summary: note.clone(),
+                last_message: text.chars().take(220).collect(),
+                created_at: now_ms,
+                delivered: false,
+            })
+            .await;
     }
 
     Ok(Some(res))
@@ -326,6 +383,7 @@ struct AppContext {
     mod_tracker: Arc<ModerationTracker>,
     loop_guard: Arc<LoopGuard>,
     echo_guard: Arc<OutboundEchoGuard>,
+    media_budget: Arc<MediaBudget>,
     bridge_tx: mpsc::UnboundedSender<BridgeCommand>,
     self_identity: Mutex<(String, Option<String>)>,
     seen_ids: Mutex<HashSet<String>>,
@@ -578,24 +636,36 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             is_group,
             timestamp,
             text,
+            quoted_text,
             is_voice,
+            media_kind,
+            media_path,
+            media_mime,
             matched_urls,
         } => {
+            let cleanup_media = |p: &Option<String>| {
+                if let Some(path) = p {
+                    let _ = std::fs::remove_file(path);
+                }
+            };
             if chat_jid == "status@broadcast"
                 || chat_jid.ends_with("@broadcast")
                 || chat_jid.ends_with("@newsletter")
             {
+                cleanup_media(&media_path);
                 return Ok(());
             }
 
             let now_sec = Utc::now().timestamp();
             if timestamp > 0 && now_sec - timestamp > ctx.cfg.ignore_older_than_seconds {
+                cleanup_media(&media_path);
                 return Ok(());
             }
 
             {
                 let mut seen = ctx.seen_ids.lock().unwrap();
                 if !seen.insert(id.clone()) {
+                    cleanup_media(&media_path);
                     return Ok(());
                 }
                 if seen.len() > 5000 {
@@ -667,6 +737,34 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                             text: reply_text,
                             mentions: vec![],
                         });
+                    } else if !ctx.cfg.ai_key.trim().is_empty() {
+                        // Conversational J.A.R.V.I.S. Self-Chat fallback for natural-language requests
+                        let cfg_clone = ctx.cfg.clone();
+                        let now_ms = Utc::now().timestamp_millis();
+                        if let Ok(outcome) = handle_owner_self_chat(
+                            &ctx.db,
+                            &ctx.cfg,
+                            &text,
+                            now_ms,
+                            |msgs| async move { call_llm_http(&cfg_clone, &msgs).await },
+                        )
+                        .await
+                        {
+                            for (target_jid, msg_text) in outcome.outbounds {
+                                let num = number_of_jid(&target_jid);
+                                ctx.loop_guard.reset(&num);
+                                ctx.send_human_like(&target_jid, "", &msg_text).await;
+                            }
+                            if !outcome.reply.trim().is_empty() {
+                                ctx.echo_guard
+                                    .record(&outcome.reply, Utc::now().timestamp_millis());
+                                ctx.send_cmd(BridgeCommand::SendMessage {
+                                    chat_jid,
+                                    text: outcome.reply,
+                                    mentions: vec![],
+                                });
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -800,6 +898,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             }
 
             if ctx.db.is_blocked(&ids).await? {
+                cleanup_media(&media_path);
                 return Ok(());
             }
 
@@ -807,27 +906,80 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             if mode == "unsaved" {
                 if ctx.db.count_saved_contacts().await? < 5 {
                     warn!("Reply mode is 'unsaved' but contacts have not synced yet. Staying silent.");
+                    cleanup_media(&media_path);
                     return Ok(());
                 }
                 if ctx.db.is_saved_contact(&ids).await? {
+                    cleanup_media(&media_path);
                     return Ok(());
                 }
             }
 
             let now_ms = Utc::now().timestamp_millis();
             if ctx.over_hourly_limit(&number, now_ms) {
+                cleanup_media(&media_path);
                 return Ok(());
             }
 
-            if text.trim().is_empty() && !is_voice {
+            if text.trim().is_empty() && !is_voice && media_path.is_none() {
                 return Ok(());
             }
 
-            let incoming_text = if is_voice {
-                "[Voice note received - ask sender to type it out]".to_string()
-            } else {
-                text
+            // Enrich voice notes (Cloudflare Whisper) and images/screenshots (Mistral Vision), deleting /tmp file immediately
+            let enriched = enrich_incoming_media(
+                &ctx.cfg,
+                &ctx.media_budget,
+                &text,
+                is_voice,
+                media_kind.as_deref(),
+                media_path.as_deref(),
+                media_mime.as_deref(),
+            )
+            .await;
+
+            let incoming_text = match quoted_text.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(q) => format!("[Replying to: \"{}\"]\n{}", q, enriched),
+                None => enriched,
             };
+
+            // Silent / Observe-Only contact tier: record message & queue for 7:00 AM digest without auto-replying
+            let contact_tier = ctx
+                .db
+                .get_contact_memory(&number)
+                .await?
+                .map(|c| c.tier)
+                .unwrap_or_else(|| "normal".to_string());
+            if contact_tier == "silent" {
+                let mut st = ctx
+                    .db
+                    .get_conversation(&number)
+                    .await?
+                    .unwrap_or_else(|| crate::db::ConversationState::new(&number));
+                st.history.push(ChatTurn {
+                    role: "user".to_string(),
+                    content: incoming_text.clone(),
+                });
+                if st.history.len() > HISTORY_MAX {
+                    let excess = st.history.len() - HISTORY_MAX;
+                    st.history.drain(0..excess);
+                }
+                st.updated_at = now_ms;
+                ctx.db.save_conversation(&st).await?;
+                let _ = ctx
+                    .db
+                    .insert_digest_item(&DigestItem {
+                        id: 0,
+                        sender: number.clone(),
+                        contact_name: st.name.clone(),
+                        kind: "silent_dm".to_string(),
+                        summary: "Observe-only contact messaged".to_string(),
+                        last_message: incoming_text.chars().take(220).collect(),
+                        created_at: now_ms,
+                        delivered: false,
+                    })
+                    .await;
+                return Ok(());
+            }
 
             match ctx.loop_guard.record_inbound(&number, &incoming_text, now_ms) {
                 InboundVerdict::Duplicate => {
@@ -877,6 +1029,13 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                 return Ok(());
             }
 
+            // Availability-aware wait: if Falcon is marked busy / deep_work / sleeping, step in immediately
+            let owner_status = ctx.db.get_owner_status(now_ms).await.ok();
+            let effective_wait_ms = match owner_status {
+                Some(ref st) if st.is_unavailable(now_ms) => 0,
+                _ => ctx.cfg.reply_wait_ms,
+            };
+
             let cfg_clone = ctx.cfg.clone();
             let ctx_send = Arc::clone(&ctx);
             let ctx_notify = Arc::clone(&ctx);
@@ -889,7 +1048,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                 &id,
                 &incoming_text,
                 &ids,
-                ctx.cfg.reply_wait_ms,
+                effective_wait_ms,
                 now_ms,
                 |msgs| async move { call_llm_http(&cfg_clone, &msgs).await },
                 move |jid, mid, reply| {
@@ -953,6 +1112,8 @@ async fn main() -> Result<()> {
     let mod_tracker = Arc::new(ModerationTracker::new());
     let loop_guard = Arc::new(LoopGuard::new());
     let echo_guard = Arc::new(OutboundEchoGuard::new());
+    let media_budget = Arc::new(MediaBudget::new());
+    let active_ctx: Arc<Mutex<Option<Arc<AppContext>>>> = Arc::new(Mutex::new(None));
 
     // Periodic Signal session backup so Heroku dyno restarts never lose rotated WhatsApp keys
     let db_sync = db.clone();
@@ -964,6 +1125,63 @@ async fn main() -> Result<()> {
             let _ = snapshot_wa_session_if_changed(&db_sync, &mut last_hash).await;
         }
     });
+
+    // Background 30-second J.A.R.V.I.S. scheduler:
+    // - Repeats unacked urgent ntfy alerts every 2 mins (cap 15)
+    // - Fires stale urgent intakes after 2.5 mins
+    // - Delivers due reminders & the 7:00 AM Africa/Lagos morning digest to self-chat
+    {
+        let db_bg = db.clone();
+        let cfg_bg = cfg.clone();
+        let ctx_slot = Arc::clone(&active_ctx);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let now_ms = Utc::now().timestamp_millis();
+                let cfg_n1 = cfg_bg.clone();
+                let _ = tick_urgent_alerts(&db_bg, &cfg_bg, now_ms, move |title, body| {
+                    let c = cfg_n1.clone();
+                    async move { send_ntfy_http(&c, &title, &body).await }
+                })
+                .await;
+
+                let current_ctx = ctx_slot.lock().ok().and_then(|g| g.clone());
+                if let Some(live_ctx) = current_ctx {
+                    let cfg_n2 = cfg_bg.clone();
+                    let ctx_w1 = Arc::clone(&live_ctx);
+                    let _ = tick_stale_urgent_intakes(
+                        &db_bg,
+                        &cfg_bg,
+                        now_ms,
+                        move |title, body| {
+                            let c = cfg_n2.clone();
+                            async move { send_ntfy_http(&c, &title, &body).await }
+                        },
+                        move |wa_msg| {
+                            ctx_w1.notify_owner(wa_msg);
+                            async { Ok(()) }
+                        },
+                    )
+                    .await;
+
+                    let ctx_w2 = Arc::clone(&live_ctx);
+                    let _ = tick_due_reminders(&db_bg, now_ms, move |wa_msg| {
+                        ctx_w2.notify_owner(wa_msg);
+                        async { Ok(()) }
+                    })
+                    .await;
+
+                    let ctx_w3 = Arc::clone(&live_ctx);
+                    let _ = tick_morning_digest(&db_bg, &cfg_bg, now_ms, move |wa_msg| {
+                        ctx_w3.notify_owner(wa_msg);
+                        async { Ok(()) }
+                    })
+                    .await;
+                }
+            }
+        });
+    }
 
     // Lightweight HTTP health listener for Heroku / Container probes
     if cfg.health_port > 0 {
@@ -1041,6 +1259,7 @@ async fn main() -> Result<()> {
             mod_tracker: Arc::clone(&mod_tracker),
             loop_guard: Arc::clone(&loop_guard),
             echo_guard: Arc::clone(&echo_guard),
+            media_budget: Arc::clone(&media_budget),
             bridge_tx,
             self_identity: Mutex::new((String::new(), None)),
             seen_ids: Mutex::new(HashSet::new()),
@@ -1048,6 +1267,9 @@ async fn main() -> Result<()> {
             roster_waiters: Mutex::new(HashMap::new()),
             groups_waiters: Mutex::new(HashMap::new()),
         });
+        if let Ok(mut guard) = active_ctx.lock() {
+            *guard = Some(Arc::clone(&ctx));
+        }
 
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
@@ -1098,8 +1320,16 @@ mod tests {
             turso_auth_token: None,
             pair_phone: "2349113683395".to_string(),
             ai_key: "test-key".to_string(),
+            cf_account_id: "test-cf-acct-12345678".to_string(),
             ai_base_url: "https://api.openai.com/v1".to_string(),
             ai_model: "gpt-4o".to_string(),
+            whisper_model: "@cf/openai/whisper-large-v3-turbo".to_string(),
+            vision_model: "@cf/mistralai/mistral-small-3.1-24b-instruct".to_string(),
+            ntfy_url: "https://ntfy.sh".to_string(),
+            ntfy_topic: "secret-falke-topic-xyz987".to_string(),
+            ntfy_token: Some("ntfy_tok_secret_12345".to_string()),
+            digest_hour_lagos: 7,
+            max_media_per_day: 40,
             default_reply_mode: "everyone".to_string(),
             reply_wait_ms: 300_000,
             takeover_pause_ms: 7_200_000,
@@ -1840,10 +2070,8 @@ mod tests {
         assert!(eg.is_echo("Hey! FalkeAI here holding the fort.", 10_500));
         assert!(!eg.is_echo("Hey! FalkeAI here holding the fort.", 10_600));
 
-        // 4) Non-blocking note for Falcon (e.g. Pookie's reminder) keeps conversation active
+        // 4) Non-blocking note for Falcon (e.g. Pookie's reminder) keeps conversation active and queues for 7:00 AM digest
         let scheduler = DmTakeoverScheduler::new();
-        let alerts = Arc::new(Mutex::new(Vec::<String>::new()));
-        let alerts_c = Arc::clone(&alerts);
         let _ = execute_customer_reply(
             &db,
             &cfg,
@@ -1863,29 +2091,28 @@ mod tests {
                 .to_string())
             },
             |_, _, _| async { Ok(()) },
-            move |a| {
-                alerts_c.lock().unwrap().push(a);
-                async { Ok(()) }
-            },
+            |_| async { Ok(()) },
         )
         .await
         .unwrap();
-        assert_eq!(alerts.lock().unwrap().len(), 1);
-        assert!(alerts.lock().unwrap()[0].contains("Pookie is awake"));
+        let queued_notes = db.list_pending_digest_items(10).await.unwrap();
+        assert_eq!(queued_notes.len(), 1);
+        assert_eq!(queued_notes[0].kind, "note");
+        assert!(queued_notes[0].summary.contains("Pookie is awake"));
         let pookie_state = db.get_conversation("2348022233344").await.unwrap().unwrap();
         assert!(pookie_state.bot_active);
         assert!(!pookie_state.owner_read_unanswered);
 
-        // 5) Deterministic approval hold on financial request + self-chat approve/reject workflow
+        // 5) Deterministic approval hold on non-urgent financial request + self-chat approve/reject workflow
         assert_eq!(
-            approval_trigger("Please send me money or transfer 50k to my account number"),
+            approval_trigger("Please send me money or bank details for 50k"),
             Some("Financial request")
         );
         let fin_res = handle_customer_message(
             &db,
             &cfg,
             "2348066677788",
-            "Bro please transfer 50k to my account number urgently",
+            "Bro please send me money for 50k whenever you are free",
             &[],
             3_000_000,
             |_| async {
@@ -1942,5 +2169,456 @@ mod tests {
                 "I'll call you in 10 mins".to_string()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn test_urgent_alert_intake_ntfy_repeat_ack_and_hourly_limit() {
+        use crate::alerts::{
+            fire_urgent_alert_if_allowed, tick_stale_urgent_intakes, tick_urgent_alerts,
+            URGENT_INTAKE_TIMEOUT_MS, URGENT_REPEAT_INTERVAL_MS,
+        };
+
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // Turn 1: Recruiter sends urgent job offer missing name & deadline -> FalkeAI collects first (does NOT lock thread yet)
+        let r1 = handle_customer_message(
+            &db,
+            &cfg,
+            "2348099900011",
+            "Urgent job offer for Falcon! Need to speak today.",
+            &[],
+            10_000_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "Got it — I'll page Falcon right away. Quick details: what's your name and the exact deadline?",
+                    "urgency": "urgent",
+                    "urgent_intake": {
+                        "name": null,
+                        "number": "2348099900011",
+                        "request": "Job offer for Falcon",
+                        "deadline": null
+                    }
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!r1.urgent_ready);
+        assert!(!r1.held);
+
+        // Turn 2: Recruiter supplies name & deadline -> urgent_ready == true, thread held, fires ntfy alert
+        let r2 = handle_customer_message(
+            &db,
+            &cfg,
+            "2348099900011",
+            "Sarah from TechCorp, deadline is 5pm today.",
+            &[],
+            10_030_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "Thanks Sarah — paging Falcon right now with all details.",
+                    "urgency": "urgent",
+                    "urgent_intake": {
+                        "name": "Sarah (TechCorp)",
+                        "number": "2348099900011",
+                        "request": "Senior Dev job offer",
+                        "deadline": "5pm today"
+                    }
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(r2.urgent_ready);
+        assert!(r2.held);
+
+        let ntfy_log = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let wa_log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let n1 = Arc::clone(&ntfy_log);
+        let w1 = Arc::clone(&wa_log);
+        let fired = fire_urgent_alert_if_allowed(
+            &db,
+            &cfg,
+            "2348099900011",
+            Some("Sarah (TechCorp)".to_string()),
+            r2.urgent_draft.as_ref().unwrap(),
+            "Job offer",
+            10_030_000,
+            move |t, b| {
+                n1.lock().unwrap().push((t, b));
+                async { Ok(()) }
+            },
+            move |m| {
+                w1.lock().unwrap().push(m);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(fired);
+        assert_eq!(ntfy_log.lock().unwrap().len(), 1);
+        assert_eq!(wa_log.lock().unwrap().len(), 1);
+
+        // Hourly limit: second urgent alert for same chat within 1 hour is blocked
+        let n2 = Arc::clone(&ntfy_log);
+        let w2 = Arc::clone(&wa_log);
+        let fired_again = fire_urgent_alert_if_allowed(
+            &db,
+            &cfg,
+            "2348099900011",
+            Some("Sarah".to_string()),
+            r2.urgent_draft.as_ref().unwrap(),
+            "Another urgent ping",
+            10_100_000,
+            move |t, b| {
+                n2.lock().unwrap().push((t, b));
+                async { Ok(()) }
+            },
+            move |m| {
+                w2.lock().unwrap().push(m);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!fired_again);
+        assert_eq!(ntfy_log.lock().unwrap().len(), 1);
+
+        // Repeat ticker: before 2 mins -> 0 repeats; at +2 mins -> Ping #2 fires
+        let n3 = Arc::clone(&ntfy_log);
+        let c0 = tick_urgent_alerts(&db, &cfg, 10_030_000 + 60_000, move |t, b| {
+            n3.lock().unwrap().push((t, b));
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(c0, 0);
+
+        let n4 = Arc::clone(&ntfy_log);
+        let c1 = tick_urgent_alerts(
+            &db,
+            &cfg,
+            10_030_000 + URGENT_REPEAT_INTERVAL_MS,
+            move |t, b| {
+                n4.lock().unwrap().push((t, b));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(c1, 1);
+        assert_eq!(ntfy_log.lock().unwrap().len(), 2);
+        assert!(ntfy_log.lock().unwrap()[1].0.contains("Ping #2"));
+
+        // Owner replies "ack" in self-chat -> stops further repeats
+        let ack_reply = run_owner_command(&db, &cfg, "ack", || async { Ok(vec![]) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ack_reply.contains("Acknowledged 1 urgent alert"));
+
+        let n5 = Arc::clone(&ntfy_log);
+        let c_after_ack = tick_urgent_alerts(
+            &db,
+            &cfg,
+            10_030_000 + 4 * URGENT_REPEAT_INTERVAL_MS,
+            move |t, b| {
+                n5.lock().unwrap().push((t, b));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(c_after_ack, 0);
+
+        // Stale intake timeout test: sender triggers urgent chat and goes silent -> fires after 2.5 minutes
+        let _ = handle_customer_message(
+            &db,
+            &cfg,
+            "2348077711122",
+            "Emergency payment issue!",
+            &[],
+            20_000_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "What's your name and deadline?",
+                    "urgency": "urgent",
+                    "urgent_intake": { "request": "Emergency payment issue" }
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+        let n6 = Arc::clone(&ntfy_log);
+        let w6 = Arc::clone(&wa_log);
+        let stale_fired = tick_stale_urgent_intakes(
+            &db,
+            &cfg,
+            20_000_000 + URGENT_INTAKE_TIMEOUT_MS + 1_000,
+            move |t, b| {
+                n6.lock().unwrap().push((t, b));
+                async { Ok(()) }
+            },
+            move |m| {
+                w6.lock().unwrap().push(m);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale_fired, 1);
+    }
+
+    #[tokio::test]
+    async fn test_morning_digest_batching_and_7am_lagos_delivery() {
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // Non-urgent handoff queues into digest_queue instead of notifying immediately
+        let wa_sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let w_c = Arc::clone(&wa_sent);
+        let _ = execute_customer_reply(
+            &db,
+            &cfg,
+            "2348033311100",
+            "2348033311100@s.whatsapp.net",
+            "d1",
+            "Do you offer Biology tutoring next term?",
+            &[],
+            1_000_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "We focus on Physics, Chemistry, and Maths — I'll leave Biology for Falcon to confirm.",
+                    "flag_human": true,
+                    "flag_reason": "Asked about Biology tutoring"
+                })
+                .to_string())
+            },
+            |_, _, _| async { Ok(()) },
+            move |m| {
+                w_c.lock().unwrap().push(m);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(wa_sent.lock().unwrap().is_empty());
+        assert_eq!(db.list_pending_digest_items(10).await.unwrap().len(), 1);
+
+        // At 6:50 AM Lagos (05:50 UTC) -> should NOT fire yet
+        let t_650 = Utc.with_ymd_and_hms(2026, 11, 20, 5, 50, 0).unwrap().timestamp_millis();
+        let d_before = tick_morning_digest(&db, &cfg, t_650, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(!d_before);
+
+        // At 7:01 AM Lagos (06:01 UTC) -> delivers once and marks items delivered
+        let t_701 = Utc.with_ymd_and_hms(2026, 11, 20, 6, 1, 0).unwrap().timestamp_millis();
+        let digest_msgs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let dm = Arc::clone(&digest_msgs);
+        let d_at_7 = tick_morning_digest(&db, &cfg, t_701, move |m| {
+            dm.lock().unwrap().push(m);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(d_at_7);
+        assert_eq!(digest_msgs.lock().unwrap().len(), 1);
+        assert!(digest_msgs.lock().unwrap()[0].contains("7:00 AM Morning Briefing"));
+        assert!(digest_msgs.lock().unwrap()[0].contains("Biology tutoring"));
+        assert!(db.list_pending_digest_items(10).await.unwrap().is_empty());
+
+        // Second tick on same day does NOT re-send
+        let d_repeat = tick_morning_digest(&db, &cfg, t_701 + 60_000, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(!d_repeat);
+    }
+
+    #[tokio::test]
+    async fn test_emotion_engine_and_crisis_escalation() {
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // 1) Mild playful / affectionate pouting -> tracked on ContactMemory, stays active (no crisis hold)
+        let r_playful = handle_customer_message(
+            &db,
+            &cfg,
+            "2348044455566",
+            "He didn't say goodnight last night 😢",
+            &[],
+            5_000_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "Ouch, Falcon is definitely in trouble for that one — I'll make sure it's the first thing he sees.",
+                    "emotion": "hurt",
+                    "emotion_intensity": "low",
+                    "emotion_subtext": "Affectionately pouting over missed goodnight",
+                    "notify_falcon": true,
+                    "note_for_falcon": "Missed saying goodnight last night"
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!r_playful.held);
+        assert!(!r_playful.urgent_ready);
+        let cm = db.get_contact_memory("2348044455566").await.unwrap().unwrap();
+        assert_eq!(cm.recent_emotions.len(), 1);
+        assert_eq!(cm.recent_emotions[0].emotion, "hurt");
+
+        // 2) High-intensity crisis -> immediate urgent escalation & automation hold
+        let r_crisis = handle_customer_message(
+            &db,
+            &cfg,
+            "2348044455566",
+            "My dad was just rushed to the hospital, I need Falcon right now",
+            &[],
+            5_100_000,
+            |_| async {
+                Ok(json!({
+                    "reply": "I'm so sorry to hear that — I'm paging Falcon right away so he sees this immediately.",
+                    "emotion": "sad",
+                    "emotion_intensity": "high",
+                    "emotion_subtext": "Family medical emergency"
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(r_crisis.urgent_ready);
+        assert!(r_crisis.held);
+        assert!(r_crisis.flagged);
+    }
+
+    #[tokio::test]
+    async fn test_contact_tiers_availability_and_scoped_owner_memory() {
+        use crate::brain::build_system_prompt_with_status;
+
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // Save 3 visibility tiers of owner memory
+        let _ = run_owner_command(&db, &cfg, "remember public Aurikrex teaches Physics, Chemistry, and Maths", || async { Ok(vec![]) }).await.unwrap();
+        let _ = run_owner_command(&db, &cfg, "remember close Falcon is currently hacking on a Rust agent", || async { Ok(vec![]) }).await.unwrap();
+        let _ = run_owner_command(&db, &cfg, "remember private Mom's spare key is under the blue mat", || async { Ok(vec![]) }).await.unwrap();
+
+        let owner_mems = db.list_owner_memory(20).await.unwrap();
+        let parts = lagos_parts(Utc::now(), 11, 18);
+
+        // Stranger ("normal" tier) sees ONLY `public`
+        let stranger_cm = crate::db::ContactMemory::new("234800001");
+        let st_stranger = crate::db::ConversationState::new("234800001");
+        let p_stranger = build_system_prompt_with_status(&parts, &st_stranger, "234800001", Some(&stranger_cm), &owner_mems, &[], None);
+        assert!(p_stranger.contains("Aurikrex teaches Physics"));
+        assert!(!p_stranger.contains("hacking on a Rust agent"));
+        assert!(!p_stranger.contains("spare key"));
+
+        // VIP contact sees `public` + `close`, NEVER `private_internal`
+        let _ = run_owner_command(&db, &cfg, "vip 234800002", || async { Ok(vec![]) }).await.unwrap();
+        let vip_cm = db.get_contact_memory("234800002").await.unwrap().unwrap();
+        assert_eq!(vip_cm.tier, "vip");
+        let p_vip = build_system_prompt_with_status(&parts, &st_stranger, "234800002", Some(&vip_cm), &owner_mems, &[], None);
+        assert!(p_vip.contains("Aurikrex teaches Physics"));
+        assert!(p_vip.contains("hacking on a Rust agent"));
+        assert!(!p_vip.contains("spare key"));
+
+        // Availability mode via command
+        let busy_resp = run_owner_command(&db, &cfg, "deep 2h studying thermodynamics", || async { Ok(vec![]) }).await.unwrap().unwrap();
+        assert!(busy_resp.contains("deep_work"));
+        let status = db.get_owner_status(Utc::now().timestamp_millis()).await.unwrap();
+        assert!(status.is_unavailable(Utc::now().timestamp_millis()));
+        let p_busy = build_system_prompt_with_status(&parts, &st_stranger, "234800002", Some(&vip_cm), &owner_mems, &[], Some(&status));
+        assert!(p_busy.contains("studying thermodynamics"));
+    }
+
+    #[tokio::test]
+    async fn test_conversational_self_chat_reminders_and_ntfy_redaction() {
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // NTFY topic and token must be strictly redacted
+        let leaked = redact_secrets(
+            "Posting to secret-falke-topic-xyz987 with bearer ntfy_tok_secret_12345",
+            &cfg,
+        );
+        assert!(!leaked.contains("secret-falke-topic-xyz987"));
+        assert!(!leaked.contains("ntfy_tok_secret_12345"));
+
+        // Conversational self-chat executes multiple actions cleanly (save memory, add reminder, send DM, set VIP)
+        let now_ms = 50_000_000;
+        let outcome = handle_owner_self_chat(
+            &db,
+            &cfg,
+            "Make 2348012345678 VIP, remind me in 30m to call Chidi, save privately that I prefer morning workouts, and tell 2348012345678 I'll see them at 4pm",
+            now_ms,
+            |_| async {
+                Ok(json!({
+                    "reply": "All set, Falcon — Chidi is marked VIP, reminder set for 30 minutes, note saved privately, and your message is on its way.",
+                    "actions": [
+                        { "type": "set_contact_tier", "target": "2348012345678", "tier": "vip" },
+                        { "type": "add_reminder", "in_minutes": 30, "text": "Call Chidi" },
+                        { "type": "save_owner_memory", "category": "preferences", "visibility": "private_internal", "content": "Prefers morning workouts" },
+                        { "type": "send_dm", "target": "2348012345678", "message": "I'll see you at 4pm" }
+                    ]
+                })
+                .to_string())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.reply.contains("All set"));
+        assert_eq!(outcome.outbounds.len(), 1);
+        assert_eq!(outcome.outbounds[0].1, "I'll see you at 4pm");
+        assert_eq!(db.get_contact_memory("2348012345678").await.unwrap().unwrap().tier, "vip");
+        assert!(db.list_owner_memory(10).await.unwrap().iter().any(|m| m.visibility == "private_internal" && m.content.contains("morning workouts")));
+
+        // Reminder ticker delivers after 30 minutes
+        let rem_msgs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rm = Arc::clone(&rem_msgs);
+        let delivered = tick_due_reminders(&db, now_ms + 31 * 60_000, move |m| {
+            rm.lock().unwrap().push(m);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, 1);
+        assert!(rem_msgs.lock().unwrap()[0].contains("Call Chidi"));
+    }
+
+    #[test]
+    fn test_media_base64_budget_and_temp_cleanup() {
+        use crate::media::{base64_encode, MediaBudget, TempFileGuard};
+
+        // RFC 4648 base64 vectors
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+
+        // Daily media budget enforcement & date rollover
+        let budget = MediaBudget::new();
+        assert!(budget.try_consume(2, "2026-11-19"));
+        assert!(budget.try_consume(2, "2026-11-19"));
+        assert!(!budget.try_consume(2, "2026-11-19"));
+        assert!(budget.try_consume(2, "2026-11-20"));
+
+        // Guaranteed temp file cleanup on Drop
+        let tmp = std::env::temp_dir().join("falkeai_test_cleanup_guard.tmp");
+        std::fs::write(&tmp, b"temp audio bytes").unwrap();
+        assert!(tmp.exists());
+        {
+            let _guard = TempFileGuard::new(&tmp);
+        }
+        assert!(!tmp.exists());
     }
 }

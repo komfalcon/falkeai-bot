@@ -153,6 +153,35 @@ pub fn approval_trigger(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Deterministic urgency detector (keywords + VIP escalation backstop) for jobs, deals,
+/// payments, strict deadlines, emergencies, or someone waiting right now.
+pub fn urgent_trigger(text: &str, is_vip: bool) -> Option<&'static str> {
+    let lower = format!(" {} ", text.to_lowercase());
+    let hard_urgent = [
+        "urgent", "urgently", "asap", "emergency", "right now", "immediately",
+        "call me now", "pick up", "waiting outside", "i'm outside", "im outside",
+        "waiting for you", "at the gate", "site is down", "server is down",
+        "deadline", "due today", "due tonight", "before midnight", "closing today",
+        "job offer", "interview", "recruiter", "shortlisted", "offer letter",
+        "client deal", "business deal", "close the deal", "sign the contract",
+        "payment issue", "payment failed", "sent the money", "paid into", "debit alert",
+        "bank transfer", "transfer failed", "hospital", "accident",
+    ];
+    if hard_urgent.iter().any(|k| lower.contains(k)) {
+        return Some("Urgent keyword match");
+    }
+    if is_vip {
+        let vip_urgent = [
+            "call me", "need you", "where are you", "please reply", "respond",
+            "payment", "deal", "job", "waiting", "problem", "trouble", "sick", "help me",
+        ];
+        if vip_urgent.iter().any(|k| lower.contains(k)) {
+            return Some("VIP urgent message");
+        }
+    }
+    None
+}
+
 fn looks_like_secret_token(word: &str) -> bool {
     let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.');
     if w.starts_with("eyJ") && w.len() >= 24 {
@@ -184,6 +213,17 @@ pub fn redact_secrets(text: &str, cfg: &Config) -> String {
     }
     if cfg.turso_url.trim().len() > 8 {
         secrets.push(cfg.turso_url.trim().to_string());
+    }
+    if cfg.cf_account_id.trim().len() >= 8 {
+        secrets.push(cfg.cf_account_id.trim().to_string());
+    }
+    if cfg.ntfy_topic.trim().len() >= 4 {
+        secrets.push(cfg.ntfy_topic.trim().to_string());
+    }
+    if let Some(t) = cfg.ntfy_token.as_deref() {
+        if !t.trim().is_empty() {
+            secrets.push(t.trim().to_string());
+        }
     }
     if cfg.ai_base_url.contains("/accounts/") {
         if let Some(acct) = cfg.ai_base_url.split("/accounts/").nth(1).and_then(|s| s.split('/').next()) {

@@ -13,8 +13,16 @@ pub struct Config {
     pub turso_auth_token: Option<String>,
     pub pair_phone: String,
     pub ai_key: String,
+    pub cf_account_id: String,
     pub ai_base_url: String,
     pub ai_model: String,
+    pub whisper_model: String,
+    pub vision_model: String,
+    pub ntfy_url: String,
+    pub ntfy_topic: String,
+    pub ntfy_token: Option<String>,
+    pub digest_hour_lagos: u32,
+    pub max_media_per_day: usize,
     pub default_reply_mode: String,
     pub reply_wait_ms: i64,
     pub takeover_pause_ms: i64,
@@ -65,6 +73,37 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "@cf/mistralai/mistral-small-3.1-24b-instruct".to_string());
+        let whisper_model = env::var("WHISPER_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "@cf/openai/whisper-large-v3-turbo".to_string());
+        let vision_model = env::var("VISION_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| ai_model.clone());
+
+        let ntfy_url = env::var("NTFY_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://ntfy.sh".to_string());
+        let ntfy_topic = env::var("NTFY_TOPIC")
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('/')
+            .to_string();
+        let ntfy_token = env::var("NTFY_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        let digest_hour_lagos: u32 = env::var("DIGEST_HOUR_LAGOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&h| h < 24)
+            .unwrap_or(7);
+        let max_media_per_day: usize = env::var("MAX_MEDIA_PER_DAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
 
         let default_reply_mode = match env::var("REPLY_MODE").unwrap_or_default().as_str() {
             "unsaved" => "unsaved".to_string(),
@@ -92,8 +131,16 @@ impl Config {
             turso_auth_token,
             pair_phone,
             ai_key,
+            cf_account_id: cf_account_id.trim().to_string(),
             ai_base_url,
             ai_model,
+            whisper_model,
+            vision_model,
+            ntfy_url,
+            ntfy_topic,
+            ntfy_token,
+            digest_hour_lagos,
+            max_media_per_day,
             default_reply_mode,
             reply_wait_ms: wait_mins.max(0) * 60_000,
             takeover_pause_ms: pause_mins.max(1) * 60_000,

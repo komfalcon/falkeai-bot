@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -100,8 +101,92 @@ func cleanPhone(raw string) string {
 	return digits
 }
 
+func extractSimpleText(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if msg.GetConversation() != "" {
+		return strings.TrimSpace(msg.GetConversation())
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return strings.TrimSpace(ext.GetText())
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return strings.TrimSpace(img.GetCaption())
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return strings.TrimSpace(vid.GetCaption())
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return strings.TrimSpace(doc.GetCaption())
+	}
+	return ""
+}
+
+func extractQuotedText(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	var ci *waE2E.ContextInfo
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		ci = ext.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		ci = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		ci = vid.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		ci = aud.GetContextInfo()
+	}
+	if ci == nil {
+		return ""
+	}
+	q := extractSimpleText(ci.GetQuotedMessage())
+	runes := []rune(q)
+	if len(runes) > 220 {
+		q = string(runes[:220])
+	}
+	return q
+}
+
+func unwrapEdited(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return nil
+	}
+	if pm := msg.GetProtocolMessage(); pm != nil {
+		if edited := pm.GetEditedMessage(); edited != nil {
+			return edited
+		}
+	}
+	return msg
+}
+
+func saveTempMedia(data []byte) string {
+	// Sweep stale media files older than 10 minutes
+	if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "falkeai_media_*")); err == nil {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for _, m := range matches {
+			if info, err := os.Stat(m); err == nil && info.ModTime().Before(cutoff) {
+				_ = os.Remove(m)
+			}
+		}
+	}
+	f, err := os.CreateTemp("", "falkeai_media_*")
+	if err != nil {
+		return ""
+	}
+	path := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return ""
+	}
+	_ = f.Close()
+	return path
+}
+
 func extractTextAndURLs(msg *waE2E.Message) (string, bool, []string, bool) {
 	urls := make([]string, 0)
+	msg = unwrapEdited(msg)
 	if msg == nil {
 		return "", false, urls, false
 	}
@@ -193,9 +278,33 @@ func main() {
 			}
 
 		case *events.Message:
-			text, isVoice, matchedURLs, isUserMsg := extractTextAndURLs(v.Message)
+			unwrapped := unwrapEdited(v.Message)
+			text, isVoice, matchedURLs, isUserMsg := extractTextAndURLs(unwrapped)
 			if !isUserMsg {
 				return
+			}
+			quotedText := extractQuotedText(unwrapped)
+			mediaKind := ""
+			mediaPath := ""
+			mediaMime := ""
+			if !v.Info.IsGroup && !v.Info.IsFromMe && unwrapped != nil {
+				if aud := unwrapped.GetAudioMessage(); aud != nil && aud.GetFileLength() <= 5*1024*1024 {
+					if data, err := client.Download(ctx, aud); err == nil && len(data) > 0 && len(data) <= 5*1024*1024 {
+						if p := saveTempMedia(data); p != "" {
+							mediaKind = "audio"
+							mediaPath = p
+							mediaMime = aud.GetMimetype()
+						}
+					}
+				} else if img := unwrapped.GetImageMessage(); img != nil && img.GetFileLength() <= 4*1024*1024 {
+					if data, err := client.Download(ctx, img); err == nil && len(data) > 0 && len(data) <= 4*1024*1024 {
+						if p := saveTempMedia(data); p != "" {
+							mediaKind = "image"
+							mediaPath = p
+							mediaMime = img.GetMimetype()
+						}
+					}
+				}
 			}
 			senderAlt := ""
 			if !v.Info.SenderAlt.IsEmpty() {
@@ -219,6 +328,18 @@ func main() {
 					}
 				}
 			}
+			var quotedAny any = nil
+			if quotedText != "" {
+				quotedAny = quotedText
+			}
+			var mkAny, mpAny, mmAny any = nil, nil, nil
+			if mediaKind != "" && mediaPath != "" {
+				mkAny = mediaKind
+				mpAny = mediaPath
+				if mediaMime != "" {
+					mmAny = mediaMime
+				}
+			}
 			emit(map[string]any{
 				"event":          "message",
 				"id":             v.Info.ID,
@@ -231,7 +352,11 @@ func main() {
 				"is_group":       v.Info.IsGroup,
 				"timestamp":      v.Info.Timestamp.Unix(),
 				"text":           text,
+				"quoted_text":    quotedAny,
 				"is_voice":       isVoice,
+				"media_kind":     mkAny,
+				"media_path":     mpAny,
+				"media_mime":     mmAny,
 				"matched_urls":   matchedURLs,
 			})
 

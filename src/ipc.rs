@@ -56,7 +56,15 @@ pub enum BridgeEvent {
         #[serde(default)]
         text: String,
         #[serde(default)]
+        quoted_text: Option<String>,
+        #[serde(default)]
         is_voice: bool,
+        #[serde(default)]
+        media_kind: Option<String>,
+        #[serde(default)]
+        media_path: Option<String>,
+        #[serde(default)]
+        media_mime: Option<String>,
         #[serde(default, deserialize_with = "deserialize_null_default")]
         matched_urls: Vec<String>,
     },

@@ -17,6 +17,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         sender TEXT PRIMARY KEY,
         name TEXT,
         draft_json TEXT NOT NULL DEFAULT '{}',
+        urgent_draft_json TEXT NOT NULL DEFAULT '{}',
         history_json TEXT NOT NULL DEFAULT '[]',
         last_booking_key TEXT,
         bot_active INTEGER NOT NULL DEFAULT 0,
@@ -39,6 +40,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         aliases_json TEXT NOT NULL DEFAULT '[]',
         relationship TEXT,
         tone TEXT,
+        tier TEXT NOT NULL DEFAULT 'normal',
+        recent_emotions_json TEXT NOT NULL DEFAULT '[]',
         owner_style_pattern TEXT,
         sample_owner_replies_json TEXT NOT NULL DEFAULT '[]',
         summary TEXT NOT NULL DEFAULT '',
@@ -51,6 +54,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS owner_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         category TEXT NOT NULL DEFAULT 'general',
+        visibility TEXT NOT NULL DEFAULT 'public',
         content TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'owner',
         created_at INTEGER NOT NULL,
@@ -120,6 +124,36 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         id TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS urgent_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        contact_name TEXT,
+        phone TEXT NOT NULL,
+        request TEXT NOT NULL,
+        deadline TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        last_sent_at INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        acknowledged INTEGER NOT NULL DEFAULT 0
+    )",
+    "CREATE TABLE IF NOT EXISTS digest_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        contact_name TEXT,
+        kind TEXT NOT NULL DEFAULT 'handoff',
+        summary TEXT NOT NULL,
+        last_message TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0
+    )",
+    "CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        due_at INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    )",
 ];
 
 #[derive(Debug, Clone)]
@@ -177,11 +211,95 @@ pub struct BookingDraft {
     pub contact_number: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UrgentDraft {
+    #[serde(default)]
+    pub active: bool,
+    pub name: Option<String>,
+    pub number: Option<String>,
+    pub request: Option<String>,
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub turns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EmotionEntry {
+    pub emotion: String,
+    pub intensity: String,
+    #[serde(default)]
+    pub subtext: String,
+    #[serde(default)]
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrgentAlertRecord {
+    pub id: i64,
+    pub sender: String,
+    pub contact_name: Option<String>,
+    pub phone: String,
+    pub request: String,
+    pub deadline: String,
+    pub summary: String,
+    pub created_at: i64,
+    pub last_sent_at: i64,
+    pub attempts: i64,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestItem {
+    pub id: i64,
+    pub sender: String,
+    pub contact_name: Option<String>,
+    pub kind: String,
+    pub summary: String,
+    pub last_message: String,
+    pub created_at: i64,
+    pub delivered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderRecord {
+    pub id: i64,
+    pub due_at: i64,
+    pub text: String,
+    pub delivered: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct OwnerStatus {
+    /// "available" | "busy" | "deep_work" | "sleeping"
+    pub mode: String,
+    pub until_ms: i64,
+    pub note: Option<String>,
+}
+
+impl OwnerStatus {
+    pub fn available() -> Self {
+        Self {
+            mode: "available".to_string(),
+            until_ms: 0,
+            note: None,
+        }
+    }
+
+    pub fn is_unavailable(&self, now_ms: i64) -> bool {
+        self.mode != "available" && !self.mode.is_empty() && (self.until_ms == 0 || now_ms < self.until_ms)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationState {
     pub sender: String,
     pub name: Option<String>,
     pub draft: BookingDraft,
+    #[serde(default)]
+    pub urgent_draft: UrgentDraft,
     pub history: Vec<ChatTurn>,
     pub last_booking_key: Option<String>,
     pub bot_active: bool,
@@ -198,6 +316,7 @@ impl ConversationState {
             sender: sender.to_string(),
             name: None,
             draft: BookingDraft::default(),
+            urgent_draft: UrgentDraft::default(),
             history: Vec::new(),
             last_booking_key: None,
             bot_active: false,
@@ -219,6 +338,14 @@ pub struct PendingReply {
     pub last_msg_id: String,
 }
 
+fn default_tier() -> String {
+    "normal".to_string()
+}
+
+fn default_visibility() -> String {
+    "public".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactMemory {
     pub sender: String,
@@ -226,6 +353,10 @@ pub struct ContactMemory {
     pub aliases: Vec<String>,
     pub relationship: Option<String>,
     pub tone: Option<String>,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    #[serde(default)]
+    pub recent_emotions: Vec<EmotionEntry>,
     #[serde(default)]
     pub owner_style_pattern: Option<String>,
     #[serde(default)]
@@ -247,6 +378,8 @@ impl ContactMemory {
             aliases: Vec::new(),
             relationship: None,
             tone: None,
+            tier: "normal".to_string(),
+            recent_emotions: Vec::new(),
             owner_style_pattern: None,
             sample_owner_replies: Vec::new(),
             summary: String::new(),
@@ -263,6 +396,8 @@ impl ContactMemory {
 pub struct OwnerMemoryItem {
     pub id: i64,
     pub category: String,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
     pub content: String,
     pub source: String,
     pub created_at: i64,
@@ -320,6 +455,12 @@ struct LocalStoreData {
     saved_contacts: HashMap<String, String>,
     settings: HashMap<String, String>,
     auth_blobs: HashMap<String, String>,
+    #[serde(default)]
+    urgent_alerts: Vec<UrgentAlertRecord>,
+    #[serde(default)]
+    digest_queue: Vec<DigestItem>,
+    #[serde(default)]
+    reminders: Vec<ReminderRecord>,
     next_id: i64,
 }
 
@@ -451,6 +592,30 @@ impl Database {
         let _ = self
             .execute_remote(
                 "ALTER TABLE contact_memory ADD COLUMN sample_owner_replies_json TEXT NOT NULL DEFAULT '[]'",
+                vec![],
+            )
+            .await;
+        let _ = self
+            .execute_remote(
+                "ALTER TABLE conversations ADD COLUMN urgent_draft_json TEXT NOT NULL DEFAULT '{}'",
+                vec![],
+            )
+            .await;
+        let _ = self
+            .execute_remote(
+                "ALTER TABLE contact_memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'normal'",
+                vec![],
+            )
+            .await;
+        let _ = self
+            .execute_remote(
+                "ALTER TABLE contact_memory ADD COLUMN recent_emotions_json TEXT NOT NULL DEFAULT '[]'",
+                vec![],
+            )
+            .await;
+        let _ = self
+            .execute_remote(
+                "ALTER TABLE owner_memory ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'",
                 vec![],
             )
             .await;
@@ -609,6 +774,9 @@ impl Database {
                 let draft: BookingDraft = row_str(row, "draft_json")
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
+                let urgent_draft: UrgentDraft = row_str(row, "urgent_draft_json")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
                 let history: Vec<ChatTurn> = row_str(row, "history_json")
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
@@ -617,6 +785,7 @@ impl Database {
                     sender: row_str(row, "sender").unwrap_or_else(|| sender.to_string()),
                     name: row_str(row, "name"),
                     draft,
+                    urgent_draft,
                     history,
                     last_booking_key: row_str(row, "last_booking_key"),
                     bot_active: row_i64(row, "bot_active") != 0,
@@ -643,14 +812,17 @@ impl Database {
             TursoBackend::Remote { .. } => {
                 let draft_json =
                     serde_json::to_string(&state.draft).unwrap_or_else(|_| "{}".to_string());
+                let urgent_draft_json =
+                    serde_json::to_string(&state.urgent_draft).unwrap_or_else(|_| "{}".to_string());
                 let history_json =
                     serde_json::to_string(&state.history).unwrap_or_else(|_| "[]".to_string());
                 self.execute_remote(
-                    "INSERT INTO conversations (sender, name, draft_json, history_json, last_booking_key, bot_active, owner_read_unanswered, paused_until, last_flagged_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO conversations (sender, name, draft_json, urgent_draft_json, history_json, last_booking_key, bot_active, owner_read_unanswered, paused_until, last_flagged_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(sender) DO UPDATE SET
                        name = excluded.name,
                        draft_json = excluded.draft_json,
+                       urgent_draft_json = excluded.urgent_draft_json,
                        history_json = excluded.history_json,
                        last_booking_key = excluded.last_booking_key,
                        bot_active = excluded.bot_active,
@@ -662,6 +834,7 @@ impl Database {
                         SqlParam::from(state.sender.clone()),
                         SqlParam::from(state.name.clone()),
                         SqlParam::from(draft_json),
+                        SqlParam::from(urgent_draft_json),
                         SqlParam::from(history_json),
                         SqlParam::from(state.last_booking_key.clone()),
                         SqlParam::Int(if state.bot_active { 1 } else { 0 }),
@@ -820,6 +993,9 @@ impl Database {
     }
 
     fn parse_contact_memory(row: &HashMap<String, Value>) -> ContactMemory {
+        let tier = row_str(row, "tier")
+            .filter(|s| matches!(s.as_str(), "vip" | "normal" | "silent"))
+            .unwrap_or_else(|| "normal".to_string());
         ContactMemory {
             sender: row_str(row, "sender").unwrap_or_default(),
             display_name: row_str(row, "display_name"),
@@ -828,6 +1004,10 @@ impl Database {
                 .unwrap_or_default(),
             relationship: row_str(row, "relationship"),
             tone: row_str(row, "tone"),
+            tier,
+            recent_emotions: row_str(row, "recent_emotions_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
             owner_style_pattern: row_str(row, "owner_style_pattern"),
             sample_owner_replies: row_str(row, "sample_owner_replies_json")
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -890,6 +1070,14 @@ impl Database {
                 .sample_owner_replies
                 .split_off(copy.sample_owner_replies.len() - 6);
         }
+        if copy.recent_emotions.len() > 5 {
+            copy.recent_emotions = copy
+                .recent_emotions
+                .split_off(copy.recent_emotions.len() - 5);
+        }
+        if !matches!(copy.tier.as_str(), "vip" | "normal" | "silent") {
+            copy.tier = "normal".to_string();
+        }
 
         match &self.backend {
             TursoBackend::Local(s) => {
@@ -903,13 +1091,15 @@ impl Database {
             }
             TursoBackend::Remote { .. } => {
                 self.execute_remote(
-                    "INSERT INTO contact_memory (sender, display_name, aliases_json, relationship, tone, owner_style_pattern, sample_owner_replies_json, summary, facts_json, open_threads_json, interaction_count, last_seen_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO contact_memory (sender, display_name, aliases_json, relationship, tone, tier, recent_emotions_json, owner_style_pattern, sample_owner_replies_json, summary, facts_json, open_threads_json, interaction_count, last_seen_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(sender) DO UPDATE SET
                        display_name = excluded.display_name,
                        aliases_json = excluded.aliases_json,
                        relationship = excluded.relationship,
                        tone = excluded.tone,
+                       tier = excluded.tier,
+                       recent_emotions_json = excluded.recent_emotions_json,
                        owner_style_pattern = excluded.owner_style_pattern,
                        sample_owner_replies_json = excluded.sample_owner_replies_json,
                        summary = excluded.summary,
@@ -924,6 +1114,8 @@ impl Database {
                         SqlParam::from(serde_json::to_string(&copy.aliases).unwrap_or_else(|_| "[]".to_string())),
                         SqlParam::from(copy.relationship.clone()),
                         SqlParam::from(copy.tone.clone()),
+                        SqlParam::from(copy.tier.clone()),
+                        SqlParam::from(serde_json::to_string(&copy.recent_emotions).unwrap_or_else(|_| "[]".to_string())),
                         SqlParam::from(copy.owner_style_pattern.clone()),
                         SqlParam::from(serde_json::to_string(&copy.sample_owner_replies).unwrap_or_else(|_| "[]".to_string())),
                         SqlParam::from(copy.summary.clone()),
@@ -940,12 +1132,28 @@ impl Database {
         }
     }
 
-    // ---- Owner Memory (Layer 3 - Permanent) ----
+    // ---- Owner Memory (Layer 3 - Permanent, Audience-Scoped) ----
     pub async fn add_owner_memory(&self, category: &str, content: &str, source: &str) -> Result<i64> {
+        self.add_owner_memory_scoped(category, "public", content, source)
+            .await
+    }
+
+    pub async fn add_owner_memory_scoped(
+        &self,
+        category: &str,
+        visibility: &str,
+        content: &str,
+        source: &str,
+    ) -> Result<i64> {
         let clean = content.trim();
         if clean.is_empty() {
             return Ok(0);
         }
+        let vis = match visibility.trim().to_lowercase().as_str() {
+            "close" | "friends" | "vip" => "close",
+            "private" | "private_internal" | "internal" => "private_internal",
+            _ => "public",
+        };
         let now = Utc::now().timestamp_millis();
         match &self.backend {
             TursoBackend::Local(s) => {
@@ -958,6 +1166,7 @@ impl Database {
                 {
                     existing.updated_at = now;
                     existing.category = category.to_string();
+                    existing.visibility = vis.to_string();
                     let id = existing.id;
                     guard.flush()?;
                     return Ok(id);
@@ -966,6 +1175,7 @@ impl Database {
                 guard.data.owner_memory.push(OwnerMemoryItem {
                     id,
                     category: category.to_string(),
+                    visibility: vis.to_string(),
                     content: clean.to_string(),
                     source: source.to_string(),
                     created_at: now,
@@ -984,17 +1194,23 @@ impl Database {
                 if let Some(row) = existing.rows.first() {
                     let id = row_i64(row, "id");
                     self.execute_remote(
-                        "UPDATE owner_memory SET updated_at = ?, category = ? WHERE id = ?",
-                        vec![SqlParam::Int(now), SqlParam::from(category), SqlParam::Int(id)],
+                        "UPDATE owner_memory SET updated_at = ?, category = ?, visibility = ? WHERE id = ?",
+                        vec![
+                            SqlParam::Int(now),
+                            SqlParam::from(category),
+                            SqlParam::from(vis),
+                            SqlParam::Int(id),
+                        ],
                     )
                     .await?;
                     return Ok(id);
                 }
                 let res = self
                     .execute_remote(
-                        "INSERT INTO owner_memory (category, content, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO owner_memory (category, visibility, content, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                         vec![
                             SqlParam::from(category),
+                            SqlParam::from(vis),
                             SqlParam::from(clean),
                             SqlParam::from(source),
                             SqlParam::Int(now),
@@ -1029,6 +1245,9 @@ impl Database {
                     .map(|r| OwnerMemoryItem {
                         id: row_i64(r, "id"),
                         category: row_str(r, "category").unwrap_or_default(),
+                        visibility: row_str(r, "visibility")
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "public".to_string()),
                         content: row_str(r, "content").unwrap_or_default(),
                         source: row_str(r, "source").unwrap_or_default(),
                         created_at: row_i64(r, "created_at"),
@@ -1809,6 +2028,514 @@ impl Database {
             TursoBackend::Remote { .. } => {
                 self.execute_remote("DELETE FROM auth_state WHERE id = ?", vec![SqlParam::from(key)])
                     .await?;
+                Ok(())
+            }
+        }
+    }
+
+    // ---- Recent Conversations & Active Urgent Intakes ----
+    pub async fn list_recent_conversations(&self, limit: i64) -> Result<Vec<ConversationState>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<ConversationState> = guard
+                    .data
+                    .conversations
+                    .values()
+                    .filter(|c| c.sender != "__owner_self_chat__")
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM conversations WHERE sender != '__owner_self_chat__' ORDER BY updated_at DESC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|row| ConversationState {
+                        sender: row_str(row, "sender").unwrap_or_default(),
+                        name: row_str(row, "name"),
+                        draft: row_str(row, "draft_json")
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        urgent_draft: row_str(row, "urgent_draft_json")
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        history: row_str(row, "history_json")
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        last_booking_key: row_str(row, "last_booking_key"),
+                        bot_active: row_i64(row, "bot_active") != 0,
+                        owner_read_unanswered: row_i64(row, "owner_read_unanswered") != 0,
+                        paused_until: row_i64(row, "paused_until"),
+                        last_flagged_at: row_i64(row, "last_flagged_at"),
+                        updated_at: row_i64(row, "updated_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn list_active_urgent_intakes(&self) -> Result<Vec<ConversationState>> {
+        let recent = self.list_recent_conversations(50).await?;
+        Ok(recent
+            .into_iter()
+            .filter(|c| c.urgent_draft.active)
+            .collect())
+    }
+
+    // ---- Contact Tiers & Owner Availability ----
+    pub async fn set_contact_tier(&self, sender: &str, tier: &str) -> Result<ContactMemory> {
+        let clean_tier = match tier.trim().to_lowercase().as_str() {
+            "vip" => "vip",
+            "silent" | "observe" | "observe_only" => "silent",
+            _ => "normal",
+        };
+        let mut cm = self
+            .get_contact_memory(sender)
+            .await?
+            .unwrap_or_else(|| ContactMemory::new(sender));
+        cm.tier = clean_tier.to_string();
+        cm.updated_at = Utc::now().timestamp_millis();
+        self.save_contact_memory(&cm).await?;
+        Ok(cm)
+    }
+
+    pub async fn get_owner_status(&self, now_ms: i64) -> Result<OwnerStatus> {
+        let Some(raw) = self.get_setting("owner_status_json").await? else {
+            return Ok(OwnerStatus::available());
+        };
+        let status: OwnerStatus =
+            serde_json::from_str(&raw).unwrap_or_else(|_| OwnerStatus::available());
+        if status.until_ms > 0 && now_ms >= status.until_ms {
+            let avail = OwnerStatus::available();
+            let _ = self.set_owner_status(&avail).await;
+            return Ok(avail);
+        }
+        Ok(status)
+    }
+
+    pub async fn set_owner_status(&self, status: &OwnerStatus) -> Result<()> {
+        let raw = serde_json::to_string(status).unwrap_or_else(|_| "{}".to_string());
+        self.set_setting("owner_status_json", &raw).await
+    }
+
+    // ---- Urgent Alerts (ntfy repeating ring-through-DND loop) ----
+    pub async fn has_recent_urgent_alert(&self, sender: &str, since_ms: i64) -> Result<bool> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .urgent_alerts
+                    .iter()
+                    .any(|a| a.sender == sender && a.created_at >= since_ms))
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT id FROM urgent_alerts WHERE sender = ? AND created_at >= ? LIMIT 1",
+                        vec![SqlParam::from(sender), SqlParam::Int(since_ms)],
+                    )
+                    .await?;
+                Ok(!res.rows.is_empty())
+            }
+        }
+    }
+
+    pub async fn create_urgent_alert(&self, alert: &UrgentAlertRecord) -> Result<i64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                let mut copy = alert.clone();
+                copy.id = id;
+                guard.data.urgent_alerts.push(copy);
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO urgent_alerts (sender, contact_name, phone, request, deadline, summary, created_at, last_sent_at, attempts, acknowledged)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        vec![
+                            SqlParam::from(alert.sender.clone()),
+                            SqlParam::from(alert.contact_name.clone()),
+                            SqlParam::from(alert.phone.clone()),
+                            SqlParam::from(alert.request.clone()),
+                            SqlParam::from(alert.deadline.clone()),
+                            SqlParam::from(alert.summary.clone()),
+                            SqlParam::Int(alert.created_at),
+                            SqlParam::Int(alert.last_sent_at),
+                            SqlParam::Int(alert.attempts),
+                            SqlParam::Int(if alert.acknowledged { 1 } else { 0 }),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn list_unacked_urgent_alerts(&self) -> Result<Vec<UrgentAlertRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .urgent_alerts
+                    .iter()
+                    .filter(|a| !a.acknowledged)
+                    .cloned()
+                    .collect())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM urgent_alerts WHERE acknowledged = 0 ORDER BY created_at ASC",
+                        vec![],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| UrgentAlertRecord {
+                        id: row_i64(r, "id"),
+                        sender: row_str(r, "sender").unwrap_or_default(),
+                        contact_name: row_str(r, "contact_name"),
+                        phone: row_str(r, "phone").unwrap_or_default(),
+                        request: row_str(r, "request").unwrap_or_default(),
+                        deadline: row_str(r, "deadline").unwrap_or_default(),
+                        summary: row_str(r, "summary").unwrap_or_default(),
+                        created_at: row_i64(r, "created_at"),
+                        last_sent_at: row_i64(r, "last_sent_at"),
+                        attempts: row_i64(r, "attempts"),
+                        acknowledged: row_i64(r, "acknowledged") != 0,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn update_urgent_alert_sent(
+        &self,
+        id: i64,
+        last_sent_at: i64,
+        attempts: i64,
+        acknowledged: bool,
+    ) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(a) = guard.data.urgent_alerts.iter_mut().find(|a| a.id == id) {
+                    a.last_sent_at = last_sent_at;
+                    a.attempts = attempts;
+                    a.acknowledged = acknowledged;
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "UPDATE urgent_alerts SET last_sent_at = ?, attempts = ?, acknowledged = ? WHERE id = ?",
+                    vec![
+                        SqlParam::Int(last_sent_at),
+                        SqlParam::Int(attempts),
+                        SqlParam::Int(if acknowledged { 1 } else { 0 }),
+                        SqlParam::Int(id),
+                    ],
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn ack_urgent_alerts(&self, filter_sender: Option<&str>) -> Result<u64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut count = 0u64;
+                for a in &mut guard.data.urgent_alerts {
+                    if !a.acknowledged {
+                        let matches = match filter_sender {
+                            None => true,
+                            Some(q) => {
+                                let ql = q.to_lowercase();
+                                a.sender.contains(q)
+                                    || a.phone.contains(q)
+                                    || a.contact_name
+                                        .as_deref()
+                                        .map(|n| n.to_lowercase().contains(&ql))
+                                        .unwrap_or(false)
+                            }
+                        };
+                        if matches {
+                            a.acknowledged = true;
+                            count += 1;
+                        }
+                    }
+                }
+                guard.flush()?;
+                Ok(count)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = match filter_sender {
+                    None => {
+                        self.execute_remote(
+                            "UPDATE urgent_alerts SET acknowledged = 1 WHERE acknowledged = 0",
+                            vec![],
+                        )
+                        .await?
+                    }
+                    Some(q) => {
+                        let like = format!("%{}%", q.to_lowercase());
+                        self.execute_remote(
+                            "UPDATE urgent_alerts SET acknowledged = 1 WHERE acknowledged = 0 AND (sender LIKE ? OR phone LIKE ? OR LOWER(COALESCE(contact_name, '')) LIKE ?)",
+                            vec![
+                                SqlParam::from(like.clone()),
+                                SqlParam::from(like.clone()),
+                                SqlParam::from(like),
+                            ],
+                        )
+                        .await?
+                    }
+                };
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
+    // ---- 7:00 AM Morning Digest Queue ----
+    pub async fn insert_digest_item(&self, item: &DigestItem) -> Result<i64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                let mut copy = item.clone();
+                copy.id = id;
+                guard.data.digest_queue.push(copy);
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO digest_queue (sender, contact_name, kind, summary, last_message, created_at, delivered)
+                         VALUES (?, ?, ?, ?, ?, ?, 0)",
+                        vec![
+                            SqlParam::from(item.sender.clone()),
+                            SqlParam::from(item.contact_name.clone()),
+                            SqlParam::from(item.kind.clone()),
+                            SqlParam::from(item.summary.clone()),
+                            SqlParam::from(item.last_message.clone()),
+                            SqlParam::Int(item.created_at),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn list_pending_digest_items(&self, limit: i64) -> Result<Vec<DigestItem>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .digest_queue
+                    .iter()
+                    .filter(|d| !d.delivered)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM digest_queue WHERE delivered = 0 ORDER BY created_at ASC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| DigestItem {
+                        id: row_i64(r, "id"),
+                        sender: row_str(r, "sender").unwrap_or_default(),
+                        contact_name: row_str(r, "contact_name"),
+                        kind: row_str(r, "kind").unwrap_or_else(|| "handoff".to_string()),
+                        summary: row_str(r, "summary").unwrap_or_default(),
+                        last_message: row_str(r, "last_message").unwrap_or_default(),
+                        created_at: row_i64(r, "created_at"),
+                        delivered: row_i64(r, "delivered") != 0,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn mark_digest_items_delivered(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                for d in &mut guard.data.digest_queue {
+                    if ids.contains(&d.id) {
+                        d.delivered = true;
+                    }
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                for &id in ids {
+                    let _ = self
+                        .execute_remote(
+                            "UPDATE digest_queue SET delivered = 1 WHERE id = ?",
+                            vec![SqlParam::Int(id)],
+                        )
+                        .await;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // ---- Reminders ----
+    pub async fn add_reminder(&self, due_at: i64, text: &str, now_ms: i64) -> Result<i64> {
+        let clean = text.trim();
+        if clean.is_empty() {
+            return Ok(0);
+        }
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                guard.data.reminders.push(ReminderRecord {
+                    id,
+                    due_at,
+                    text: clean.to_string(),
+                    delivered: false,
+                    created_at: now_ms,
+                });
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO reminders (due_at, text, delivered, created_at) VALUES (?, ?, 0, ?)",
+                        vec![
+                            SqlParam::Int(due_at),
+                            SqlParam::from(clean),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn list_due_reminders(&self, now_ms: i64) -> Result<Vec<ReminderRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .reminders
+                    .iter()
+                    .filter(|r| !r.delivered && r.due_at <= now_ms)
+                    .cloned()
+                    .collect())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM reminders WHERE delivered = 0 AND due_at <= ? ORDER BY due_at ASC",
+                        vec![SqlParam::Int(now_ms)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| ReminderRecord {
+                        id: row_i64(r, "id"),
+                        due_at: row_i64(r, "due_at"),
+                        text: row_str(r, "text").unwrap_or_default(),
+                        delivered: row_i64(r, "delivered") != 0,
+                        created_at: row_i64(r, "created_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn list_pending_reminders(&self, limit: i64) -> Result<Vec<ReminderRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<ReminderRecord> = guard
+                    .data
+                    .reminders
+                    .iter()
+                    .filter(|r| !r.delivered)
+                    .cloned()
+                    .collect();
+                list.sort_by_key(|r| r.due_at);
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM reminders WHERE delivered = 0 ORDER BY due_at ASC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| ReminderRecord {
+                        id: row_i64(r, "id"),
+                        due_at: row_i64(r, "due_at"),
+                        text: row_str(r, "text").unwrap_or_default(),
+                        delivered: row_i64(r, "delivered") != 0,
+                        created_at: row_i64(r, "created_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(r) = guard.data.reminders.iter_mut().find(|r| r.id == id) {
+                    r.delivered = true;
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "UPDATE reminders SET delivered = 1 WHERE id = ?",
+                    vec![SqlParam::Int(id)],
+                )
+                .await?;
                 Ok(())
             }
         }
