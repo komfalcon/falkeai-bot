@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, GROQ_BASE_URL};
 use crate::safety::redact_secrets;
 
 pub const MAX_AUDIO_BYTES: usize = 5 * 1024 * 1024;
@@ -133,23 +133,125 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Transcribes a downloaded WhatsApp voice note using Cloudflare Workers AI Whisper.
+/// Maps a WhatsApp audio MIME string (e.g. `audio/ogg; codecs=opus`) to a clean filename & MIME
+/// accepted by Groq's OpenAI-compatible `/audio/transcriptions` endpoint.
+pub fn audio_filename_and_mime(mime: Option<&str>) -> (&'static str, &'static str) {
+    let base = mime
+        .and_then(|m| m.split(';').next())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    match base.as_str() {
+        "audio/mpeg" | "audio/mp3" => ("voice.mp3", "audio/mpeg"),
+        "audio/mp4" | "audio/m4a" | "audio/aac" => ("voice.m4a", "audio/mp4"),
+        "audio/wav" | "audio/x-wav" => ("voice.wav", "audio/wav"),
+        "audio/webm" => ("voice.webm", "audio/webm"),
+        "audio/flac" => ("voice.flac", "audio/flac"),
+        _ => ("voice.ogg", "audio/ogg"),
+    }
+}
+
+/// Zero-dependency RFC 7578 `multipart/form-data` builder for Groq `/audio/transcriptions`.
+pub fn build_whisper_multipart(
+    boundary: &str,
+    model: &str,
+    filename: &str,
+    mime: &str,
+    audio_bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(audio_bytes.len() + 384);
+    let head = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+         Content-Type: {mime}\r\n\r\n"
+    );
+    body.extend_from_slice(head.as_bytes());
+    body.extend_from_slice(audio_bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Transcribes a downloaded WhatsApp voice note:
+/// 1) Groq Whisper (`whisper-large-v3-turbo` -> `whisper-large-v3`) across all configured Groq keys
+/// 2) Automatic fallback to Cloudflare Workers AI Whisper (`@cf/openai/whisper-large-v3-turbo` -> `@cf/openai/whisper`)
 /// Always deletes `file_path` on return.
-pub async fn transcribe_voice_note(cfg: &Config, file_path: &str) -> Result<String> {
+pub async fn transcribe_voice_note(
+    cfg: &Config,
+    file_path: &str,
+    mime: Option<&str>,
+) -> Result<String> {
     let _cleanup = TempFileGuard::new(file_path);
-    let Some(cf_token) = cloudflare_api_token(cfg) else {
-        return Err(anyhow!("CF_API_TOKEN missing for Whisper"));
-    };
-    let Some(acct) = cloudflare_account_id(cfg) else {
-        return Err(anyhow!("CF_ACCOUNT_ID missing for Whisper"));
-    };
     let bytes = std::fs::read(file_path)?;
     if bytes.is_empty() || bytes.len() > MAX_AUDIO_BYTES {
         return Err(anyhow!("Audio file empty or exceeds 5 MB limit"));
     }
 
     let client = http_client();
-    // Primary: @cf/openai/whisper-large-v3-turbo expects base64 JSON payload
+
+    // 1) Groq Whisper primary (model-first across all configured Groq keys)
+    if !cfg.groq_keys.is_empty() {
+        let (filename, clean_mime) = audio_filename_and_mime(mime);
+        let boundary = "----FalkeAIGroqWhisperBoundary9x7k";
+        let groq_url = format!("{}/audio/transcriptions", GROQ_BASE_URL.trim_end_matches('/'));
+        for model in ["whisper-large-v3-turbo", "whisper-large-v3"] {
+            let multipart_body =
+                build_whisper_multipart(boundary, model, filename, clean_mime, &bytes);
+            for (idx, key) in cfg.groq_keys.iter().enumerate() {
+                match client
+                    .post(&groq_url)
+                    .bearer_auth(key)
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(multipart_body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            if let Some(t) = v["text"]
+                                .as_str()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
+                                return Ok(t.chars().take(1200).collect());
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        let st = resp.status();
+                        let err_txt = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            "Groq Whisper failed (groq#{} / {} / {}): {}",
+                            idx + 1,
+                            model,
+                            st,
+                            redact_secrets(&err_txt, cfg)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Groq Whisper request error (groq#{} / {}): {}",
+                            idx + 1,
+                            model,
+                            redact_secrets(&e.to_string(), cfg)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Cloudflare Workers AI Whisper fallback
+    let Some(cf_token) = cloudflare_api_token(cfg) else {
+        return Err(anyhow!("Groq Whisper unavailable and CF_API_TOKEN missing"));
+    };
+    let Some(acct) = cloudflare_account_id(cfg) else {
+        return Err(anyhow!("Groq Whisper unavailable and CF_ACCOUNT_ID missing"));
+    };
+
+    // Primary CF: @cf/openai/whisper-large-v3-turbo expects base64 JSON payload
     let turbo_url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/{}",
         acct,
@@ -178,14 +280,14 @@ pub async fn transcribe_voice_note(cfg: &Config, file_path: &str) -> Result<Stri
             let st = resp.status();
             let err_txt = resp.text().await.unwrap_or_default();
             tracing::warn!(
-                "Whisper turbo failed ({}): {}",
+                "Cloudflare Whisper turbo failed ({}): {}",
                 st,
                 redact_secrets(&err_txt, cfg)
             );
         }
     }
 
-    // Fallback: @cf/openai/whisper accepts raw audio bytes
+    // Secondary CF: @cf/openai/whisper accepts raw audio bytes
     let fallback_url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/@cf/openai/whisper",
         acct
@@ -201,7 +303,7 @@ pub async fn transcribe_voice_note(cfg: &Config, file_path: &str) -> Result<Stri
         let st = resp.status();
         let err_txt = resp.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "Whisper fallback HTTP {}: {}",
+            "Cloudflare Whisper fallback HTTP {}: {}",
             st,
             redact_secrets(&err_txt, cfg)
         ));
@@ -314,19 +416,14 @@ pub async fn enrich_incoming_media(
     let today_key = Utc::now().format("%Y-%m-%d").to_string();
 
     if let (Some(kind), Some(path)) = (media_kind, media_path) {
-        if !budget.try_consume(cfg.max_media_per_day, &today_key) {
-            let _ = std::fs::remove_file(path);
-            return if kind == "audio" {
-                "[Voice note received — daily transcription limit reached; ask sender to type key details]".to_string()
-            } else if text.trim().is_empty() {
-                "[Image received — ask sender what it's about]".to_string()
-            } else {
-                format!("[Image received] {}", text.trim())
-            };
-        }
-
         if kind == "audio" {
-            return match transcribe_voice_note(cfg, path).await {
+            // Groq keys give 2,000+ free Whisper req/day per key; only gate by Cloudflare daily cap
+            // when no Groq key is configured.
+            if cfg.groq_keys.is_empty() && !budget.try_consume(cfg.max_media_per_day, &today_key) {
+                let _ = std::fs::remove_file(path);
+                return "[Voice note received — daily transcription limit reached; ask sender to type key details]".to_string();
+            }
+            return match transcribe_voice_note(cfg, path, media_mime).await {
                 Ok(transcript) => format!("[Voice note transcript]: {}", transcript),
                 Err(e) => {
                     tracing::warn!("Voice transcription fallback: {}", redact_secrets(&e.to_string(), cfg));
@@ -336,6 +433,14 @@ pub async fn enrich_incoming_media(
         }
 
         if kind == "image" {
+            if !budget.try_consume(cfg.max_media_per_day, &today_key) {
+                let _ = std::fs::remove_file(path);
+                return if text.trim().is_empty() {
+                    "[Image received — ask sender what it's about]".to_string()
+                } else {
+                    format!("[Image received] {}", text.trim())
+                };
+            }
             return match describe_image(cfg, path, media_mime, text).await {
                 Ok(desc) => {
                     if text.trim().is_empty() {

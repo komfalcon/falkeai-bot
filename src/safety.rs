@@ -215,6 +215,11 @@ pub fn redact_secrets(text: &str, cfg: &Config) -> String {
     if !cfg.cf_api_token.trim().is_empty() {
         secrets.push(cfg.cf_api_token.trim().to_string());
     }
+    for k in &cfg.groq_keys {
+        if !k.trim().is_empty() {
+            secrets.push(k.trim().to_string());
+        }
+    }
     for attempt in &cfg.ai_attempts {
         if !attempt.api_key.trim().is_empty() {
             secrets.push(attempt.api_key.trim().to_string());

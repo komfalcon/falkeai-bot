@@ -1330,6 +1330,7 @@ mod tests {
             turso_auth_token: None,
             pair_phone: "2349113683395".to_string(),
             ai_key: "test-key".to_string(),
+            groq_keys: Vec::new(),
             cf_account_id: "test-cf-acct-12345678".to_string(),
             cf_api_token: "test-cf-token-12345678".to_string(),
             ai_base_url: "https://api.openai.com/v1".to_string(),
@@ -2632,6 +2633,30 @@ mod tests {
             let _guard = TempFileGuard::new(&tmp);
         }
         assert!(!tmp.exists());
+
+        // Groq Whisper zero-dependency multipart payload builder + MIME mapping
+        use crate::media::{audio_filename_and_mime, build_whisper_multipart};
+        assert_eq!(
+            audio_filename_and_mime(Some("audio/ogg; codecs=opus")),
+            ("voice.ogg", "audio/ogg")
+        );
+        assert_eq!(
+            audio_filename_and_mime(Some("audio/mpeg")),
+            ("voice.mp3", "audio/mpeg")
+        );
+        let mp = build_whisper_multipart(
+            "----TestBound",
+            "whisper-large-v3-turbo",
+            "voice.ogg",
+            "audio/ogg",
+            b"OggS1234",
+        );
+        let mp_str = String::from_utf8_lossy(&mp);
+        assert!(mp_str.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo"));
+        assert!(mp_str.contains("filename=\"voice.ogg\""));
+        assert!(mp_str.contains("Content-Type: audio/ogg"));
+        assert!(mp_str.contains("OggS1234"));
+        assert!(mp_str.ends_with("----TestBound--\r\n"));
     }
 
     #[tokio::test]
