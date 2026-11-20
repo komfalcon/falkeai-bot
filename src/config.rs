@@ -67,6 +67,51 @@ fn push_unique_keys(out: &mut Vec<String>, raw: &str) {
     }
 }
 
+pub fn normalize_ntfy_url(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "https://ntfy.sh".to_string();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    }
+}
+
+/// Extracts a clean ntfy topic name even if the user accidentally pasted a full subscription URL
+/// like `https://ntfy.sh/my-secret-topic` or wrapped it in quotes.
+pub fn normalize_ntfy_topic(raw: &str, base_url: &str) -> String {
+    let mut s = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let lower = s.to_lowercase();
+    let base_no_scheme = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_lowercase();
+
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        if let Some(after_scheme) = s.split("://").nth(1) {
+            if let Some((_, topic_part)) = after_scheme.split_once('/') {
+                s = topic_part.trim_matches('/').to_string();
+            }
+        }
+    } else if !base_no_scheme.is_empty() && lower.starts_with(&(base_no_scheme.clone() + "/")) {
+        s = s[base_no_scheme.len() + 1..].trim_matches('/').to_string();
+    } else if lower.starts_with("ntfy.sh/") {
+        s = s["ntfy.sh/".len()..].trim_matches('/').to_string();
+    }
+    s.split('/').next().unwrap_or("").trim().to_string()
+}
+
 /// Builds the ordered multi-provider LLM failover chain:
 /// 1) Groq keys (model-first across all configured keys: Qwen 3.8 27B -> GPT-OSS 120B -> GPT-OSS 20B)
 /// 2) Custom primary / fallback OpenAI-compatible providers (if configured)
@@ -354,15 +399,16 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "@cf/mistralai/mistral-small-3.1-24b-instruct".to_string());
 
-        let ntfy_url = env::var("NTFY_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "https://ntfy.sh".to_string());
-        let ntfy_topic = env::var("NTFY_TOPIC")
-            .unwrap_or_default()
-            .trim()
-            .trim_matches('/')
-            .to_string();
+        let ntfy_url = normalize_ntfy_url(
+            &env::var("NTFY_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "https://ntfy.sh".to_string()),
+        );
+        let ntfy_topic = normalize_ntfy_topic(
+            &env::var("NTFY_TOPIC").unwrap_or_default(),
+            &ntfy_url,
+        );
         let ntfy_token = env::var("NTFY_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty());

@@ -13,7 +13,7 @@ pub mod util;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -386,7 +386,7 @@ struct AppContext {
     media_budget: Arc<MediaBudget>,
     bridge_tx: mpsc::UnboundedSender<BridgeCommand>,
     self_identity: Mutex<(String, Option<String>)>,
-    seen_ids: Mutex<HashSet<String>>,
+    seen_ids: Mutex<(HashSet<String>, VecDeque<String>)>,
     hourly_stamps: Mutex<HashMap<String, Vec<i64>>>,
     roster_waiters: Mutex<HashMap<String, oneshot::Sender<CachedRoster>>>,
     groups_waiters: Mutex<HashMap<String, oneshot::Sender<Vec<GroupSummary>>>>,
@@ -425,22 +425,31 @@ impl AppContext {
         });
     }
 
-    fn notify_owner(&self, text: String) {
+    fn try_notify_owner(&self, text: String) -> Result<()> {
         let safe_text = redact_secrets(&text, &self.cfg);
-        self.echo_guard
-            .record(&safe_text, Utc::now().timestamp_millis());
         let self_jid = self
             .self_identity
             .lock()
             .ok()
             .map(|g| g.0.clone())
             .unwrap_or_default();
-        if !self_jid.is_empty() {
-            self.send_cmd(BridgeCommand::SendMessage {
+        if self_jid.is_empty() {
+            return Err(anyhow!("WhatsApp self JID not ready yet"));
+        }
+        self.echo_guard
+            .record(&safe_text, Utc::now().timestamp_millis());
+        self.bridge_tx
+            .send(BridgeCommand::SendMessage {
                 chat_jid: self_jid,
                 text: safe_text,
                 mentions: vec![],
-            });
+            })
+            .map_err(|_| anyhow!("WhatsApp bridge stdin channel closed"))
+    }
+
+    fn notify_owner(&self, text: String) {
+        if let Err(e) = self.try_notify_owner(text) {
+            warn!("Could not notify owner on WhatsApp yet: {}", e);
         }
     }
 
@@ -664,12 +673,15 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
 
             {
                 let mut seen = ctx.seen_ids.lock().unwrap();
-                if !seen.insert(id.clone()) {
+                if !seen.0.insert(id.clone()) {
                     cleanup_media(&media_path);
                     return Ok(());
                 }
-                if seen.len() > 5000 {
-                    seen.clear();
+                seen.1.push_back(id.clone());
+                while seen.1.len() > 5000 {
+                    if let Some(old) = seen.1.pop_front() {
+                        seen.0.remove(&old);
+                    }
                 }
             }
 
@@ -1167,11 +1179,17 @@ async fn main() -> Result<()> {
         .iter()
         .map(|a| format!("{}:{}", a.provider, a.model))
         .collect();
+    let ntfy_state = if cfg.ntfy_topic.trim().is_empty() {
+        "DISABLED (NTFY_TOPIC not set)".to_string()
+    } else {
+        format!("ready (server: {})", cfg.ntfy_url)
+    };
     info!(
-        "Connected to Turso database ({} ready). AI failover chain ({} slots): {}",
+        "Connected to Turso database ({} ready). AI failover chain ({} slots): {}. ntfy urgent push: {}.",
         BOT_NAME,
         provider_summary.len(),
-        provider_summary.join(" -> ")
+        provider_summary.join(" -> "),
+        ntfy_state
     );
 
     let scheduler = Arc::new(DmTakeoverScheduler::new());
@@ -1225,23 +1243,23 @@ async fn main() -> Result<()> {
                             async move { send_ntfy_http(&c, &title, &body).await }
                         },
                         move |wa_msg| {
-                            ctx_w1.notify_owner(wa_msg);
-                            async { Ok(()) }
+                            let res = ctx_w1.try_notify_owner(wa_msg);
+                            async move { res }
                         },
                     )
                     .await;
 
                     let ctx_w2 = Arc::clone(&live_ctx);
                     let _ = tick_due_reminders(&db_bg, now_ms, move |wa_msg| {
-                        ctx_w2.notify_owner(wa_msg);
-                        async { Ok(()) }
+                        let res = ctx_w2.try_notify_owner(wa_msg);
+                        async move { res }
                     })
                     .await;
 
                     let ctx_w3 = Arc::clone(&live_ctx);
                     let _ = tick_morning_digest(&db_bg, &cfg_bg, now_ms, move |wa_msg| {
-                        ctx_w3.notify_owner(wa_msg);
-                        async { Ok(()) }
+                        let res = ctx_w3.try_notify_owner(wa_msg);
+                        async move { res }
                     })
                     .await;
 
@@ -1361,7 +1379,7 @@ async fn main() -> Result<()> {
             media_budget: Arc::clone(&media_budget),
             bridge_tx,
             self_identity: Mutex::new((String::new(), None)),
-            seen_ids: Mutex::new(HashSet::new()),
+            seen_ids: Mutex::new((HashSet::new(), VecDeque::new())),
             hourly_stamps: Mutex::new(HashMap::new()),
             roster_waiters: Mutex::new(HashMap::new()),
             groups_waiters: Mutex::new(HashMap::new()),
@@ -3161,5 +3179,113 @@ mod tests {
         assert!(refreshed.bot_active);
         assert!(!refreshed.owner_read_unanswered);
         assert_eq!(refreshed.paused_until, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ntfy_normalization_diagnostics_and_delivery_safety() {
+        use crate::alerts::fire_urgent_alert_if_allowed;
+        use crate::config::{normalize_ntfy_topic, normalize_ntfy_url};
+        use crate::db::UrgentDraft;
+        use crate::safety::urgent_trigger;
+
+        // 1) Topic & URL normalization catches accidental pasted full URLs or quotes
+        assert_eq!(
+            normalize_ntfy_url("ntfy.sh/"),
+            "https://ntfy.sh"
+        );
+        assert_eq!(
+            normalize_ntfy_topic("https://ntfy.sh/falke-urgent-secret-123/", "https://ntfy.sh"),
+            "falke-urgent-secret-123"
+        );
+        assert_eq!(
+            normalize_ntfy_topic("ntfy.sh/falke-urgent-secret-123", "https://ntfy.sh"),
+            "falke-urgent-secret-123"
+        );
+        assert_eq!(
+            normalize_ntfy_topic("\"falke-urgent-secret-123\"", "https://ntfy.sh"),
+            "falke-urgent-secret-123"
+        );
+
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let mut cfg_missing_ntfy = test_cfg();
+        cfg_missing_ntfy.ntfy_topic = String::new();
+
+        // 2) `status` and `test ntfy` clearly report missing NTFY_TOPIC instead of silent failure
+        let status_off = run_owner_command(&db, &cfg_missing_ntfy, "status", || async { Ok(vec![]) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status_off.contains("ntfy urgent push: OFF"));
+
+        let test_err = run_owner_command(&db, &cfg_missing_ntfy, "test ntfy", || async { Ok(vec![]) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(test_err.contains("NTFY_TOPIC"));
+
+        // 3) If ntfy fails during an urgent alert, WhatsApp alert visibly reports why
+        let wa_alerts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let wa_c = Arc::clone(&wa_alerts);
+        let _ = fire_urgent_alert_if_allowed(
+            &db,
+            &cfg_missing_ntfy,
+            "2348091234567",
+            Some("Recruiter".to_string()),
+            &UrgentDraft {
+                active: true,
+                name: Some("Recruiter".to_string()),
+                number: Some("2348091234567".to_string()),
+                request: Some("Final interview today".to_string()),
+                deadline: Some("2pm".to_string()),
+                started_at: 1000,
+                turns: 1,
+            },
+            "Final interview today",
+            1000,
+            |_, _| async { Err(anyhow!("ntfy HTTP 403 Forbidden")) },
+            move |m| {
+                wa_c.lock().unwrap().push(m);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(wa_alerts.lock().unwrap()[0].contains("ntfy push failed"));
+        assert!(wa_alerts.lock().unwrap()[0].contains("403 Forbidden"));
+
+        // 4) Reminder & digest delivery do NOT mark delivered if WhatsApp bridge is disconnected
+        let now_ms = Utc.with_ymd_and_hms(2026, 11, 20, 6, 5, 0).unwrap().timestamp_millis(); // 7:05 AM Lagos
+        let rid = db.add_reminder(now_ms - 1000, "Call recruiter", now_ms - 5000).await.unwrap();
+        let res_rem = tick_due_reminders(&db, now_ms, |_| async {
+            Err(anyhow!("WhatsApp self JID not ready yet"))
+        })
+        .await;
+        assert!(res_rem.is_err());
+        assert_eq!(db.list_pending_reminders(10).await.unwrap().len(), 1);
+
+        let res_dig = tick_morning_digest(&db, &cfg_missing_ntfy, now_ms, |_| async {
+            Err(anyhow!("WhatsApp self JID not ready yet"))
+        })
+        .await;
+        assert!(res_dig.is_err());
+
+        // Once reconnected, BOTH deliver cleanly!
+        let delivered = tick_due_reminders(&db, now_ms, |_| async { Ok(()) }).await.unwrap();
+        assert_eq!(delivered, 1);
+        assert!(tick_morning_digest(&db, &cfg_missing_ntfy, now_ms, |_| async { Ok(()) }).await.unwrap());
+
+        // 5) `unremind <id>` cancels reminders cleanly
+        let rid2 = db.add_reminder(now_ms + 60_000, "Cancel me", now_ms).await.unwrap();
+        assert_ne!(rid, rid2);
+        let cancel_msg = run_owner_command(&db, &test_cfg(), &format!("unremind #{}", rid2), || async { Ok(vec![]) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cancel_msg.contains("Cancelled reminder"));
+        assert!(db.list_pending_reminders(10).await.unwrap().is_empty());
+
+        // 6) Urgent payment confirmation / deal keywords trigger immediately without casual false positives
+        assert!(urgent_trigger("Sent payment confirmation for the deal", false).is_some());
+        assert!(urgent_trigger("How much do tutoring classes cost?", false).is_none());
     }
 }

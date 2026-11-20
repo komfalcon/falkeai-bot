@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::alerts::format_digest_message;
+use crate::alerts::{format_digest_message, send_ntfy_http};
 use crate::brain::{merge_unique_strings, HISTORY_MAX};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, ContactMemory, ConversationState, Database, OwnerStatus};
@@ -174,6 +174,33 @@ where
         )));
     }
 
+    // test ntfy / ntfy test — send an instant diagnostic max-priority ping to verify phone delivery
+    if matches!(lower.as_str(), "test ntfy" | "ntfy test" | "ping ntfy" | "ntfy") {
+        let topic = crate::config::normalize_ntfy_topic(&cfg.ntfy_topic, &cfg.ntfy_url);
+        if topic.is_empty() {
+            return Ok(Some(
+                "❌ *ntfy is NOT configured* (`NTFY_TOPIC` env var is missing on Heroku).\nAdd `NTFY_TOPIC` (just the topic name, not the full URL) in Heroku Settings -> Config Vars and restart the dyno."
+                    .to_string(),
+            ));
+        }
+        return match send_ntfy_http(
+            cfg,
+            &format!("{} Test Alert", BOT_NAME),
+            "Test max-priority alert from WhatsApp self-chat. If your phone rang / broke through DND, ntfy is ready!",
+        )
+        .await
+        {
+            Ok(()) => Ok(Some(
+                "✅ Test max-priority `ntfy` alert sent! Check if your phone buzzed/rang (make sure battery optimization is off & Override DND is enabled on the max-priority channel in the ntfy app)."
+                    .to_string(),
+            )),
+            Err(e) => Ok(Some(format!(
+                "❌ `ntfy` push failed: {}\nCheck `NTFY_TOPIC` (topic name only) / `NTFY_URL` / `NTFY_TOKEN` in Heroku Config Vars.",
+                crate::safety::redact_secrets(&e.to_string(), cfg)
+            ))),
+        };
+    }
+
     // briefing / brief / summary — on-demand digest
     if matches!(lower.as_str(), "briefing" | "brief" | "summary" | "morning summary") {
         let items = db.list_pending_digest_items(40).await?;
@@ -303,6 +330,24 @@ where
                 )));
             }
         }
+    }
+    if lower.starts_with("unremind ")
+        || lower.starts_with("cancel reminder ")
+        || lower.starts_with("delete reminder ")
+    {
+        let id_str = raw
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_start_matches('#');
+        let Ok(rid) = id_str.parse::<i64>() else {
+            return Ok(Some("⚠️ Usage: `unremind <id>` (e.g. `unremind 3`)".to_string()));
+        };
+        return Ok(Some(if db.delete_reminder(rid).await? {
+            format!("✅ Cancelled reminder #{}.", rid)
+        } else {
+            format!("⚠️ No reminder found with ID #{}.", rid)
+        }));
     }
 
     // block / unblock <numbers>
@@ -812,15 +857,20 @@ where
         let unacked = db.list_unacked_urgent_alerts().await?.len();
         let digest = db.list_pending_digest_items(50).await?.len();
         let rems = db.list_pending_reminders(50).await?.len();
+        let ntfy_state = if crate::config::normalize_ntfy_topic(&cfg.ntfy_topic, &cfg.ntfy_url).is_empty() {
+            "OFF (set NTFY_TOPIC)"
+        } else {
+            "ready"
+        };
         return Ok(Some(format!(
-            "✅ {} online (Rust Core + Turso). Availability: {}. Reply mode: {}. Active urgent alerts: {}. Digest queue (7am): {}. Reminders: {}. Saved contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
-            BOT_NAME, avail.mode, mode, unacked, digest, rems, saved, bookings, flags, owner_mem, lessons
+            "✅ {} online (Rust Core + Turso). Availability: {}. Reply mode: {}. ntfy urgent push: {}. Active urgent alerts: {}. Digest queue (7am): {}. Reminders: {}. Saved contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
+            BOT_NAME, avail.mode, mode, ntfy_state, unacked, digest, rems, saved, bookings, flags, owner_mem, lessons
         )));
     }
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] — stop urgent ntfy pings\n• briefing — view pending 7:00 AM digest now\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• remind <30m|2h>: <text> | reminders\n• approve <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact>\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
+            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] | test ntfy — stop or test urgent ring alerts\n• briefing — view pending 7:00 AM digest now\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• remind <30m|2h>: <text> | reminders | unremind <id>\n• approve/say <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact>\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
             BOT_NAME
         )));
     }

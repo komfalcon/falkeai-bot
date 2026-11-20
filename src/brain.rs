@@ -1729,7 +1729,9 @@ where
     db.save_contact_memory(&contact_mem).await?;
 
     if let Some(llm_fn) = learn_llm {
-        if !recent_user_context.is_empty() || !text.trim().is_empty() {
+        let reply_len = text.trim().len();
+        let substantive_reply = reply_len >= 12 || (reply_len >= 4 && recent_user_context.contains('?'));
+        if substantive_reply && (!recent_user_context.is_empty() || !text.trim().is_empty()) {
             let reflection_prompt = vec![
                 ChatTurn {
                     role: "system".to_string(),

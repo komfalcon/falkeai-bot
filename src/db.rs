@@ -2616,4 +2616,25 @@ impl Database {
             }
         }
     }
+
+    pub async fn delete_reminder(&self, id: i64) -> Result<bool> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let before = guard.data.reminders.len();
+                guard.data.reminders.retain(|r| r.id != id);
+                let deleted = guard.data.reminders.len() < before;
+                if deleted {
+                    guard.flush()?;
+                }
+                Ok(deleted)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote("DELETE FROM reminders WHERE id = ?", vec![SqlParam::Int(id)])
+                    .await?;
+                Ok(res.rows_affected > 0)
+            }
+        }
+    }
 }

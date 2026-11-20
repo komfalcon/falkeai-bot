@@ -242,11 +242,14 @@ pub fn urgent_trigger(text: &str, is_vip: bool) -> Option<&'static str> {
     let hard_urgent = [
         "urgent", "urgently", "asap", "emergency", "immediately",
         "call me now", "pick up", "waiting outside", "i'm outside", "im outside",
-        "waiting for falcon", "at the gate", "site is down", "server is down",
-        "deadline", "due today", "due tonight", "before midnight", "closing today",
-        "job offer", "job interview", "interview invite", "interview today", "recruiter", "shortlisted", "offer letter",
-        "client deal", "business deal", "close the deal", "sign the contract",
-        "payment issue", "payment failed", "sent the money", "debit alert",
+        "at the door", "waiting for falcon", "waiting for your reply", "at the gate",
+        "site is down", "server is down", "deadline", "due today", "due tonight",
+        "before midnight", "closing today", "job offer", "job interview",
+        "job opportunity", "role opening", "interview invite", "interview today",
+        "recruiter", "shortlisted", "offer letter", "client deal", "business deal",
+        "partnership deal", "sponsorship deal", "close the deal", "sign the contract",
+        "payment issue", "payment failed", "payment confirmation", "payment receipt",
+        "sent payment", "made payment", "sent the money", "paid you", "debit alert",
         "transfer failed", "hospital", "accident",
     ];
     if hard_urgent.iter().any(|k| lower.contains(k)) {

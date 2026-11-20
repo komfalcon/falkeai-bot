@@ -9,7 +9,7 @@ use chrono_tz::Africa::Lagos;
 use serde_json::Value;
 use std::future::Future;
 
-use crate::alerts::format_digest_message;
+use crate::alerts::{format_digest_message, send_ntfy_http};
 use crate::brain::{extract_json_object, HISTORY_MAX};
 use crate::commands::resolve_contact_target;
 use crate::config::{Config, BOT_NAME};
@@ -377,7 +377,9 @@ Think J.A.R.V.I.S.: sharp, concise, witty when natural, completely loyal, zero f
    - Save a durable fact about Falcon: `{{"type": "save_owner_memory", "category": "bio|projects|aurikrex|schedule|relationships|style|preferences", "visibility": "public|close|private_internal", "content": "concise fact"}}`
      * Use `public` for Aurikrex/public bio, `close` for friends/VIPs, `private_internal` for private guidance only for you and Falcon.
    - Add a reminder: `{{"type": "add_reminder", "in_minutes": 60, "text": "reminder text"}}`
+   - Cancel a reminder: `{{"type": "delete_reminder", "id": 3}}`
    - Acknowledge active urgent alerts: `{{"type": "ack_alerts", "target": null}}`
+   - Send a live test ntfy push notification: `{{"type": "test_ntfy"}}`
    - Show full briefing: `{{"type": "briefing"}}`
 3. If Falcon says he wants you to "interview" him or learn more about him, ask 1–2 thoughtful, crisp questions at a time (e.g. his current projects, communication boundaries, close people, daily rhythm, Aurikrex offerings), and save his answers concisely using `save_owner_memory` with the right visibility (bundle related points into at most 4 short `save_owner_memory` entries per turn so your JSON stays compact).
 4. Never fabricate messages or facts that aren't in the live data below. Never expose API keys, tokens, or `NTFY_TOPIC`.
@@ -562,7 +564,30 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                     let r_text = act["text"].as_str().unwrap_or("").trim();
                     if in_mins > 0 && !r_text.is_empty() {
                         let due_at = now_ms + in_mins * 60_000;
-                        let _ = db.add_reminder(due_at, r_text, now_ms).await?;
+                        let id = db.add_reminder(due_at, r_text, now_ms).await?;
+                        action_notes.push(format!("Reminder #{} set", id));
+                    }
+                }
+                "delete_reminder" | "cancel_reminder" => {
+                    if let Some(rid) = act["id"].as_i64() {
+                        if db.delete_reminder(rid).await? {
+                            action_notes.push(format!("Cancelled reminder #{}", rid));
+                        }
+                    }
+                }
+                "test_ntfy" => {
+                    match send_ntfy_http(
+                        cfg,
+                        &format!("{} Test Alert", BOT_NAME),
+                        "Test max-priority alert requested via J.A.R.V.I.S. self-chat.",
+                    )
+                    .await
+                    {
+                        Ok(()) => action_notes.push("ntfy test sent".to_string()),
+                        Err(e) => action_notes.push(format!(
+                            "ntfy failed: {}",
+                            redact_secrets(&e.to_string(), cfg)
+                        )),
                     }
                 }
                 "ack_alerts" => {

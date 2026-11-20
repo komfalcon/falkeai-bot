@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Timelike, TimeZone, Utc};
 use chrono_tz::Africa::Lagos;
+use serde_json::json;
 use std::future::Future;
 use std::time::Duration;
 
@@ -94,14 +95,16 @@ pub fn format_ntfy_payload(alert: &UrgentAlertRecord, attempt: i64) -> (String, 
     (title, body)
 }
 
-/// Sends a top-priority (`Priority: max`) push notification to the configured secret `NTFY_TOPIC`.
+/// Sends a top-priority (`priority: 5` = `max`) push notification via ntfy's JSON publish API
+/// (`POST <ntfy_url>/` with JSON body) so UTF-8 titles/emojis never fail HTTP header validation.
 pub async fn send_ntfy_http(cfg: &Config, title: &str, body: &str) -> Result<()> {
-    let topic = cfg.ntfy_topic.trim().trim_matches('/');
+    let topic = crate::config::normalize_ntfy_topic(&cfg.ntfy_topic, &cfg.ntfy_url);
     if topic.is_empty() {
-        tracing::warn!("NTFY_TOPIC is not configured; skipping ntfy push (WhatsApp self-chat alert still sent).");
-        return Ok(());
+        return Err(anyhow!(
+            "NTFY_TOPIC is not set in environment variables (set NTFY_TOPIC in Heroku Config Vars)"
+        ));
     }
-    let url = format!("{}/{}", cfg.ntfy_url.trim_end_matches('/'), topic);
+    let base_url = crate::config::normalize_ntfy_url(&cfg.ntfy_url);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(6))
         .timeout(Duration::from_secs(12))
@@ -110,12 +113,16 @@ pub async fn send_ntfy_http(cfg: &Config, title: &str, body: &str) -> Result<()>
 
     let safe_title = sanitize_http_header_ascii(&redact_secrets(title, cfg));
     let safe_body = redact_secrets(body, cfg);
+    let payload = json!({
+        "topic": topic,
+        "title": safe_title,
+        "message": safe_body,
+        "priority": 5,
+        "tags": ["rotating_light", "phone"]
+    });
     let mut req = client
-        .post(&url)
-        .header("Title", safe_title)
-        .header("Priority", "max")
-        .header("Tags", "rotating_light,phone")
-        .body(safe_body);
+        .post(format!("{}/", base_url.trim_end_matches('/')))
+        .json(&payload);
     if let Some(tok) = cfg.ntfy_token.as_deref().filter(|s| !s.trim().is_empty()) {
         req = req.bearer_auth(tok.trim());
     }
@@ -227,14 +234,16 @@ where
     rec.id = id;
 
     let (title, body) = format_ntfy_payload(&rec, 1);
-    if let Err(e) = send_ntfy(title, body).await {
-        tracing::warn!(
-            "Initial ntfy urgent push failed: {}",
-            redact_secrets(&e.to_string(), cfg)
-        );
-    }
+    let ntfy_warning = match send_ntfy(title, body).await {
+        Ok(()) => None,
+        Err(e) => {
+            let err_msg = redact_secrets(&e.to_string(), cfg);
+            tracing::warn!("Initial ntfy urgent push failed: {}", err_msg);
+            Some(err_msg)
+        }
+    };
 
-    let wa_alert = format!(
+    let mut wa_alert = format!(
         "🚨 *{} URGENT ALERT*\nFrom: {} (+{})\nRequest: {}\nDeadline: {}\n\nReply `ack` to stop 2-min ntfy pings, or `approve {}: <msg>` to reply.",
         BOT_NAME,
         rec.contact_name.as_deref().unwrap_or("Unknown"),
@@ -243,6 +252,9 @@ where
         rec.deadline,
         rec.sender
     );
+    if let Some(warn_msg) = ntfy_warning {
+        wa_alert.push_str(&format!("\n\n⚠️ *ntfy push failed:* {}", warn_msg));
+    }
     let _ = notify_wa(wa_alert).await;
 
     // Clear active intake and pause automation on this urgent thread while awaiting Falcon
@@ -497,9 +509,8 @@ where
     let unacked = db.list_unacked_urgent_alerts().await?;
     let reminders = db.list_pending_reminders(10).await?;
 
-    db.set_setting("last_digest_date", &today_key).await?;
-
     if items.is_empty() && unacked.is_empty() && reminders.is_empty() {
+        db.set_setting("last_digest_date", &today_key).await?;
         return Ok(false);
     }
 
@@ -511,6 +522,7 @@ where
     let msg = format_digest_message(&items, &unacked, &reminders, &header);
     notify_wa(msg).await?;
 
+    db.set_setting("last_digest_date", &today_key).await?;
     let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
     db.mark_digest_items_delivered(&ids).await?;
     Ok(true)
