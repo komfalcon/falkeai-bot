@@ -215,7 +215,14 @@ pub async fn transcribe_voice_note(
                                 .map(|s| s.trim())
                                 .filter(|s| !s.is_empty())
                             {
-                                return Ok(t.chars().take(1200).collect());
+                                let clean: String = t.chars().take(1200).collect();
+                                tracing::info!(
+                                    "Transcribed voice note via groq#{} / {} ({} chars)",
+                                    idx + 1,
+                                    model,
+                                    clean.len()
+                                );
+                                return Ok(clean);
                             }
                         }
                     }

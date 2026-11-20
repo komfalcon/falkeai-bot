@@ -102,6 +102,7 @@ func cleanPhone(raw string) string {
 }
 
 func extractSimpleText(msg *waE2E.Message) string {
+	msg = unwrapEdited(msg)
 	if msg == nil {
 		return ""
 	}
@@ -149,13 +150,40 @@ func extractQuotedText(msg *waE2E.Message) string {
 }
 
 func unwrapEdited(msg *waE2E.Message) *waE2E.Message {
-	if msg == nil {
-		return nil
-	}
-	if pm := msg.GetProtocolMessage(); pm != nil {
-		if edited := pm.GetEditedMessage(); edited != nil {
-			return edited
+	for depth := 0; depth < 6 && msg != nil; depth++ {
+		if dsm := msg.GetDeviceSentMessage(); dsm != nil && dsm.GetMessage() != nil {
+			msg = dsm.GetMessage()
+			continue
 		}
+		if eph := msg.GetEphemeralMessage(); eph != nil && eph.GetMessage() != nil {
+			msg = eph.GetMessage()
+			continue
+		}
+		if vo := msg.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+			msg = vo.GetMessage()
+			continue
+		}
+		if vo2 := msg.GetViewOnceMessageV2(); vo2 != nil && vo2.GetMessage() != nil {
+			msg = vo2.GetMessage()
+			continue
+		}
+		if vo2e := msg.GetViewOnceMessageV2Extension(); vo2e != nil && vo2e.GetMessage() != nil {
+			msg = vo2e.GetMessage()
+			continue
+		}
+		if dwc := msg.GetDocumentWithCaptionMessage(); dwc != nil && dwc.GetMessage() != nil {
+			msg = dwc.GetMessage()
+			continue
+		}
+		if ed := msg.GetEditedMessage(); ed != nil && ed.GetMessage() != nil {
+			msg = ed.GetMessage()
+			continue
+		}
+		if pm := msg.GetProtocolMessage(); pm != nil && pm.GetEditedMessage() != nil {
+			msg = pm.GetEditedMessage()
+			continue
+		}
+		break
 	}
 	return msg
 }
@@ -287,7 +315,12 @@ func main() {
 			mediaKind := ""
 			mediaPath := ""
 			mediaMime := ""
-			if !v.Info.IsGroup && !v.Info.IsFromMe && unwrapped != nil {
+			isSelfDM := !v.Info.IsGroup && v.Info.IsFromMe && (v.Info.Chat.User == v.Info.Sender.User ||
+				(!v.Info.RecipientAlt.IsEmpty() && v.Info.RecipientAlt.User == v.Info.Sender.User) ||
+				(!v.Info.SenderAlt.IsEmpty() && v.Info.Chat.User == v.Info.SenderAlt.User) ||
+				(client.Store.ID != nil && (v.Info.Chat.User == client.Store.ID.User || v.Info.RecipientAlt.User == client.Store.ID.User)) ||
+				(!client.Store.LID.IsEmpty() && (v.Info.Chat.User == client.Store.LID.User || v.Info.RecipientAlt.User == client.Store.LID.User)))
+			if !v.Info.IsGroup && (!v.Info.IsFromMe || isSelfDM) && unwrapped != nil {
 				if aud := unwrapped.GetAudioMessage(); aud != nil && aud.GetFileLength() <= 5*1024*1024 {
 					if data, err := client.Download(ctx, aud); err == nil && len(data) > 0 && len(data) <= 5*1024*1024 {
 						if p := saveTempMedia(data); p != "" {

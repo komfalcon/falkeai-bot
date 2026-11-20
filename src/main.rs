@@ -691,6 +691,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
             if from_me {
                 // Ignore WhatsApp echoes of FalkeAI's own automated messages
                 if ctx.echo_guard.is_echo(&text, Utc::now().timestamp_millis()) {
+                    cleanup_media(&media_path);
                     return Ok(());
                 }
 
@@ -704,11 +705,48 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                         chat_alt_jid.as_deref(),
                     )
                 {
-                    if text.trim().is_empty() {
+                    let mut self_input = text.trim().to_string();
+                    if let (Some(kind), Some(path)) = (media_kind.as_deref(), media_path.as_deref()) {
+                        if kind == "audio" {
+                            match crate::media::transcribe_voice_note(&ctx.cfg, path, media_mime.as_deref()).await {
+                                Ok(transcript) => {
+                                    self_input = transcript.trim().to_string();
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Self-chat voice note transcription failed: {}",
+                                        crate::safety::redact_secrets(&e.to_string(), &ctx.cfg)
+                                    );
+                                    let msg = "Couldn't catch that voice note clearly — try sending it again or type it out.".to_string();
+                                    ctx.echo_guard.record(&msg, Utc::now().timestamp_millis());
+                                    ctx.send_cmd(BridgeCommand::SendMessage {
+                                        chat_jid,
+                                        text: msg,
+                                        mentions: vec![],
+                                    });
+                                    return Ok(());
+                                }
+                            }
+                        } else if kind == "image" {
+                            if let Ok(desc) = crate::media::describe_image(&ctx.cfg, path, media_mime.as_deref(), &text).await {
+                                self_input = if self_input.is_empty() {
+                                    format!("[Image attached by Falcon]: {}", desc)
+                                } else {
+                                    format!("{}\n[Image attached by Falcon]: {}", self_input, desc)
+                                };
+                            }
+                        } else {
+                            cleanup_media(&media_path);
+                        }
+                    } else {
+                        cleanup_media(&media_path);
+                    }
+
+                    if self_input.trim().is_empty() {
                         return Ok(());
                     }
                     let ctx_groups = Arc::clone(&ctx);
-                    let reply = run_owner_command(&ctx.db, &ctx.cfg, &text, || {
+                    let reply = run_owner_command(&ctx.db, &ctx.cfg, &self_input, || {
                         let c = Arc::clone(&ctx_groups);
                         async move {
                             let req_id = format!("grp-{}", Utc::now().timestamp_millis());
@@ -744,7 +782,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                         if let Ok(outcome) = handle_owner_self_chat(
                             &ctx.db,
                             &ctx.cfg,
-                            &text,
+                            &self_input,
                             now_ms,
                             |msgs| async move { call_llm_http(&cfg_clone, &msgs).await },
                         )
@@ -768,6 +806,8 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                     }
                     return Ok(());
                 }
+
+                cleanup_media(&media_path);
 
                 if !is_group {
                     let ids: Vec<String> = [Some(chat_jid.as_str()), chat_alt_jid.as_deref()]
