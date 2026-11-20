@@ -18,6 +18,45 @@ pub const URGENT_MAX_ATTEMPTS: i64 = 15;
 pub const URGENT_CHAT_COOLDOWN_MS: i64 = 60 * 60_000;
 pub const URGENT_INTAKE_TIMEOUT_MS: i64 = 150_000; // 2.5 minutes
 pub const URGENT_INTAKE_MAX_TURNS: i64 = 2;
+pub const MAX_GLOBAL_NON_VIP_URGENT_PER_HOUR: usize = 4;
+
+fn clean_single_line(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .map(|c| if c == '\r' || c == '\n' || c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// Sanitizes an HTTP header value (such as ntfy `Title`) to printable ASCII (`0x20..=0x7E`)
+/// with zero CR/LF or non-ASCII bytes so `reqwest::header::HeaderValue` can never reject or inject headers.
+pub fn sanitize_http_header_ascii(s: &str) -> String {
+    let replaced = s.replace('—', "-").replace('–', "-");
+    let ascii: String = replaced
+        .chars()
+        .filter_map(|c| {
+            if (' '..='~').contains(&c) {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if ascii.is_empty() {
+        format!("URGENT - {}", BOT_NAME)
+    } else {
+        ascii.chars().take(120).collect()
+    }
+}
 
 pub fn is_urgent_draft_complete(d: &UrgentDraft) -> bool {
     let has_name = d.name.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
@@ -28,24 +67,28 @@ pub fn is_urgent_draft_complete(d: &UrgentDraft) -> bool {
 }
 
 pub fn format_ntfy_payload(alert: &UrgentAlertRecord, attempt: i64) -> (String, String) {
+    let clean_phone = clean_single_line(&alert.phone, 32);
     let who = match alert.contact_name.as_deref() {
-        Some(n) if !n.trim().is_empty() => format!("{} (+{})", n.trim(), alert.phone),
-        _ => format!("+{}", alert.phone),
+        Some(n) if !n.trim().is_empty() => {
+            format!("{} (+{})", clean_single_line(n, 40), clean_phone)
+        }
+        _ => format!("+{}", clean_phone),
     };
-    let title = if attempt <= 1 {
-        format!("URGENT — {} ({})", who, BOT_NAME)
+    let raw_title = if attempt <= 1 {
+        format!("URGENT - {} ({})", who, BOT_NAME)
     } else {
-        format!("URGENT [Ping #{}] — {}", attempt, who)
+        format!("URGENT [Ping #{}] - {}", attempt, who)
     };
+    let title = sanitize_http_header_ascii(&raw_title);
     let deadline_line = if alert.deadline.trim().is_empty() {
         "Not specified".to_string()
     } else {
-        alert.deadline.trim().to_string()
+        clean_single_line(&alert.deadline, 120)
     };
     let body = format!(
         "From: {}\nRequest: {}\nDeadline: {}\n\nReply 'ack' in WhatsApp Message yourself to stop alerts.",
         who,
-        alert.request.trim(),
+        clean_single_line(&alert.request, 240),
         deadline_line
     );
     (title, body)
@@ -65,7 +108,7 @@ pub async fn send_ntfy_http(cfg: &Config, title: &str, body: &str) -> Result<()>
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let safe_title = redact_secrets(title, cfg);
+    let safe_title = sanitize_http_header_ascii(&redact_secrets(title, cfg));
     let safe_body = redact_secrets(body, cfg);
     let mut req = client
         .post(&url)
@@ -109,11 +152,31 @@ where
     WF: FnMut(String) -> WFut,
     WFut: Future<Output = Result<()>>,
 {
-    // Rate limit: max 1 urgent alert sequence per chat per hour
+    // Rate limit 1: max 1 urgent alert sequence per chat per hour
     if db
         .has_recent_urgent_alert(sender, now_ms - URGENT_CHAT_COOLDOWN_MS)
         .await?
     {
+        return Ok(false);
+    }
+
+    // Rate limit 2: global non-VIP anti-flood guard so multi-number spam waves cannot DoS Falcon's phone
+    let is_vip = db
+        .get_contact_memory(sender)
+        .await?
+        .map(|cm| cm.tier == "vip")
+        .unwrap_or(false);
+    if !is_vip
+        && db
+            .count_recent_urgent_alerts(now_ms - URGENT_CHAT_COOLDOWN_MS)
+            .await?
+            >= MAX_GLOBAL_NON_VIP_URGENT_PER_HOUR
+    {
+        tracing::warn!(
+            "Suppressed non-VIP urgent alert flood for +{} (global hourly limit {} reached)",
+            sender,
+            MAX_GLOBAL_NON_VIP_URGENT_PER_HOUR
+        );
         return Ok(false);
     }
 

@@ -15,15 +15,38 @@ fn url_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:https?://|www\.)[^\s]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|co|ng|xyz|top|site|link|me|ly|app|info|biz|ru|cc|tk|ml|gq|cf|ga|click|live|shop|online|store|vip|club|gl|page|dev|ai|tech|icu|pw|cloud|win|bet|fun|best|work|today|world|space|website|ink)\b(?:/[^\s]*)?",
+            r"(?i)(?:https?://|www\.)[^\s]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|co|ng|xyz|top|site|link|me|ly|app|info|biz|ru|cc|tk|ml|gq|cf|ga|click|live|shop|online|store|vip|club|gl|page|dev|ai|tech|icu|pw|cloud|win|bet|fun|best|work|today|world|space|website|ink|gg|tv|to|in|uk|us|de|cn|br|za|ke|gh|tg|sbs|cfd|buzz|rest|fit|bio|lol)\b(?:/[^\s]*)?",
         )
         .expect("Valid URL regex")
     })
 }
 
+fn normalize_url_obfuscation(text: &str) -> String {
+    text.chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{0}'
+                    | '\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{FEFF}'
+                    | '\u{2060}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .map(|c| match c {
+            '\u{FF0E}' | '\u{3002}' | '\u{FF61}' | '\u{2024}' => '.',
+            _ => c,
+        })
+        .collect()
+}
+
 pub fn extract_hosts(text: &str) -> Vec<String> {
+    let normalized = normalize_url_obfuscation(text);
     let mut hosts = Vec::new();
-    for m in url_regex().find_iter(text) {
+    for m in url_regex().find_iter(&normalized) {
         let token = m
             .as_str()
             .to_lowercase()
@@ -33,7 +56,7 @@ pub fn extract_hosts(text: &str) -> Vec<String> {
             .to_string();
         let host_part = token.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
         let clean = host_part.trim_matches(&['.', ',', ')', '!'][..]);
-        if !clean.is_empty() {
+        if !clean.is_empty() && clean.contains('.') {
             hosts.push(clean.to_string());
         }
     }
@@ -56,6 +79,7 @@ pub struct CachedRoster {
     pub linked_parent: Option<String>,
     pub admins: HashSet<String>,
     pub members: HashSet<String>,
+    pub canonical_ids: HashMap<String, String>,
 }
 
 impl CachedRoster {
@@ -68,11 +92,12 @@ impl CachedRoster {
     ) -> Self {
         let mut admins = HashSet::new();
         let mut members = HashSet::new();
+        let mut canonical_ids = HashMap::new();
         for p in participants {
             let ids: Vec<String> = [
+                p.phone_number.as_deref(),
                 Some(p.jid.as_str()),
                 p.lid.as_deref(),
-                p.phone_number.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -80,10 +105,13 @@ impl CachedRoster {
             .filter(|s| !s.is_empty())
             .collect();
 
-            for id in &ids {
-                members.insert(id.clone());
-                if p.is_admin {
-                    admins.insert(id.clone());
+            if let Some(canonical) = ids.first().cloned() {
+                for id in &ids {
+                    canonical_ids.insert(id.clone(), canonical.clone());
+                    members.insert(id.clone());
+                    if p.is_admin {
+                        admins.insert(id.clone());
+                    }
                 }
             }
         }
@@ -94,6 +122,7 @@ impl CachedRoster {
             linked_parent,
             admins,
             members,
+            canonical_ids,
         }
     }
 
@@ -265,7 +294,10 @@ where
         return Ok(ModerationOutcome::AdminSender);
     }
 
-    let sender_key = sender_ids[0].clone();
+    let sender_key = sender_ids
+        .iter()
+        .find_map(|id| roster.canonical_ids.get(id).cloned())
+        .unwrap_or_else(|| sender_ids[0].clone());
     let rate_key = format!("{}:{}", input.group_jid, sender_key);
 
     // Record all recent messages from this non-admin so we can delete ALL their messages if they send multiple links

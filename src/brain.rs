@@ -11,8 +11,8 @@ use crate::db::{
     EmotionEntry, FlagRecord, LearningEpisode, OwnerMemoryItem, OwnerStatus, UrgentDraft,
 };
 use crate::safety::{
-    approval_trigger, detect_injection, redact_secrets, sanitize_display_name, sanitize_inbound,
-    sanitize_outbound_reply, urgent_trigger,
+    approval_trigger, detect_injection, is_life_safety_emergency, redact_secrets,
+    sanitize_display_name, sanitize_inbound, sanitize_outbound_reply, urgent_trigger,
 };
 use crate::util::{digits, lagos_parts, LagosTimeParts};
 
@@ -155,12 +155,19 @@ Reply with ONE JSON object only, no markdown fences or extra text:
     )
 }
 
+/// Returns true if a contact is verified to see `close`-tier owner memories.
+/// Security rule: An unverified stranger cannot unlock `close` memories simply by claiming in a DM
+/// to be Falcon's friend/partner/family — they must either be marked `vip` by Falcon OR have
+/// verified prior replies from Falcon himself (`!sample_owner_replies.is_empty()`).
 pub fn contact_allows_close_memory(contact_mem: Option<&ContactMemory>) -> bool {
     let Some(cm) = contact_mem else {
         return false;
     };
     if cm.tier == "vip" {
         return true;
+    }
+    if cm.sample_owner_replies.is_empty() {
+        return false;
     }
     if let Some(rel) = cm.relationship.as_deref() {
         let r = rel.to_lowercase();
@@ -1231,6 +1238,11 @@ where
 
     // Urgency Evaluation: AI urgency + deterministic keywords + VIP tier + active intake + high-intensity crisis
     let is_vip = contact_mem.tier == "vip";
+    let is_trusted_contact = is_vip || !contact_mem.sample_owner_replies.is_empty();
+    let life_safety = is_life_safety_emergency(&clean_text);
+    // Security guard: an unverified stranger merely acting "angry" or "frustrated" on turn 1 cannot
+    // skip collect-first intake unless it is a genuine life-safety emergency or a trusted contact.
+    let immediate_crisis_bypass = crisis_detected && (is_trusted_contact || life_safety);
     let ai_urgent = data
         .urgency
         .as_deref()
@@ -1276,7 +1288,7 @@ where
             state.urgent_draft.request = Some(clean_text.chars().take(240).collect());
         }
 
-        if crisis_detected
+        if immediate_crisis_bypass
             || is_urgent_draft_complete(&state.urgent_draft)
             || state.urgent_draft.turns >= URGENT_INTAKE_MAX_TURNS
         {
@@ -1298,8 +1310,24 @@ where
                         .to_string(),
                 );
             }
+            // If this urgent message also involves a financial/contract/private-info request, never
+            // allow the LLM to make an unapproved commitment while escalating.
+            if approval_trigger(&clean_text).is_some() {
+                if data.draft_for_falcon.is_none() {
+                    if let Some(ref existing_reply) = data.reply {
+                        if existing_reply.trim() != HANDOFF_REPLY {
+                            data.draft_for_falcon = Some(existing_reply.trim().to_string());
+                        }
+                    }
+                }
+                data.reply = Some(
+                    "Got it — this needs Falcon personally and I'm paging him right away."
+                        .to_string(),
+                );
+            }
         } else {
-            // Still collecting missing urgent intake fields — do NOT lock/hold the thread yet!
+            // Still collecting missing urgent intake fields — do NOT lock/hold the thread yet,
+            // and if approval_trigger matched, force a safe intake prompt so no unapproved commitment leaks.
             let mut missing = Vec::new();
             if state.urgent_draft.name.is_none() {
                 missing.push("your name");
@@ -1310,7 +1338,8 @@ where
             if state.urgent_draft.deadline.is_none() {
                 missing.push("the deadline / timing");
             }
-            if data.reply.as_deref().unwrap_or("").trim().is_empty()
+            if approval_trigger(&clean_text).is_some()
+                || data.reply.as_deref().unwrap_or("").trim().is_empty()
                 || data.reply.as_deref().unwrap_or("").trim() == HANDOFF_REPLY
             {
                 data.reply = Some(format!(
@@ -1494,7 +1523,27 @@ where
 
     if let Some(mu) = data.memory_update {
         if let Some(rel) = mu.relationship.filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("null")) {
-            contact_mem.relationship = Some(rel.chars().take(40).collect());
+            let rel_lower = rel.to_lowercase();
+            let high_trust_claim = [
+                "partner",
+                "girlfriend",
+                "boyfriend",
+                "wife",
+                "husband",
+                "family",
+                "brother",
+                "sister",
+                "mother",
+                "father",
+                "close",
+                "best friend",
+            ]
+            .iter()
+            .any(|k| rel_lower.contains(k));
+            // Block unverified strangers from self-assigning high-trust relationship labels
+            if !high_trust_claim || is_trusted_contact {
+                contact_mem.relationship = Some(rel.chars().take(40).collect());
+            }
         }
         if let Some(tone) = mu.tone.filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("null")) {
             contact_mem.tone = Some(tone.chars().take(40).collect());
@@ -1649,6 +1698,8 @@ where
     state.updated_at = now_ms;
     db.save_conversation(&state).await?;
     db.delete_pending_reply(sender).await?;
+    let _ = db.delete_flags_for_chat(sender).await;
+    let _ = db.ack_urgent_alerts(Some(sender)).await;
 
     let mut contact_mem = db
         .get_contact_memory(sender)

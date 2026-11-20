@@ -1940,6 +1940,55 @@ impl Database {
         }
     }
 
+    pub async fn find_saved_contacts(&self, query: &str) -> Result<Vec<(String, String)>> {
+        let q = query.trim().to_lowercase();
+        let q_alpha: String = q.chars().filter(|c| c.is_alphanumeric()).collect();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all: Vec<(String, String)> = match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                guard
+                    .data
+                    .saved_contacts
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }
+            TursoBackend::Remote { .. } => {
+                let like = format!("%{}%", q);
+                let res = self
+                    .execute_remote(
+                        "SELECT id, name FROM saved_contacts WHERE LOWER(name) LIKE ? OR id LIKE ? LIMIT 25",
+                        vec![SqlParam::from(like.clone()), SqlParam::from(like)],
+                    )
+                    .await?;
+                res.rows
+                    .iter()
+                    .filter_map(|r| Some((row_str(r, "id")?, row_str(r, "name")?)))
+                    .collect()
+            }
+        };
+        let mut hits: Vec<(String, String)> = all
+            .into_iter()
+            .filter(|(id, name)| {
+                let nl = name.to_lowercase();
+                let n_alpha: String = nl.chars().filter(|c| c.is_alphanumeric()).collect();
+                nl.contains(&q)
+                    || id.contains(&q)
+                    || (!q_alpha.is_empty() && n_alpha.contains(&q_alpha))
+            })
+            .collect();
+        // Prefer exact name matches and standard phone numbers (starting with country code, not @lid ids)
+        hits.sort_by_key(|(id, name)| {
+            let exact = name.trim().eq_ignore_ascii_case(query.trim());
+            let looks_phone = id.starts_with("234") && id.len() == 13;
+            (!exact, !looks_phone, name.len())
+        });
+        Ok(hits)
+    }
+
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         match &self.backend {
             TursoBackend::Local(s) => Ok(s.lock().unwrap().data.settings.get(key).cloned()),
@@ -2146,6 +2195,33 @@ impl Database {
                     )
                     .await?;
                 Ok(!res.rows.is_empty())
+            }
+        }
+    }
+
+    pub async fn count_recent_urgent_alerts(&self, since_ms: i64) -> Result<usize> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard
+                    .data
+                    .urgent_alerts
+                    .iter()
+                    .filter(|a| a.created_at >= since_ms)
+                    .count())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT COUNT(*) AS cnt FROM urgent_alerts WHERE created_at >= ?",
+                        vec![SqlParam::Int(since_ms)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .first()
+                    .map(|r| row_i64(r, "cnt") as usize)
+                    .unwrap_or(0))
             }
         }
     }

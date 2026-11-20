@@ -22,16 +22,48 @@ pub(crate) async fn resolve_contact_target(db: &Database, query: &str) -> Result
             return Ok(Some(first.sender.clone()));
         }
     }
+    if let Ok(saved_hits) = db.find_saved_contacts(q).await {
+        if let Some((id, _name)) = saved_hits.first() {
+            return Ok(Some(id.clone()));
+        }
+    }
+    let lower_q = q.to_lowercase();
+    let q_alpha: String = lower_q.chars().filter(|c| c.is_alphanumeric()).collect();
+    if let Ok(convos) = db.list_recent_conversations(30).await {
+        if let Some(c) = convos.into_iter().find(|c| {
+            (!norm.is_empty() && c.sender.contains(&norm))
+                || c.name
+                    .as_deref()
+                    .map(|n| {
+                        let nl = n.to_lowercase();
+                        let na: String = nl.chars().filter(|ch| ch.is_alphanumeric()).collect();
+                        nl.contains(&lower_q) || (!q_alpha.is_empty() && na.contains(&q_alpha))
+                    })
+                    .unwrap_or(false)
+        }) {
+            return Ok(Some(c.sender));
+        }
+    }
     if let Ok(flags) = db.list_flags(25).await {
-        let lower_q = q.to_lowercase();
         if let Some(f) = flags.into_iter().find(|f| {
-            f.chat.contains(&norm)
+            (!norm.is_empty() && f.chat.contains(&norm))
                 || f.name
                     .as_deref()
                     .map(|n| n.to_lowercase().contains(&lower_q))
                     .unwrap_or(false)
         }) {
             return Ok(Some(f.chat));
+        }
+    }
+    if let Ok(alerts) = db.list_unacked_urgent_alerts().await {
+        if let Some(a) = alerts.into_iter().find(|a| {
+            (!norm.is_empty() && (a.sender.contains(&norm) || a.phone.contains(&norm)))
+                || a.contact_name
+                    .as_deref()
+                    .map(|n| n.to_lowercase().contains(&lower_q))
+                    .unwrap_or(false)
+        }) {
+            return Ok(Some(a.sender));
         }
     }
     Ok(None)
@@ -316,8 +348,8 @@ where
         return Ok(Some(format!("✅ Ignored numbers ({}): {}", list.len(), joined)));
     }
 
-    // approve <phone/name>: <reply> | reply <phone/name>: <reply> | reject <phone/name>
-    if lower == "approve" || lower == "reply" || lower == "reject" {
+    // approve <phone/name>: <reply> | reply <phone/name>: <reply> | say <phone/name>: <reply> | reject <phone/name>
+    if lower == "approve" || lower == "reply" || lower == "say" || lower == "reject" {
         return Ok(Some(
             "⚠️ Usage: `approve <phone/name>: <reply to send>` or `reject <phone/name>`".to_string(),
         ));
@@ -342,12 +374,13 @@ where
         db.save_conversation(&state).await?;
         db.delete_pending_reply(&num).await?;
         let _ = db.delete_flags_for_chat(&num).await;
+        let _ = db.ack_urgent_alerts(Some(&num)).await;
         return Ok(Some(format!(
             "✅ Rejected held request for +{}. {} stays paused in that chat so you can take over whenever ready.",
             num, BOT_NAME
         )));
     }
-    if lower.starts_with("approve ") || lower.starts_with("reply ") {
+    if lower.starts_with("approve ") || lower.starts_with("reply ") || lower.starts_with("say ") {
         let idx = raw.find(' ').unwrap_or(0);
         let body = raw[idx + 1..].trim();
         let (target_part, custom_reply) = match body.find(':') {
@@ -402,6 +435,7 @@ where
         db.save_conversation(&state).await?;
         db.delete_pending_reply(&num).await?;
         let _ = db.delete_flags_for_chat(&num).await;
+        let _ = db.ack_urgent_alerts(Some(&num)).await;
         queue_approved_outbound(db, &num, &reply_to_send).await?;
         return Ok(Some(format!(
             "✅ Approved & sent to +{}:\n\"{}\"",

@@ -17,12 +17,21 @@ const OWNER_PUBLIC_NUMBERS: [&str; 2] = ["2349113683395", "09113683395"];
 const PROMPT_LEAK_MARKERS: &[&str] = &[
     "## 1. core personality",
     "## 2. thinking pattern",
+    "## 5b. emotional intelligence",
+    "## 6b. urgent matters",
+    "## 8. safety & privacy",
     "## 9. output format",
     "core personality (falcon's profile)",
     "session state:",
     "flag_human",
     "memory_update",
     "save_booking",
+    "urgent_intake",
+    "emotion_intensity",
+    "emotion_subtext",
+    "private_internal",
+    "__owner_self_chat__",
+    "live workspace context",
     "owner memory & verified facts",
     "learned preferences & self-improvement",
     "contact memory (persistent)",
@@ -32,21 +41,41 @@ const INJECTION_PATTERNS: &[&str] = &[
     "ignore previous instructions",
     "ignore all previous",
     "ignore your instructions",
+    "ignore all rules",
+    "ignore your rules",
     "ignore the above",
     "disregard previous",
     "disregard your instructions",
     "forget your instructions",
     "forget all previous",
+    "override instructions",
+    "new instructions",
     "system prompt",
     "your prompt",
     "your instructions",
     "your rules",
+    "what are your rules",
+    "what are your instructions",
+    "repeat the text above",
+    "repeat everything above",
+    "print the above",
     "reveal your",
     "print your",
     "show me your config",
     "your config",
+    "dump database",
+    "dump memory",
+    "show all memories",
+    "list all bookings",
+    "other contacts",
+    "who else messaged",
+    "who else texted",
     "api key",
     "api_key",
+    "groq_api",
+    "cf_api_token",
+    "ntfy_topic",
+    "turso_auth",
     "auth token",
     "access token",
     "environment variable",
@@ -59,9 +88,27 @@ const INJECTION_PATTERNS: &[&str] = &[
     "falcon approved",
 ];
 
+fn strip_hidden_control_chars(text: &str) -> String {
+    text.chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{0}'
+                    | '\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{FEFF}'
+                    | '\u{2060}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .collect()
+}
+
 /// Removes spoofed role / control tags a sender might inject (e.g. `[Falcon]:`, `[SYSTEM]`, `<|im_start|>`).
 pub fn sanitize_inbound(text: &str) -> String {
-    let mut out = text.replace('\u{0}', "");
+    let mut out = strip_hidden_control_chars(text);
     for tag in [
         "<|im_start|>",
         "<|im_end|>",
@@ -95,12 +142,47 @@ pub fn sanitize_inbound(text: &str) -> String {
     joined.chars().take(2000).collect()
 }
 
-/// Returns true if the text looks like a prompt-injection or secret-extraction attempt.
+/// Returns true if the text looks like a prompt-injection or secret-extraction attempt,
+/// including obfuscated spacing/punctuation tricks (e.g. `s.y.s.t.e.m p-r-o-m-p-t`).
 pub fn detect_injection(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    INJECTION_PATTERNS.iter().any(|p| lower.contains(p))
-        || lower.contains("[system]")
-        || lower.contains("[falcon]")
+    let stripped = strip_hidden_control_chars(text).to_lowercase();
+    if INJECTION_PATTERNS.iter().any(|p| stripped.contains(p))
+        || stripped.contains("[system]")
+        || stripped.contains("[falcon]")
+    {
+        return true;
+    }
+    // Collapse punctuation/separators and extra whitespace to catch obfuscated keywords
+    let normalized_words: String = stripped
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if INJECTION_PATTERNS.iter().any(|p| normalized_words.contains(p)) {
+        return true;
+    }
+    // Catch letter-spaced obfuscation like "s y s t e m p r o m p t" or "s.y.s.t.e.m"
+    let squashed: String = stripped
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    for critical in [
+        "ignorepreviousinstructions",
+        "ignoreyourinstructions",
+        "systemprompt",
+        "revealconfig",
+        "ntfytopic",
+        "tursoauthtoken",
+        "groqapikey",
+        "enterdevelopermode",
+    ] {
+        if squashed.contains(critical) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cleans an untrusted WhatsApp display name before it is stored or put into a prompt.
@@ -158,14 +240,14 @@ pub fn approval_trigger(text: &str) -> Option<&'static str> {
 pub fn urgent_trigger(text: &str, is_vip: bool) -> Option<&'static str> {
     let lower = format!(" {} ", text.to_lowercase());
     let hard_urgent = [
-        "urgent", "urgently", "asap", "emergency", "right now", "immediately",
+        "urgent", "urgently", "asap", "emergency", "immediately",
         "call me now", "pick up", "waiting outside", "i'm outside", "im outside",
-        "waiting for you", "at the gate", "site is down", "server is down",
+        "waiting for falcon", "at the gate", "site is down", "server is down",
         "deadline", "due today", "due tonight", "before midnight", "closing today",
-        "job offer", "interview", "recruiter", "shortlisted", "offer letter",
+        "job offer", "job interview", "interview invite", "interview today", "recruiter", "shortlisted", "offer letter",
         "client deal", "business deal", "close the deal", "sign the contract",
-        "payment issue", "payment failed", "sent the money", "paid into", "debit alert",
-        "bank transfer", "transfer failed", "hospital", "accident",
+        "payment issue", "payment failed", "sent the money", "debit alert",
+        "transfer failed", "hospital", "accident",
     ];
     if hard_urgent.iter().any(|k| lower.contains(k)) {
         return Some("Urgent keyword match");
@@ -173,13 +255,33 @@ pub fn urgent_trigger(text: &str, is_vip: bool) -> Option<&'static str> {
     if is_vip {
         let vip_urgent = [
             "call me", "need you", "where are you", "please reply", "respond",
-            "payment", "deal", "job", "waiting", "problem", "trouble", "sick", "help me",
+            "payment", "deal", "job", "waiting", "problem", "trouble", "sick", "help me", "right now",
         ];
         if vip_urgent.iter().any(|k| lower.contains(k)) {
             return Some("VIP urgent message");
         }
     }
     None
+}
+
+/// Returns true only for genuine physical / medical / safety emergencies where even an unverified
+/// contact should bypass 2-turn intake.
+pub fn is_life_safety_emergency(text: &str) -> bool {
+    let lower = format!(" {} ", text.to_lowercase());
+    [
+        "hospital",
+        "accident",
+        "medical emergency",
+        "police",
+        "bleeding",
+        "ambulance",
+        "dying",
+        "collapsed",
+        "arrested",
+        "fire",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 fn looks_like_secret_token(word: &str) -> bool {
