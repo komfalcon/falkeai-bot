@@ -169,6 +169,57 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS email_items (
+        msg_id TEXT PRIMARY KEY,
+        account_label TEXT NOT NULL,
+        thread_id TEXT NOT NULL DEFAULT '',
+        sender TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        snippet TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL DEFAULT 'direct_human',
+        priority TEXT NOT NULL DEFAULT 'important',
+        summary TEXT NOT NULL DEFAULT '',
+        received_at INTEGER NOT NULL,
+        alerted INTEGER NOT NULL DEFAULT 0,
+        digest_delivered INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS scheduled_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target TEXT NOT NULL,
+        contact_name TEXT,
+        channel TEXT NOT NULL DEFAULT 'whatsapp',
+        message TEXT NOT NULL,
+        due_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS bank_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL DEFAULT 'android',
+        bank TEXT NOT NULL,
+        direction TEXT NOT NULL DEFAULT 'credit',
+        amount_minor INTEGER NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'NGN',
+        counterparty TEXT NOT NULL DEFAULT '',
+        raw_summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS phone_devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS phone_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
 ];
 
 #[derive(Debug, Clone)]
@@ -481,6 +532,100 @@ pub struct GuardedGroup {
     pub mode: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailItemRecord {
+    pub msg_id: String,
+    pub account_label: String,
+    pub thread_id: String,
+    pub sender: String,
+    pub subject: String,
+    pub snippet: String,
+    /// "interview_career" | "payments_finance" | "infra_alerts" | "direct_human" | "low_noise"
+    pub category: String,
+    /// "urgent" | "important" | "low"
+    pub priority: String,
+    pub summary: String,
+    pub received_at: i64,
+    pub alerted: bool,
+    pub digest_delivered: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledMessageRecord {
+    pub id: i64,
+    pub target: String,
+    pub contact_name: Option<String>,
+    /// "whatsapp" | "sms"
+    pub channel: String,
+    pub message: String,
+    pub due_at: i64,
+    /// "pending" | "sent" | "cancelled" | "failed"
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BankAlertRecord {
+    pub id: i64,
+    pub source: String,
+    pub bank: String,
+    /// "credit" | "debit"
+    pub direction: String,
+    /// Minor units (kobo for NGN, cents for USD)
+    pub amount_minor: i64,
+    pub currency: String,
+    pub counterparty: String,
+    pub raw_summary: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneDeviceRecord {
+    pub id: i64,
+    pub device_name: String,
+    pub token_hash: String,
+    pub active: bool,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneEventRecord {
+    pub id: i64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PhoneTelemetrySnapshot {
+    pub battery_pct: i64,
+    pub is_charging: bool,
+    pub dnd_active: bool,
+    pub bt_connected: bool,
+    #[serde(default)]
+    pub calendar_upcoming: Vec<String>,
+    #[serde(default)]
+    pub recent_notifications: Vec<String>,
+    #[serde(default)]
+    pub low_battery_cover: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerBriefContext {
+    pub phone: String,
+    pub display_name: Option<String>,
+    pub relationship: Option<String>,
+    pub tier: String,
+    pub summary_line: String,
+    pub open_followups: Vec<String>,
+    pub bookings: Vec<String>,
+    pub last_chat_snippet: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct LocalStoreData {
     conversations: HashMap<String, ConversationState>,
@@ -504,6 +649,16 @@ struct LocalStoreData {
     reminders: Vec<ReminderRecord>,
     #[serde(default)]
     followups: Vec<FollowupRecord>,
+    #[serde(default)]
+    email_items: HashMap<String, EmailItemRecord>,
+    #[serde(default)]
+    scheduled_messages: Vec<ScheduledMessageRecord>,
+    #[serde(default)]
+    bank_alerts: Vec<BankAlertRecord>,
+    #[serde(default)]
+    phone_devices: Vec<PhoneDeviceRecord>,
+    #[serde(default)]
+    phone_events: Vec<PhoneEventRecord>,
     next_id: i64,
 }
 
@@ -3291,5 +3446,824 @@ impl Database {
                 Ok(res.rows_affected > 0)
             }
         }
+    }
+
+    // ---- Multi-Account Priority Gmail Items ----
+    pub async fn has_email_item(&self, msg_id: &str) -> Result<bool> {
+        match &self.backend {
+            TursoBackend::Local(s) => Ok(s.lock().unwrap().data.email_items.contains_key(msg_id)),
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT msg_id FROM email_items WHERE msg_id = ? LIMIT 1",
+                        vec![SqlParam::from(msg_id)],
+                    )
+                    .await?;
+                Ok(!res.rows.is_empty())
+            }
+        }
+    }
+
+    pub async fn upsert_email_item(&self, item: &EmailItemRecord) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                guard
+                    .data
+                    .email_items
+                    .insert(item.msg_id.clone(), item.clone());
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "INSERT INTO email_items (msg_id, account_label, thread_id, sender, subject, snippet, category, priority, summary, received_at, alerted, digest_delivered, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(msg_id) DO UPDATE SET
+                       category = excluded.category,
+                       priority = excluded.priority,
+                       summary = excluded.summary,
+                       alerted = CASE WHEN email_items.alerted = 1 THEN 1 ELSE excluded.alerted END,
+                       digest_delivered = CASE WHEN email_items.digest_delivered = 1 THEN 1 ELSE excluded.digest_delivered END",
+                    vec![
+                        SqlParam::from(item.msg_id.clone()),
+                        SqlParam::from(item.account_label.clone()),
+                        SqlParam::from(item.thread_id.clone()),
+                        SqlParam::from(item.sender.clone()),
+                        SqlParam::from(item.subject.clone()),
+                        SqlParam::from(item.snippet.clone()),
+                        SqlParam::from(item.category.clone()),
+                        SqlParam::from(item.priority.clone()),
+                        SqlParam::from(item.summary.clone()),
+                        SqlParam::Int(item.received_at),
+                        SqlParam::Int(if item.alerted { 1 } else { 0 }),
+                        SqlParam::Int(if item.digest_delivered { 1 } else { 0 }),
+                        SqlParam::Int(item.created_at),
+                    ],
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    fn parse_email_item(r: &HashMap<String, Value>) -> EmailItemRecord {
+        EmailItemRecord {
+            msg_id: row_str(r, "msg_id").unwrap_or_default(),
+            account_label: row_str(r, "account_label").unwrap_or_default(),
+            thread_id: row_str(r, "thread_id").unwrap_or_default(),
+            sender: row_str(r, "sender").unwrap_or_default(),
+            subject: row_str(r, "subject").unwrap_or_default(),
+            snippet: row_str(r, "snippet").unwrap_or_default(),
+            category: row_str(r, "category").unwrap_or_else(|| "direct_human".to_string()),
+            priority: row_str(r, "priority").unwrap_or_else(|| "important".to_string()),
+            summary: row_str(r, "summary").unwrap_or_default(),
+            received_at: row_i64(r, "received_at"),
+            alerted: row_i64(r, "alerted") != 0,
+            digest_delivered: row_i64(r, "digest_delivered") != 0,
+            created_at: row_i64(r, "created_at"),
+        }
+    }
+
+    pub async fn list_pending_digest_emails(&self, limit: i64) -> Result<Vec<EmailItemRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<EmailItemRecord> = guard
+                    .data
+                    .email_items
+                    .values()
+                    .filter(|e| !e.digest_delivered && matches!(e.priority.as_str(), "urgent" | "important"))
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| {
+                    let a_urg = a.priority == "urgent";
+                    let b_urg = b.priority == "urgent";
+                    b_urg.cmp(&a_urg).then_with(|| b.received_at.cmp(&a.received_at))
+                });
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM email_items WHERE digest_delivered = 0 AND priority IN ('urgent', 'important') ORDER BY CASE WHEN priority = 'urgent' THEN 0 ELSE 1 END, received_at DESC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res.rows.iter().map(Self::parse_email_item).collect())
+            }
+        }
+    }
+
+    pub async fn list_recent_priority_emails(&self, limit: i64) -> Result<Vec<EmailItemRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<EmailItemRecord> = guard
+                    .data
+                    .email_items
+                    .values()
+                    .filter(|e| matches!(e.priority.as_str(), "urgent" | "important"))
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM email_items WHERE priority IN ('urgent', 'important') ORDER BY received_at DESC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res.rows.iter().map(Self::parse_email_item).collect())
+            }
+        }
+    }
+
+    pub async fn mark_emails_digest_delivered(&self, msg_ids: &[String]) -> Result<()> {
+        if msg_ids.is_empty() {
+            return Ok(());
+        }
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                for id in msg_ids {
+                    if let Some(e) = guard.data.email_items.get_mut(id) {
+                        e.digest_delivered = true;
+                    }
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                for id in msg_ids {
+                    let _ = self
+                        .execute_remote(
+                            "UPDATE email_items SET digest_delivered = 1 WHERE msg_id = ?",
+                            vec![SqlParam::from(id.clone())],
+                        )
+                        .await;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn mark_email_alerted(&self, msg_id: &str) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(e) = guard.data.email_items.get_mut(msg_id) {
+                    e.alerted = true;
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "UPDATE email_items SET alerted = 1 WHERE msg_id = ?",
+                    vec![SqlParam::from(msg_id)],
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    // ---- Scheduled WhatsApp & SMS Messages (Feature J) ----
+    pub async fn add_scheduled_message(
+        &self,
+        target: &str,
+        contact_name: Option<&str>,
+        channel: &str,
+        message: &str,
+        due_at: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let clean_target = target.trim();
+        let clean_msg = message.trim();
+        if clean_target.is_empty() || clean_msg.is_empty() {
+            return Ok(0);
+        }
+        let chan = if channel.trim().eq_ignore_ascii_case("sms") {
+            "sms"
+        } else {
+            "whatsapp"
+        };
+        let cname = contact_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                guard.data.scheduled_messages.push(ScheduledMessageRecord {
+                    id,
+                    target: clean_target.to_string(),
+                    contact_name: cname,
+                    channel: chan.to_string(),
+                    message: clean_msg.to_string(),
+                    due_at,
+                    status: "pending".to_string(),
+                    created_at: now_ms,
+                    updated_at: now_ms,
+                });
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO scheduled_messages (target, contact_name, channel, message, due_at, status, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                        vec![
+                            SqlParam::from(clean_target),
+                            SqlParam::from(cname),
+                            SqlParam::from(chan),
+                            SqlParam::from(clean_msg),
+                            SqlParam::Int(due_at),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    fn parse_scheduled_message(r: &HashMap<String, Value>) -> ScheduledMessageRecord {
+        ScheduledMessageRecord {
+            id: row_i64(r, "id"),
+            target: row_str(r, "target").unwrap_or_default(),
+            contact_name: row_str(r, "contact_name"),
+            channel: row_str(r, "channel").unwrap_or_else(|| "whatsapp".to_string()),
+            message: row_str(r, "message").unwrap_or_default(),
+            due_at: row_i64(r, "due_at"),
+            status: row_str(r, "status").unwrap_or_else(|| "pending".to_string()),
+            created_at: row_i64(r, "created_at"),
+            updated_at: row_i64(r, "updated_at"),
+        }
+    }
+
+    pub async fn list_due_scheduled_messages(&self, now_ms: i64) -> Result<Vec<ScheduledMessageRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<ScheduledMessageRecord> = guard
+                    .data
+                    .scheduled_messages
+                    .iter()
+                    .filter(|m| m.status == "pending" && m.due_at <= now_ms)
+                    .cloned()
+                    .collect();
+                list.sort_by_key(|m| m.due_at);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM scheduled_messages WHERE status = 'pending' AND due_at <= ? ORDER BY due_at ASC",
+                        vec![SqlParam::Int(now_ms)],
+                    )
+                    .await?;
+                Ok(res.rows.iter().map(Self::parse_scheduled_message).collect())
+            }
+        }
+    }
+
+    pub async fn list_pending_scheduled_messages(&self, limit: i64) -> Result<Vec<ScheduledMessageRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<ScheduledMessageRecord> = guard
+                    .data
+                    .scheduled_messages
+                    .iter()
+                    .filter(|m| m.status == "pending")
+                    .cloned()
+                    .collect();
+                list.sort_by_key(|m| m.due_at);
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM scheduled_messages WHERE status = 'pending' ORDER BY due_at ASC LIMIT ?",
+                        vec![SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res.rows.iter().map(Self::parse_scheduled_message).collect())
+            }
+        }
+    }
+
+    pub async fn update_scheduled_message_status(
+        &self,
+        id: i64,
+        status: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(m) = guard.data.scheduled_messages.iter_mut().find(|m| m.id == id) {
+                    m.status = status.to_string();
+                    m.updated_at = now_ms;
+                    guard.flush()?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "UPDATE scheduled_messages SET status = ?, updated_at = ? WHERE id = ?",
+                        vec![SqlParam::from(status), SqlParam::Int(now_ms), SqlParam::Int(id)],
+                    )
+                    .await?;
+                Ok(res.rows_affected > 0)
+            }
+        }
+    }
+
+    // ---- Bank / Paystack / Stripe Alert Ledger (Feature #4) ----
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_bank_alert(
+        &self,
+        source: &str,
+        bank: &str,
+        direction: &str,
+        amount_minor: i64,
+        currency: &str,
+        counterparty: &str,
+        raw_summary: &str,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let dir = if direction.trim().eq_ignore_ascii_case("debit") {
+            "debit"
+        } else {
+            "credit"
+        };
+        let cur = if currency.trim().is_empty() {
+            "NGN"
+        } else {
+            currency.trim()
+        };
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                // Simple 2-minute duplicate suppression for identical bank alert notifications
+                if let Some(dup) = guard.data.bank_alerts.iter().rev().take(10).find(|b| {
+                    b.bank.eq_ignore_ascii_case(bank)
+                        && b.direction == dir
+                        && b.amount_minor == amount_minor
+                        && b.raw_summary == raw_summary
+                        && (now_ms - b.created_at).abs() < 120_000
+                }) {
+                    return Ok(dup.id);
+                }
+                let id = guard.alloc_id();
+                guard.data.bank_alerts.push(BankAlertRecord {
+                    id,
+                    source: source.to_string(),
+                    bank: bank.to_string(),
+                    direction: dir.to_string(),
+                    amount_minor,
+                    currency: cur.to_uppercase(),
+                    counterparty: counterparty.trim().to_string(),
+                    raw_summary: raw_summary.chars().take(240).collect(),
+                    created_at: now_ms,
+                });
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let dup = self
+                    .execute_remote(
+                        "SELECT id FROM bank_alerts WHERE bank = ? AND direction = ? AND amount_minor = ? AND raw_summary = ? AND created_at >= ? LIMIT 1",
+                        vec![
+                            SqlParam::from(bank),
+                            SqlParam::from(dir),
+                            SqlParam::Int(amount_minor),
+                            SqlParam::from(raw_summary.chars().take(240).collect::<String>()),
+                            SqlParam::Int(now_ms - 120_000),
+                        ],
+                    )
+                    .await?;
+                if let Some(row) = dup.rows.first() {
+                    return Ok(row_i64(row, "id"));
+                }
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO bank_alerts (source, bank, direction, amount_minor, currency, counterparty, raw_summary, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        vec![
+                            SqlParam::from(source),
+                            SqlParam::from(bank),
+                            SqlParam::from(dir),
+                            SqlParam::Int(amount_minor),
+                            SqlParam::from(cur.to_uppercase()),
+                            SqlParam::from(counterparty.trim()),
+                            SqlParam::from(raw_summary.chars().take(240).collect::<String>()),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn list_bank_alerts(
+        &self,
+        since_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<BankAlertRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<BankAlertRecord> = guard
+                    .data
+                    .bank_alerts
+                    .iter()
+                    .filter(|b| b.created_at >= since_ms)
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM bank_alerts WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+                        vec![SqlParam::Int(since_ms), SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| BankAlertRecord {
+                        id: row_i64(r, "id"),
+                        source: row_str(r, "source").unwrap_or_default(),
+                        bank: row_str(r, "bank").unwrap_or_default(),
+                        direction: row_str(r, "direction").unwrap_or_else(|| "credit".to_string()),
+                        amount_minor: row_i64(r, "amount_minor"),
+                        currency: row_str(r, "currency").unwrap_or_else(|| "NGN".to_string()),
+                        counterparty: row_str(r, "counterparty").unwrap_or_default(),
+                        raw_summary: row_str(r, "raw_summary").unwrap_or_default(),
+                        created_at: row_i64(r, "created_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    // ---- Android Companion Devices, SSE Events & Telemetry ----
+    pub async fn register_phone_device(
+        &self,
+        device_name: &str,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<i64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                guard.data.phone_devices.push(PhoneDeviceRecord {
+                    id,
+                    device_name: device_name.to_string(),
+                    token_hash: token_hash.to_string(),
+                    active: true,
+                    created_at: now_ms,
+                    last_seen_at: now_ms,
+                });
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO phone_devices (device_name, token_hash, active, created_at, last_seen_at) VALUES (?, ?, 1, ?, ?)",
+                        vec![
+                            SqlParam::from(device_name),
+                            SqlParam::from(token_hash),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn verify_phone_device_hash(&self, token_hash: &str, now_ms: i64) -> Result<Option<PhoneDeviceRecord>> {
+        let devices = self.list_active_phone_devices().await?;
+        // Constant-time byte comparison across active hashed tokens
+        let want = token_hash.as_bytes();
+        let matched = devices.into_iter().find(|d| {
+            let got = d.token_hash.as_bytes();
+            if got.len() != want.len() {
+                return false;
+            }
+            let mut diff = 0u8;
+            for (a, b) in got.iter().zip(want.iter()) {
+                diff |= a ^ b;
+            }
+            diff == 0
+        });
+        if let Some(ref dev) = matched {
+            let _ = self.touch_phone_device(dev.id, now_ms).await;
+        }
+        Ok(matched)
+    }
+
+    async fn touch_phone_device(&self, id: i64, now_ms: i64) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(d) = guard.data.phone_devices.iter_mut().find(|d| d.id == id) {
+                    d.last_seen_at = now_ms;
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "UPDATE phone_devices SET last_seen_at = ? WHERE id = ?",
+                    vec![SqlParam::Int(now_ms), SqlParam::Int(id)],
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn list_active_phone_devices(&self) -> Result<Vec<PhoneDeviceRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => Ok(s
+                .lock()
+                .unwrap()
+                .data
+                .phone_devices
+                .iter()
+                .filter(|d| d.active)
+                .cloned()
+                .collect()),
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM phone_devices WHERE active = 1 ORDER BY last_seen_at DESC",
+                        vec![],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| PhoneDeviceRecord {
+                        id: row_i64(r, "id"),
+                        device_name: row_str(r, "device_name").unwrap_or_default(),
+                        token_hash: row_str(r, "token_hash").unwrap_or_default(),
+                        active: row_i64(r, "active") != 0,
+                        created_at: row_i64(r, "created_at"),
+                        last_seen_at: row_i64(r, "last_seen_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn revoke_all_phone_devices(&self) -> Result<u64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut cnt = 0u64;
+                for d in &mut guard.data.phone_devices {
+                    if d.active {
+                        d.active = false;
+                        cnt += 1;
+                    }
+                }
+                guard.flush()?;
+                Ok(cnt)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote("UPDATE phone_devices SET active = 0 WHERE active = 1", vec![])
+                    .await?;
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
+    pub async fn append_phone_event(
+        &self,
+        event_type: &str,
+        payload_json: &str,
+        now_ms: i64,
+    ) -> Result<PhoneEventRecord> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let id = guard.alloc_id();
+                let rec = PhoneEventRecord {
+                    id,
+                    event_type: event_type.to_string(),
+                    payload_json: payload_json.to_string(),
+                    created_at: now_ms,
+                };
+                guard.data.phone_events.push(rec.clone());
+                if guard.data.phone_events.len() > 200 {
+                    let excess = guard.data.phone_events.len() - 200;
+                    guard.data.phone_events.drain(0..excess);
+                }
+                guard.flush()?;
+                Ok(rec)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO phone_events (event_type, payload_json, created_at) VALUES (?, ?, ?)",
+                        vec![
+                            SqlParam::from(event_type),
+                            SqlParam::from(payload_json),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                // Prune events older than 48h occasionally
+                let _ = self
+                    .execute_remote(
+                        "DELETE FROM phone_events WHERE created_at < ?",
+                        vec![SqlParam::Int(now_ms - 48 * 3_600_000)],
+                    )
+                    .await;
+                Ok(PhoneEventRecord {
+                    id: res.last_insert_rowid,
+                    event_type: event_type.to_string(),
+                    payload_json: payload_json.to_string(),
+                    created_at: now_ms,
+                })
+            }
+        }
+    }
+
+    pub async fn list_phone_events_since(&self, since_id: i64, limit: i64) -> Result<Vec<PhoneEventRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<PhoneEventRecord> = guard
+                    .data
+                    .phone_events
+                    .iter()
+                    .filter(|e| e.id > since_id)
+                    .cloned()
+                    .collect();
+                list.sort_by_key(|e| e.id);
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM phone_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                        vec![SqlParam::Int(since_id), SqlParam::Int(limit)],
+                    )
+                    .await?;
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| PhoneEventRecord {
+                        id: row_i64(r, "id"),
+                        event_type: row_str(r, "event_type").unwrap_or_default(),
+                        payload_json: row_str(r, "payload_json").unwrap_or_default(),
+                        created_at: row_i64(r, "created_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn get_phone_telemetry(&self) -> Result<Option<PhoneTelemetrySnapshot>> {
+        let Some(raw) = self.get_setting("phone_telemetry_json").await? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str::<PhoneTelemetrySnapshot>(&raw).ok())
+    }
+
+    pub async fn save_phone_telemetry(&self, snap: &PhoneTelemetrySnapshot) -> Result<()> {
+        let raw = serde_json::to_string(snap).unwrap_or_else(|_| "{}".to_string());
+        self.set_setting("phone_telemetry_json", &raw).await
+    }
+
+    /// Returns true if the Infinix Hot 10T recently sent a Dead-Battery (`<=10%` unplugged) beacon,
+    /// enabling automatic 0-minute WhatsApp cover until the phone charges or reconnects.
+    pub async fn is_phone_low_battery_cover(&self, now_ms: i64) -> Result<bool> {
+        let Some(snap) = self.get_phone_telemetry().await? else {
+            return Ok(false);
+        };
+        if !snap.low_battery_cover {
+            return Ok(false);
+        }
+        // Automatically expire stale cover after 12 hours just in case
+        if now_ms - snap.updated_at > 12 * 3_600_000 {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Fast `<5ms` caller pre-brief lookup for incoming Android phone calls (Feature A).
+    pub async fn get_caller_brief_context(&self, raw_phone: &str) -> Result<CallerBriefContext> {
+        let norm = crate::util::normalize_number(raw_phone);
+        let lookup_key = if norm.is_empty() {
+            raw_phone.trim().to_string()
+        } else {
+            norm.clone()
+        };
+        let cm = self.get_contact_memory(&lookup_key).await?;
+        let conv = self.get_conversation(&lookup_key).await?;
+        let saved_name = self
+            .get_saved_contact_name(&[lookup_key.clone()])
+            .await
+            .ok()
+            .flatten();
+        let display_name = cm
+            .as_ref()
+            .and_then(|c| c.display_name.clone())
+            .or_else(|| conv.as_ref().and_then(|c| c.name.clone()))
+            .or(saved_name);
+
+        let all_bookings = self.list_bookings(30).await.unwrap_or_default();
+        let matching_bookings: Vec<String> = all_bookings
+            .into_iter()
+            .filter(|b| {
+                let b_chat = crate::util::normalize_number(&b.chat);
+                let b_num = crate::util::normalize_number(&b.number);
+                (!lookup_key.is_empty() && (b_chat == lookup_key || b_num == lookup_key))
+                    || display_name
+                        .as_deref()
+                        .map(|n| b.name.to_lowercase().contains(&n.to_lowercase()))
+                        .unwrap_or(false)
+            })
+            .take(3)
+            .map(|b| format!("{} {} ({})", b.subject, b.exam, b.slot))
+            .collect();
+
+        let open_fu: Vec<String> = self
+            .list_followups(Some("open"), 20)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.sender == lookup_key)
+            .map(|f| format!("[#{}] {}", f.id, f.reason))
+            .collect();
+
+        let last_chat_snippet = conv
+            .as_ref()
+            .and_then(|c| c.history.last())
+            .map(|t| {
+                let who = if t.role == "user" { "They said" } else { "Last reply" };
+                format!("{}: {}", who, t.content.chars().take(110).collect::<String>())
+            });
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ref rel) = cm.as_ref().and_then(|c| c.relationship.clone()) {
+            parts.push(rel.clone());
+        }
+        if !matching_bookings.is_empty() {
+            parts.push(format!("Booked: {}", matching_bookings.join(", ")));
+        }
+        if !open_fu.is_empty() {
+            parts.push(format!("Follow-up: {}", open_fu[0]));
+        }
+        if let Some(ref snip) = last_chat_snippet {
+            parts.push(snip.clone());
+        }
+        let summary_line = if parts.is_empty() {
+            "No prior WhatsApp/booking history yet.".to_string()
+        } else {
+            parts.join(" | ")
+        };
+
+        Ok(CallerBriefContext {
+            phone: lookup_key,
+            display_name,
+            relationship: cm.as_ref().and_then(|c| c.relationship.clone()),
+            tier: cm
+                .as_ref()
+                .map(|c| c.tier.clone())
+                .unwrap_or_else(|| "normal".to_string()),
+            summary_line,
+            open_followups: open_fu,
+            bookings: matching_bookings,
+            last_chat_snippet,
+        })
     }
 }

@@ -76,6 +76,11 @@ const INJECTION_PATTERNS: &[&str] = &[
     "cf_api_token",
     "ntfy_topic",
     "turso_auth",
+    "gmail_refresh",
+    "gmail_client",
+    "phone_bridge",
+    "device_token",
+    "github_token",
     "auth token",
     "access token",
     "environment variable",
@@ -298,8 +303,11 @@ fn looks_like_secret_token(word: &str) -> bool {
         || w.starts_with("nvapi-")
         || w.starts_with("ghp_")
         || w.starts_with("github_pat_")
+        || w.starts_with("ya29.")
+        || w.starts_with("1//")
+        || w.starts_with("GOCSPX-")
     {
-        return w.len() >= 16;
+        return w.len() >= 14;
     }
     if w.len() < 32 {
         return false;
@@ -348,6 +356,22 @@ pub fn redact_secrets(text: &str, cfg: &Config) -> String {
         if !t.trim().is_empty() {
             secrets.push(t.trim().to_string());
         }
+    }
+    if !cfg.gmail_client_secret.trim().is_empty() {
+        secrets.push(cfg.gmail_client_secret.trim().to_string());
+    }
+    for acc in &cfg.gmail_accounts {
+        if !acc.refresh_token.trim().is_empty() {
+            secrets.push(acc.refresh_token.trim().to_string());
+        }
+    }
+    if let Some(t) = cfg.github_token.as_deref() {
+        if !t.trim().is_empty() {
+            secrets.push(t.trim().to_string());
+        }
+    }
+    if !cfg.phone_bridge_secret.trim().is_empty() {
+        secrets.push(cfg.phone_bridge_secret.trim().to_string());
     }
     if cfg.ai_base_url.contains("/accounts/") {
         if let Some(acct) = cfg.ai_base_url.split("/accounts/").nth(1).and_then(|s| s.split('/').next()) {

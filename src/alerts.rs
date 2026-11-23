@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use crate::config::{Config, BOT_NAME};
 use crate::db::{
-    Database, DigestItem, FollowupRecord, ReminderRecord, UrgentAlertRecord, UrgentDraft,
+    ChatTurn, ConversationState, Database, DigestItem, EmailItemRecord, FollowupRecord,
+    ReminderRecord, UrgentAlertRecord, UrgentDraft,
 };
+use crate::gmail::{sync_all_gmail_accounts, GmailTokenCache};
 use crate::safety::redact_secrets;
 
 pub const URGENT_REPEAT_INTERVAL_MS: i64 = 2 * 60_000;
@@ -232,6 +234,25 @@ where
 
     let id = db.create_urgent_alert(&rec).await?;
     rec.id = id;
+
+    let _ = db
+        .append_phone_event(
+            "urgent_alarm",
+            &json!({
+                "source": "whatsapp",
+                "alert_id": rec.id,
+                "sender": rec.sender,
+                "phone": rec.phone,
+                "contact_name": rec.contact_name,
+                "request": rec.request,
+                "deadline": rec.deadline,
+                "summary": rec.summary,
+                "at": now_ms
+            })
+            .to_string(),
+            now_ms,
+        )
+        .await;
 
     let (title, body) = format_ntfy_payload(&rec, 1);
     let ntfy_warning = match send_ntfy(title, body).await {
@@ -648,13 +669,49 @@ pub fn format_followup_card(f: &FollowupRecord) -> String {
     )
 }
 
+pub fn format_bank_amount(amount_minor: i64, currency: &str) -> String {
+    let major = (amount_minor as f64) / 100.0;
+    let upper = currency.to_uppercase();
+    let sym = match upper.as_str() {
+        "NGN" => "₦",
+        "USD" => "$",
+        "GBP" => "£",
+        "EUR" => "€",
+        other => other,
+    };
+    if amount_minor % 100 == 0 {
+        format!("{}{}", sym, amount_minor / 100)
+    } else {
+        format!("{}{:.2}", sym, major)
+    }
+}
+
+pub fn format_email_line(e: &EmailItemRecord) -> String {
+    let icon = match e.category.as_str() {
+        "interview_career" => "💼",
+        "payments_finance" => "💰",
+        "infra_alerts" => "🛠️",
+        _ => "✉️",
+    };
+    let urg_tag = if e.priority == "urgent" { " [URGENT]" } else { "" };
+    format!(
+        "• {} *[{}]{}* {} — *{}*\n  {}",
+        icon,
+        e.account_label,
+        urg_tag,
+        e.sender.chars().take(48).collect::<String>(),
+        e.subject.chars().take(90).collect::<String>(),
+        e.snippet.chars().take(120).collect::<String>()
+    )
+}
+
 pub fn format_digest_message(
     items: &[DigestItem],
     unacked_alerts: &[UrgentAlertRecord],
     reminders: &[ReminderRecord],
     header: &str,
 ) -> String {
-    format_digest_message_with_followups(items, unacked_alerts, reminders, &[], header)
+    format_digest_message_full(items, unacked_alerts, reminders, &[], &[], header)
 }
 
 pub fn format_digest_message_with_followups(
@@ -662,6 +719,24 @@ pub fn format_digest_message_with_followups(
     unacked_alerts: &[UrgentAlertRecord],
     reminders: &[ReminderRecord],
     ready_followups: &[FollowupRecord],
+    header: &str,
+) -> String {
+    format_digest_message_full(
+        items,
+        unacked_alerts,
+        reminders,
+        ready_followups,
+        &[],
+        header,
+    )
+}
+
+pub fn format_digest_message_full(
+    items: &[DigestItem],
+    unacked_alerts: &[UrgentAlertRecord],
+    reminders: &[ReminderRecord],
+    ready_followups: &[FollowupRecord],
+    priority_emails: &[EmailItemRecord],
     header: &str,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
@@ -675,6 +750,19 @@ pub fn format_digest_message_with_followups(
         sections.push(format!(
             "🚨 *Active Urgent Alerts ({})*:\n{}",
             unacked_alerts.len(),
+            lines.join("\n")
+        ));
+    }
+
+    if !priority_emails.is_empty() {
+        let lines: Vec<String> = priority_emails
+            .iter()
+            .take(8)
+            .map(format_email_line)
+            .collect();
+        sections.push(format!(
+            "📧 *Priority Unread Emails ({})*:\n{}",
+            priority_emails.len(),
             lines.join("\n")
         ));
     }
@@ -827,8 +915,14 @@ where
     let unacked = db.list_unacked_urgent_alerts().await?;
     let reminders = db.list_pending_reminders(10).await?;
     let ready_followups = db.list_followups(Some("ready"), 10).await?;
+    let priority_emails = db.list_pending_digest_emails(12).await?;
 
-    if items.is_empty() && unacked.is_empty() && reminders.is_empty() && ready_followups.is_empty() {
+    if items.is_empty()
+        && unacked.is_empty()
+        && reminders.is_empty()
+        && ready_followups.is_empty()
+        && priority_emails.is_empty()
+    {
         db.set_setting("last_digest_date", &today_key).await?;
         return Ok(false);
     }
@@ -838,11 +932,12 @@ where
         BOT_NAME,
         lagos.format("%a, %d %b")
     );
-    let msg = format_digest_message_with_followups(
+    let msg = format_digest_message_full(
         &items,
         &unacked,
         &reminders,
         &ready_followups,
+        &priority_emails,
         &header,
     );
     notify_wa(msg).await?;
@@ -850,7 +945,220 @@ where
     db.set_setting("last_digest_date", &today_key).await?;
     let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
     db.mark_digest_items_delivered(&ids).await?;
+    let email_ids: Vec<String> = priority_emails.iter().map(|e| e.msg_id.clone()).collect();
+    db.mark_emails_digest_delivered(&email_ids).await?;
     Ok(true)
+}
+
+/// Polls all connected Gmail accounts and triggers immediate urgent alerts for critical emails
+/// (interview invites/reschedules, Paystack/Stripe payout failures/disputes, Heroku/GitHub crashes).
+pub async fn tick_gmail_watcher<NF, NFut, WF, WFut, PF, PFut>(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    now_ms: i64,
+    mut send_ntfy: NF,
+    mut notify_wa: WF,
+    mut push_phone_alarm: PF,
+) -> Result<usize>
+where
+    NF: FnMut(String, String) -> NFut,
+    NFut: Future<Output = Result<()>>,
+    WF: FnMut(String) -> WFut,
+    WFut: Future<Output = Result<()>>,
+    PF: FnMut(String, serde_json::Value) -> PFut,
+    PFut: Future<Output = Result<()>>,
+{
+    let newly_found = sync_all_gmail_accounts(db, cfg, cache, now_ms).await?;
+    let mut urgent_count = 0usize;
+    for email in newly_found {
+        if email.priority != "urgent" || email.alerted {
+            continue;
+        }
+        let title = format!("URGENT EMAIL [{}] - {}", email.account_label, email.category);
+        let body = format!(
+            "From: {}\nSubject: {}\n{}",
+            email.sender, email.subject, email.snippet
+        );
+        let _ = send_ntfy(title, body.clone()).await;
+        let wa_msg = format!(
+            "🚨 *{} URGENT EMAIL [{}]*\nFrom: {}\nSubject: {}\nSummary: {}",
+            BOT_NAME, email.account_label, email.sender, email.subject, email.snippet
+        );
+        let _ = notify_wa(wa_msg).await;
+        let _ = push_phone_alarm(
+            "urgent_alarm".to_string(),
+            json!({
+                "source": "gmail",
+                "account": email.account_label,
+                "sender": email.sender,
+                "subject": email.subject,
+                "summary": email.snippet,
+                "msg_id": email.msg_id,
+                "at": now_ms
+            }),
+        )
+        .await;
+        db.mark_email_alerted(&email.msg_id).await?;
+        urgent_count += 1;
+    }
+    Ok(urgent_count)
+}
+
+/// Dispatches any due scheduled WhatsApp or SMS messages (Feature J).
+pub async fn tick_scheduled_messages<SW, SWFut, SS, SSFut, NW, NWFut>(
+    db: &Database,
+    now_ms: i64,
+    mut send_whatsapp: SW,
+    mut send_sms_to_phone: SS,
+    mut notify_wa: NW,
+) -> Result<usize>
+where
+    SW: FnMut(String, String) -> SWFut,
+    SWFut: Future<Output = Result<()>>,
+    SS: FnMut(String, serde_json::Value) -> SSFut,
+    SSFut: Future<Output = Result<()>>,
+    NW: FnMut(String) -> NWFut,
+    NWFut: Future<Output = Result<()>>,
+{
+    let due = db.list_due_scheduled_messages(now_ms).await?;
+    let mut sent = 0usize;
+    for msg in due {
+        if msg.channel == "sms" {
+            send_sms_to_phone(
+                "send_sms".to_string(),
+                json!({
+                    "scheduled_id": msg.id,
+                    "phone": msg.target,
+                    "contact_name": msg.contact_name,
+                    "message": msg.message,
+                }),
+            )
+            .await?;
+            db.update_scheduled_message_status(msg.id, "sent", now_ms)
+                .await?;
+            let _ = notify_wa(format!(
+                "📤 Dispatched scheduled SMS #{} to {} (+{}) via Android phone:\n\"{}\"",
+                msg.id,
+                msg.contact_name.as_deref().unwrap_or("Contact"),
+                msg.target,
+                msg.message
+            ))
+            .await;
+            sent += 1;
+        } else {
+            let jid = if msg.target.contains('@') {
+                msg.target.clone()
+            } else {
+                format!("{}@s.whatsapp.net", msg.target)
+            };
+            send_whatsapp(jid, msg.message.clone()).await?;
+            let mut st = db
+                .get_conversation(&msg.target)
+                .await?
+                .unwrap_or_else(|| ConversationState::new(&msg.target));
+            st.history.push(ChatTurn {
+                role: "assistant".to_string(),
+                content: format!("[Falcon]: {}", msg.message),
+            });
+            st.bot_active = true;
+            st.owner_read_unanswered = false;
+            st.paused_until = 0;
+            st.updated_at = now_ms;
+            db.save_conversation(&st).await?;
+            db.update_scheduled_message_status(msg.id, "sent", now_ms)
+                .await?;
+            let _ = notify_wa(format!(
+                "✅ Sent scheduled WhatsApp #{} to {} (+{}):\n\"{}\"",
+                msg.id,
+                msg.contact_name.as_deref().unwrap_or("Contact"),
+                msg.target,
+                msg.message
+            ))
+            .await;
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
+/// Builds a compact ~20-second "Catch Me Up" summary across WhatsApp, Gmail, Follow-ups & Bank Alerts (Feature I).
+pub async fn build_catch_me_up_summary(db: &Database, now_ms: i64) -> Result<String> {
+    let _ = db.promote_due_followups(now_ms).await;
+    let unacked = db.list_unacked_urgent_alerts().await?;
+    let flags = db.list_flags(6).await?;
+    let emails = db.list_recent_priority_emails(5).await?;
+    let followups = db.list_followups(Some("ready"), 5).await?;
+    let bank = db
+        .list_bank_alerts(now_ms - 24 * 3_600_000, 5)
+        .await?;
+
+    let mut parts: Vec<String> = Vec::new();
+    if !unacked.is_empty() {
+        parts.push(format!(
+            "Urgent alerts ({}): {}",
+            unacked.len(),
+            unacked
+                .iter()
+                .take(2)
+                .map(|a| a.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !flags.is_empty() {
+        parts.push(format!(
+            "WhatsApp chats needing your approval ({}): {}",
+            flags.len(),
+            flags
+                .iter()
+                .take(3)
+                .map(|f| format!("{}: {}", f.name.as_deref().unwrap_or(&f.chat), f.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !emails.is_empty() {
+        parts.push(format!(
+            "Priority Gmail ({}): {}",
+            emails.len(),
+            emails
+                .iter()
+                .take(3)
+                .map(|e| format!("{} — {}", e.sender, e.subject))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !bank.is_empty() {
+        parts.push(format!(
+            "Recent bank/payout alerts ({}): {}",
+            bank.len(),
+            bank.iter()
+                .take(3)
+                .map(|b| format!(
+                    "{} {} {} ({})",
+                    b.bank,
+                    if b.direction == "credit" { "+" } else { "-" },
+                    format_bank_amount(b.amount_minor, &b.currency),
+                    b.counterparty
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !followups.is_empty() {
+        parts.push(format!(
+            "{} follow-up(s) ready for approval",
+            followups.len()
+        ));
+    }
+
+    if parts.is_empty() {
+        Ok("All clear, boss — no urgent alerts, pending WhatsApp holds, priority emails, or new bank alerts right now.".to_string())
+    } else {
+        Ok(format!("⚡ *Catch-Up Briefing*\n{}", parts.join("\n• ")))
+    }
 }
 
 /// Fires any due owner reminders to WhatsApp `"Message yourself"`, automatically rescheduling

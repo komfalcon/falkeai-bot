@@ -1,14 +1,17 @@
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Africa::Lagos;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::alerts::{
-    format_digest_message_with_followups, format_followup_card, format_recurrence_badge,
-    parse_reminder_schedule, send_ntfy_http,
+    build_catch_me_up_summary, format_bank_amount, format_digest_message_full, format_email_line,
+    format_followup_card, format_recurrence_badge, parse_reminder_schedule, send_ntfy_http,
 };
 use crate::brain::{merge_semantic_facts, HISTORY_MAX};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, ContactMemory, ConversationState, Database, OwnerStatus};
+use crate::gmail::{sync_all_gmail_accounts, GmailTokenCache};
 use crate::ipc::GroupSummary;
 use crate::util::{normalize_number, number_of_jid};
 
@@ -168,6 +171,34 @@ pub fn should_reply_with_voice_in_self_chat(
     }
 }
 
+/// Generates a single-use 5-minute pairing code (`FALKE-XXXXXX`) for the Kotlin Android Companion app.
+pub async fn generate_android_pair_code(
+    db: &Database,
+    cfg: &Config,
+    now_ms: i64,
+) -> Result<(String, i64)> {
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(now_ms * 1_000_000);
+    let mut hasher = Sha256::new();
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(cfg.phone_bridge_secret.as_bytes());
+    hasher.update(cfg.pair_phone.as_bytes());
+    let digest = hasher.finalize();
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let mut suffix = String::with_capacity(6);
+    for &b in digest.iter().take(6) {
+        suffix.push(ALPHABET[(b as usize) % ALPHABET.len()] as char);
+    }
+    let code = format!("FALKE-{}", suffix);
+    let expires_at = now_ms + 5 * 60_000;
+    let payload = json!({
+        "code": code,
+        "expires_at": expires_at,
+    })
+    .to_string();
+    db.set_setting("android_pair_code_json", &payload).await?;
+    Ok((code, expires_at))
+}
+
 fn parse_duration_minutes(token: &str) -> Option<i64> {
     let t = token.trim().to_lowercase();
     if let Some(h) = t.strip_suffix("hr").or_else(|| t.strip_suffix("hrs")).or_else(|| t.strip_suffix('h')) {
@@ -244,7 +275,7 @@ where
         };
     }
 
-    // briefing / brief / summary / read me my briefing — on-demand digest
+    // briefing / brief / summary / read me my briefing — on-demand unified WhatsApp + Gmail digest
     if matches!(
         lower.as_str(),
         "briefing"
@@ -257,18 +288,293 @@ where
     ) {
         let now_ms = Utc::now().timestamp_millis();
         let _ = db.promote_due_followups(now_ms).await;
+        if cfg.has_gmail() {
+            let cache = GmailTokenCache::new();
+            let _ = sync_all_gmail_accounts(db, cfg, &cache, now_ms).await;
+        }
         let items = db.list_pending_digest_items(40).await?;
         let unacked = db.list_unacked_urgent_alerts().await?;
         let rems = db.list_pending_reminders(10).await?;
         let ready_followups = db.list_followups(Some("ready"), 10).await?;
-        let msg = format_digest_message_with_followups(
+        let priority_emails = db.list_pending_digest_emails(10).await?;
+        let msg = format_digest_message_full(
             &items,
             &unacked,
             &rems,
             &ready_followups,
+            &priority_emails,
             &format!("📋 *{} On-Demand Briefing*", BOT_NAME),
         );
         return Ok(Some(msg));
+    }
+
+    // emails / gmail — live multi-account priority unread Gmail view
+    if matches!(lower.as_str(), "emails" | "gmail" | "check emails" | "check gmail") {
+        let now_ms = Utc::now().timestamp_millis();
+        if cfg.has_gmail() {
+            let cache = GmailTokenCache::new();
+            let _ = sync_all_gmail_accounts(db, cfg, &cache, now_ms).await;
+        }
+        let recent = db.list_recent_priority_emails(10).await?;
+        if recent.is_empty() {
+            if !cfg.has_gmail() {
+                return Ok(Some(
+                    "📧 *Gmail is not connected yet.* Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` (plus `_2`, `_3` for extra accounts) in Heroku Config Vars."
+                        .to_string(),
+                ));
+            }
+            return Ok(Some("✅ No unread priority emails across your connected Gmail accounts.".to_string()));
+        }
+        let lines: Vec<String> = recent.iter().map(format_email_line).collect();
+        return Ok(Some(format!(
+            "📧 *Priority Gmail Inbox ({})*:\n{}",
+            recent.len(),
+            lines.join("\n")
+        )));
+    }
+
+    // pair android / revoke android / ring my phone — Native Kotlin Android Companion controls
+    if matches!(lower.as_str(), "pair android" | "phone pair" | "pair phone") {
+        let now_ms = Utc::now().timestamp_millis();
+        let (code, _) = generate_android_pair_code(db, cfg, now_ms).await?;
+        let url_hint = if cfg.public_base_url.is_empty() {
+            "https://<your-heroku-app>.herokuapp.com".to_string()
+        } else {
+            cfg.public_base_url.clone()
+        };
+        return Ok(Some(format!(
+            "📱 *FalkeAI Android Companion Pairing*\n• Server URL: `{}`\n• Pairing Code (valid 5 min): `{}`\n\nOpen the FalkeAI Android app on your Infinix Hot 10T, enter the URL + code, and tap *Pair Device*.",
+            url_hint, code
+        )));
+    }
+    if matches!(lower.as_str(), "revoke android" | "unpair android" | "revoke phone") {
+        let revoked = db.revoke_all_phone_devices().await?;
+        return Ok(Some(format!(
+            "🔒 Revoked {} paired Android device token(s). Run `pair android` to link a new device.",
+            revoked
+        )));
+    }
+    if matches!(
+        lower.as_str(),
+        "ring my phone" | "find my phone" | "ring phone" | "buddy you there"
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = db
+            .append_phone_event(
+                "find_phone",
+                &json!({
+                    "message": "I'm right here, boss!",
+                    "strobe": true,
+                    "at": now_ms
+                })
+                .to_string(),
+                now_ms,
+            )
+            .await?;
+        return Ok(Some(
+            "🔊 Sent Find-My-Phone siren + rear torch strobe command to your paired Android device!"
+                .to_string(),
+        ));
+    }
+
+    // catch me up — quick cross-channel catch-up routine (Feature I)
+    if matches!(lower.as_str(), "catch me up" | "catchup" | "catch up") {
+        let now_ms = Utc::now().timestamp_millis();
+        return Ok(Some(build_catch_me_up_summary(db, now_ms).await?));
+    }
+
+    // scheduled / schedule [sms] <when> -> <target>: <message> / unschedule <id> (Feature J)
+    if lower == "scheduled" || lower == "scheduled messages" {
+        let list = db.list_pending_scheduled_messages(15).await?;
+        if list.is_empty() {
+            return Ok(Some(
+                "✅ No scheduled messages queued.\nExample: `schedule tomorrow 9am -> Chidi: Bring the Physics notes` or `schedule sms 7pm -> 08012345678: Running 10m late`"
+                    .to_string(),
+            ));
+        }
+        let lines: Vec<String> = list
+            .iter()
+            .map(|m| {
+                let dt: DateTime<Utc> = Utc
+                    .timestamp_millis_opt(m.due_at)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                let lagos_str = dt.with_timezone(&Lagos).format("%b %d %I:%M %p").to_string();
+                format!(
+                    "• #{} [{} | {}] -> {} (+{}): \"{}\"",
+                    m.id,
+                    m.channel.to_uppercase(),
+                    lagos_str,
+                    m.contact_name.as_deref().unwrap_or("Contact"),
+                    m.target,
+                    m.message
+                )
+            })
+            .collect();
+        return Ok(Some(format!(
+            "🗓️ *Scheduled Outbound Messages ({})*:\n{}",
+            list.len(),
+            lines.join("\n")
+        )));
+    }
+    if lower.starts_with("unschedule ") || lower.starts_with("cancel scheduled ") {
+        let id_str = raw
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_start_matches('#');
+        let Ok(sid) = id_str.parse::<i64>() else {
+            return Ok(Some("⚠️ Usage: `unschedule <id>`".to_string()));
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        return Ok(Some(
+            if db
+                .update_scheduled_message_status(sid, "cancelled", now_ms)
+                .await?
+            {
+                format!("✅ Cancelled scheduled message #{}.", sid)
+            } else {
+                format!("⚠️ No scheduled message found with ID #{}.", sid)
+            },
+        ));
+    }
+    if lower.starts_with("schedule ") {
+        let rest_raw = raw["schedule ".len()..].trim();
+        let (channel, body) = if let Some(after_sms) = rest_raw
+            .strip_prefix("sms ")
+            .or_else(|| rest_raw.strip_prefix("SMS "))
+        {
+            ("sms", after_sms.trim())
+        } else if let Some(after_wa) = rest_raw
+            .strip_prefix("whatsapp ")
+            .or_else(|| rest_raw.strip_prefix("wa "))
+        {
+            ("whatsapp", after_wa.trim())
+        } else {
+            ("whatsapp", rest_raw)
+        };
+        if let Some((when_part, target_and_msg)) = body.split_once("->") {
+            if let Some((target_raw, msg_text)) = target_and_msg.split_once(':') {
+                let now_ms = Utc::now().timestamp_millis();
+                if let Some((due_at, _)) = parse_reminder_schedule(when_part.trim(), now_ms) {
+                    if let Some(num) = resolve_contact_target(db, target_raw.trim()).await? {
+                        let clean_msg = msg_text.trim();
+                        if !clean_msg.is_empty() {
+                            let id = db
+                                .add_scheduled_message(
+                                    &num,
+                                    Some(target_raw.trim()),
+                                    channel,
+                                    clean_msg,
+                                    due_at,
+                                    now_ms,
+                                )
+                                .await?;
+                            let dt: DateTime<Utc> = Utc
+                                .timestamp_millis_opt(due_at)
+                                .single()
+                                .unwrap_or_else(Utc::now);
+                            let lagos_str = dt
+                                .with_timezone(&Lagos)
+                                .format("%a, %b %d at %I:%M %p")
+                                .to_string();
+                            return Ok(Some(format!(
+                                "🗓️ Scheduled {} #{} to +{} for *{}*:\n\"{}\"\n(Cancel anytime with `unschedule {}`)",
+                                channel.to_uppercase(),
+                                id,
+                                num,
+                                lagos_str,
+                                clean_msg,
+                                id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(Some(
+            "⚠️ Usage: `schedule tomorrow 9am -> Chidi: Bring Physics notes` or `schedule sms 7pm -> 08012345678: On my way`"
+                .to_string(),
+        ));
+    }
+
+    // bank / expenses / payouts — 7-day bank & Paystack/Stripe alert ledger (Feature #4)
+    if matches!(lower.as_str(), "bank" | "expenses" | "payouts" | "ledger") {
+        let now_ms = Utc::now().timestamp_millis();
+        let rows = db.list_bank_alerts(now_ms - 7 * 86_400_000, 15).await?;
+        if rows.is_empty() {
+            return Ok(Some(
+                "💰 No bank / Paystack / Stripe alerts recorded in the last 7 days.".to_string(),
+            ));
+        }
+        let mut ngn_in = 0i64;
+        let mut ngn_out = 0i64;
+        let mut usd_in = 0i64;
+        let mut usd_out = 0i64;
+        for b in &rows {
+            match (b.currency.as_str(), b.direction.as_str()) {
+                ("NGN", "credit") => ngn_in += b.amount_minor,
+                ("NGN", "debit") => ngn_out += b.amount_minor,
+                ("USD", "credit") => usd_in += b.amount_minor,
+                ("USD", "debit") => usd_out += b.amount_minor,
+                _ => {}
+            }
+        }
+        let lines: Vec<String> = rows
+            .iter()
+            .take(8)
+            .map(|b| {
+                let sign = if b.direction == "credit" { "+" } else { "-" };
+                format!(
+                    "• [{}] {}{} ({})",
+                    b.bank,
+                    sign,
+                    format_bank_amount(b.amount_minor, &b.currency),
+                    if b.counterparty.is_empty() {
+                        b.raw_summary.chars().take(60).collect::<String>()
+                    } else {
+                        b.counterparty.clone()
+                    }
+                )
+            })
+            .collect();
+        let mut totals = Vec::new();
+        if ngn_in > 0 || ngn_out > 0 {
+            totals.push(format!(
+                "NGN In: {} | Out: {}",
+                format_bank_amount(ngn_in, "NGN"),
+                format_bank_amount(ngn_out, "NGN")
+            ));
+        }
+        if usd_in > 0 || usd_out > 0 {
+            totals.push(format!(
+                "USD In: {} | Out: {}",
+                format_bank_amount(usd_in, "USD"),
+                format_bank_amount(usd_out, "USD")
+            ));
+        }
+        return Ok(Some(format!(
+            "💰 *7-Day Bank & Payout Ledger*\n{}\n\n{}",
+            totals.join(" | "),
+            lines.join("\n")
+        )));
+    }
+
+    // classes — Aurikrex tutoring timetable view (Feature G)
+    if matches!(lower.as_str(), "classes" | "timetable" | "aurikrex classes") {
+        let rows = db.list_bookings(12).await?;
+        if rows.is_empty() {
+            return Ok(Some("📚 No Aurikrex tutoring classes booked yet.".to_string()));
+        }
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|b| format!("• *{}* — {} {} | {} (+{})", b.name, b.subject, b.exam, b.slot, b.number))
+            .collect();
+        return Ok(Some(format!(
+            "📚 *Aurikrex Tutoring Schedule ({})*:\n{}",
+            rows.len(),
+            lines.join("\n")
+        )));
     }
 
     // voice [auto|on|off] — self-chat TTS voice note mode
@@ -1100,20 +1406,45 @@ where
         let digest = db.list_pending_digest_items(50).await?.len();
         let rems = db.list_pending_reminders(50).await?.len();
         let followups = db.list_followups(Some("open"), 50).await?.len();
+        let scheduled = db.list_pending_scheduled_messages(50).await?.len();
+        let android_devices = db.list_active_phone_devices().await?.len();
+        let low_bat = db.is_phone_low_battery_cover(now_ms).await.unwrap_or(false);
+        let gmail_state = if cfg.has_gmail() {
+            format!("{} acct(s)", cfg.gmail_accounts.len())
+        } else {
+            "OFF".to_string()
+        };
         let ntfy_state = if crate::config::normalize_ntfy_topic(&cfg.ntfy_topic, &cfg.ntfy_url).is_empty() {
             "OFF (set NTFY_TOPIC)"
         } else {
             "ready"
         };
         return Ok(Some(format!(
-            "✅ {} online (Rust Core + Turso). Availability: {}. Reply mode: {}. Self-chat voice: {}. ntfy urgent push: {}. Active urgent alerts: {}. Digest queue (7am): {}. Follow-ups: {}. Reminders: {}. Saved contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
-            BOT_NAME, avail.mode, mode, voice_mode, ntfy_state, unacked, digest, followups, rems, saved, bookings, flags, owner_mem, lessons
+            "✅ {} online (Rust Core + Turso). Availability: {}{}. Reply mode: {}. Self-chat voice: {}. Gmail: {}. Android paired: {}. ntfy urgent push: {}. Urgent alerts: {}. Digest (7am): {}. Follow-ups: {}. Scheduled msgs: {}. Reminders: {}. Contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
+            BOT_NAME,
+            avail.mode,
+            if low_bat { " (Low-Battery Auto-Cover ON)" } else { "" },
+            mode,
+            voice_mode,
+            gmail_state,
+            android_devices,
+            ntfy_state,
+            unacked,
+            digest,
+            followups,
+            scheduled,
+            rems,
+            saved,
+            bookings,
+            flags,
+            owner_mem,
+            lessons
         )));
     }
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] | test ntfy — stop or test urgent ring alerts\n• briefing | read me my briefing — view or hear pending 7:00 AM digest\n• voice [auto|on|off] — self-chat voice note reply mode\n• followups | send followup <id> [: msg] | snooze followup <id> | skip followup <id>\n• remind <30m|7pm|daily 8am|every mon 9am>: <text> | reminders | unremind <id>\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• approve/say <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact> | tidy memories\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
+            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] | test ntfy — stop or test urgent ring alerts\n• briefing | read me my briefing | catch me up | emails — WhatsApp + Gmail digests\n• pair android | revoke android | ring my phone — Android Companion bridge\n• schedule [sms] <when> -> <no/name>: <msg> | scheduled | unschedule <id>\n• bank | classes — 7-day bank/payout ledger & Aurikrex schedule\n• voice [auto|on|off] — self-chat voice note reply mode\n• followups | send followup <id> [: msg] | snooze followup <id> | skip followup <id>\n• remind <30m|7pm|daily 8am|every mon 9am>: <text> | reminders | unremind <id>\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• approve/say <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact> | tidy memories\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
             BOT_NAME
         )));
     }

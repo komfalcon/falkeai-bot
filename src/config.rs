@@ -27,6 +27,12 @@ pub struct AiAttempt {
     pub model: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmailAccountConfig {
+    pub label: String,
+    pub refresh_token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub turso_url: String,
@@ -44,6 +50,12 @@ pub struct Config {
     pub ntfy_url: String,
     pub ntfy_topic: String,
     pub ntfy_token: Option<String>,
+    pub gmail_client_id: String,
+    pub gmail_client_secret: String,
+    pub gmail_accounts: Vec<GmailAccountConfig>,
+    pub github_token: Option<String>,
+    pub phone_bridge_secret: String,
+    pub public_base_url: String,
     pub digest_hour_lagos: u32,
     pub max_media_per_day: usize,
     pub tts_voice: String,
@@ -279,6 +291,12 @@ impl Config {
         !self.ai_attempts.is_empty() || !self.ai_key.trim().is_empty()
     }
 
+    pub fn has_gmail(&self) -> bool {
+        !self.gmail_client_id.trim().is_empty()
+            && !self.gmail_client_secret.trim().is_empty()
+            && !self.gmail_accounts.is_empty()
+    }
+
     pub fn from_env() -> Self {
         let turso_url = env::var("TURSO_DATABASE_URL")
             .or_else(|_| env::var("LIBSQL_URL"))
@@ -416,6 +434,90 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
 
+        let gmail_client_id = env::var("GMAIL_CLIENT_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let gmail_client_secret = env::var("GMAIL_CLIENT_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut gmail_accounts: Vec<GmailAccountConfig> = Vec::new();
+        for (idx, (tok_var, lbl_var)) in [
+            ("GMAIL_REFRESH_TOKEN", "GMAIL_LABEL"),
+            ("GMAIL_REFRESH_TOKEN_2", "GMAIL_LABEL_2"),
+            ("GMAIL_REFRESH_TOKEN_3", "GMAIL_LABEL_3"),
+            ("GMAIL_REFRESH_TOKEN_4", "GMAIL_LABEL_4"),
+            ("GMAIL_REFRESH_TOKEN_5", "GMAIL_LABEL_5"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if let Ok(tok) = env::var(tok_var) {
+                let clean_tok = tok.trim().to_string();
+                if !clean_tok.is_empty()
+                    && !gmail_accounts.iter().any(|a| a.refresh_token == clean_tok)
+                {
+                    let label = env::var(lbl_var)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| {
+                            if idx == 0 {
+                                "Primary Gmail".to_string()
+                            } else {
+                                format!("Gmail #{}", idx + 1)
+                            }
+                        });
+                    gmail_accounts.push(GmailAccountConfig {
+                        label,
+                        refresh_token: clean_tok,
+                    });
+                }
+            }
+        }
+        // Also support JSON array in GMAIL_ACCOUNTS_JSON: [{"label":"Work","refresh_token":"1//..."}]
+        if let Ok(raw_json) = env::var("GMAIL_ACCOUNTS_JSON") {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw_json) {
+                for (i, item) in arr.iter().enumerate() {
+                    if let Some(rt) = item["refresh_token"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !gmail_accounts.iter().any(|a| a.refresh_token == rt) {
+                            let lbl = item["label"]
+                                .as_str()
+                                .or_else(|| item["email"].as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("Gmail #{}", gmail_accounts.len() + i + 1));
+                            gmail_accounts.push(GmailAccountConfig {
+                                label: lbl,
+                                refresh_token: rt.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let github_token = env::var("GITHUB_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let phone_bridge_secret = env::var("PHONE_BRIDGE_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let public_base_url = env::var("PUBLIC_BASE_URL")
+            .or_else(|_| env::var("HEROKU_APP_DEFAULT_DOMAIN_NAME").map(|d| format!("https://{}", d)))
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+
         let digest_hour_lagos: u32 = env::var("DIGEST_HOUR_LAGOS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -475,6 +577,12 @@ impl Config {
             ntfy_url,
             ntfy_topic,
             ntfy_token,
+            gmail_client_id,
+            gmail_client_secret,
+            gmail_accounts,
+            github_token,
+            phone_bridge_secret,
+            public_base_url,
             digest_hour_lagos,
             max_media_per_day,
             tts_voice,
