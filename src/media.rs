@@ -475,3 +475,308 @@ pub async fn enrich_incoming_media(
     }
     text.to_string()
 }
+
+/// Cleans a WhatsApp markdown / command reply into a natural spoken script suitable for TTS.
+pub fn prepare_spoken_script(raw_text: &str, max_chars: usize) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    for raw_line in raw_text.lines() {
+        let trimmed = raw_line
+            .trim()
+            .trim_start_matches(|c: char| {
+                matches!(
+                    c,
+                    '•' | '-'
+                        | '*'
+                        | '━'
+                        | '─'
+                        | '☀'
+                        | '\u{fe0f}'
+                        | '🔔'
+                        | '📋'
+                        | '⏰'
+                        | '💡'
+                        | '✅'
+                        | '⚠'
+                        | '❌'
+                        | '🔊'
+                        | '🎙'
+                )
+            })
+            .trim();
+        if trimmed.is_empty() || trimmed.chars().all(|c| matches!(c, '━' | '─' | '=' | '-')) {
+            continue;
+        }
+        let mut line_words: Vec<String> = Vec::new();
+        for word in trimmed.split_whitespace() {
+            if word.starts_with("http://") || word.starts_with("https://") {
+                line_words.push("a link".to_string());
+                continue;
+            }
+            let cleaned: String = word
+                .chars()
+                .filter(|c| !matches!(c, '*' | '_' | '~' | '`'))
+                .collect();
+            if !cleaned.is_empty() {
+                line_words.push(cleaned);
+            }
+        }
+        if !line_words.is_empty() {
+            let mut sentence = line_words.join(" ");
+            if !sentence.ends_with(['.', '!', '?', ':', ';']) {
+                sentence.push('.');
+            }
+            tokens.push(sentence);
+        }
+    }
+
+    let joined = tokens.join(" ");
+    let cap = max_chars.max(80);
+    if joined.chars().count() <= cap {
+        return joined;
+    }
+
+    let clipped: String = joined.chars().take(cap).collect();
+    if let Some(pos) = clipped.rfind(['.', '!', '?']) {
+        if pos >= cap / 2 {
+            return clipped[..=pos].trim().to_string();
+        }
+    }
+    if let Some(pos) = clipped.rfind(' ') {
+        return format!("{}.", clipped[..pos].trim_end_matches([',', ';', ':']));
+    }
+    clipped
+}
+
+/// Returns true when a voice reply should also be accompanied by the full text reply in self-chat
+/// (e.g., long multi-section briefings, URLs, phone numbers, or command IDs).
+pub fn should_send_text_companion(raw_text: &str) -> bool {
+    if raw_text.chars().count() > 450 || raw_text.lines().count() > 6 {
+        return true;
+    }
+    let lower = raw_text.to_lowercase();
+    lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("@s.whatsapp.net")
+        || lower.contains("followup #")
+        || lower.contains("Send `")
+}
+
+/// Estimates spoken audio duration in seconds from word count (~2.6 words/second).
+pub fn estimate_speech_seconds(script: &str) -> u32 {
+    let words = script.split_whitespace().count();
+    if words == 0 {
+        return 2;
+    }
+    let secs = ((words as f64) / 2.6).ceil() as u32;
+    secs.clamp(2, 60)
+}
+
+fn try_convert_wav_to_ogg_opus(wav_bytes: &[u8]) -> Option<Vec<u8>> {
+    if wav_bytes.is_empty() {
+        return None;
+    }
+    let stamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let wav_path = std::env::temp_dir().join(format!("falkeai_tts_in_{}.wav", stamp));
+    let ogg_path = std::env::temp_dir().join(format!("falkeai_tts_out_{}.ogg", stamp));
+    if std::fs::write(&wav_path, wav_bytes).is_err() {
+        return None;
+    }
+    let _wav_guard = TempFileGuard::new(wav_path.clone());
+    let _ogg_guard = TempFileGuard::new(ogg_path.clone());
+
+    let wav_str = wav_path.to_string_lossy().to_string();
+    let ogg_str = ogg_path.to_string_lossy().to_string();
+
+    let converted = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            &wav_str,
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+            &ogg_str,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        || std::process::Command::new("opusenc")
+            .args(["--quiet", "--bitrate", "24", &wav_str, &ogg_str])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    if !converted {
+        return None;
+    }
+    let out = std::fs::read(&ogg_path).ok()?;
+    if out.len() > 64 && out.starts_with(b"OggS") {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn write_tts_temp_file(bytes: &[u8], ext: &str) -> Result<PathBuf> {
+    let stamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("falkeai_tts_{}.{}", stamp, ext));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// Synthesizes a spoken voice note for self-chat ("Message yourself"):
+/// 1) Groq Orpheus (`canopylabs/orpheus-v1-english`) across all configured Groq keys
+///    (converted to Ogg Opus if `ffmpeg`/`opusenc` is present on the host)
+/// 2) Cloudflare Workers AI Deepgram Aura-1 (`@cf/deepgram/aura-1`) with native `opus`/`ogg` container
+/// Returns `(temp_audio_path, mime_type, duration_seconds)`.
+pub async fn synthesize_voice_note(
+    cfg: &Config,
+    raw_text: &str,
+) -> Result<(PathBuf, String, u32)> {
+    let script = prepare_spoken_script(raw_text, 450);
+    if script.trim().is_empty() {
+        return Err(anyhow!("Empty spoken script for TTS"));
+    }
+    let seconds = estimate_speech_seconds(&script);
+    let client = http_client();
+    let voice = if cfg.tts_voice.trim().is_empty() {
+        "troy"
+    } else {
+        cfg.tts_voice.trim()
+    };
+
+    // 1) Try Groq Orpheus (`canopylabs/orpheus-v1-english`) across configured Groq keys
+    let mut groq_wav_fallback: Option<Vec<u8>> = None;
+    if !cfg.groq_keys.is_empty() {
+        let groq_url = format!("{}/audio/speech", GROQ_BASE_URL.trim_end_matches('/'));
+        for (idx, key) in cfg.groq_keys.iter().enumerate() {
+            let body = json!({
+                "model": "canopylabs/orpheus-v1-english",
+                "input": script,
+                "voice": voice,
+                "response_format": "wav"
+            });
+            match client
+                .post(&groq_url)
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if !bytes.is_empty() && bytes.len() <= MAX_AUDIO_BYTES {
+                            if let Some(ogg_bytes) = try_convert_wav_to_ogg_opus(&bytes) {
+                                let path = write_tts_temp_file(&ogg_bytes, "ogg")?;
+                                tracing::info!(
+                                    "Synthesized TTS voice note via groq#{} Orpheus + Opus ({} bytes, {}s)",
+                                    idx + 1,
+                                    ogg_bytes.len(),
+                                    seconds
+                                );
+                                return Ok((
+                                    path,
+                                    "audio/ogg; codecs=opus".to_string(),
+                                    seconds,
+                                ));
+                            }
+                            groq_wav_fallback = Some(bytes.to_vec());
+                            break;
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let st = resp.status();
+                    let err_txt = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "Groq Orpheus TTS skipped (groq#{} / {}): {}",
+                        idx + 1,
+                        st,
+                        redact_secrets(&err_txt, cfg)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Groq Orpheus TTS error (groq#{}): {}",
+                        idx + 1,
+                        redact_secrets(&e.to_string(), cfg)
+                    );
+                }
+            }
+        }
+    }
+
+    // 2) Cloudflare Workers AI Deepgram Aura-1 (`@cf/deepgram/aura-1`) with native Ogg/Opus output
+    if let (Some(acct), Some(cf_token)) = (cloudflare_account_id(cfg), cloudflare_api_token(cfg)) {
+        let cf_url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/@cf/deepgram/aura-1",
+            acct
+        );
+        let cf_speaker = match voice.to_lowercase().as_str() {
+            "autumn" | "diana" | "hannah" | "asteria" | "luna" | "stella" => "asteria",
+            _ => "orion",
+        };
+        let body = json!({
+            "text": script,
+            "speaker": cf_speaker,
+            "encoding": "opus",
+            "container": "ogg"
+        });
+        match client
+            .post(&cf_url)
+            .bearer_auth(&cf_token)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    if bytes.len() > 64 && bytes.len() <= MAX_AUDIO_BYTES {
+                        let (ext, mime) = if bytes.starts_with(b"OggS") {
+                            ("ogg", "audio/ogg; codecs=opus")
+                        } else {
+                            ("mp3", "audio/mpeg")
+                        };
+                        let path = write_tts_temp_file(&bytes, ext)?;
+                        tracing::info!(
+                            "Synthesized TTS voice note via Cloudflare Deepgram Aura-1 ({} bytes, {}s)",
+                            bytes.len(),
+                            seconds
+                        );
+                        return Ok((path, mime.to_string(), seconds));
+                    }
+                }
+            }
+            Ok(resp) => {
+                let st = resp.status();
+                let err_txt = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Cloudflare Aura-1 TTS failed ({}): {}",
+                    st,
+                    redact_secrets(&err_txt, cfg)
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Cloudflare Aura-1 TTS error: {}",
+                    redact_secrets(&e.to_string(), cfg)
+                );
+            }
+        }
+    }
+
+    // 3) Last resort: if Groq Orpheus succeeded with WAV bytes and Cloudflare was unavailable
+    if let Some(wav_bytes) = groq_wav_fallback {
+        let path = write_tts_temp_file(&wav_bytes, "wav")?;
+        return Ok((path, "audio/wav".to_string(), seconds));
+    }
+
+    Err(anyhow!("All TTS synthesis providers failed"))
+}

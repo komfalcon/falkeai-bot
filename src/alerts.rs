@@ -2,7 +2,7 @@
 //! urgent intake timeout evaluator, 7:00 AM Africa/Lagos morning digest, and reminders ticker.
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Timelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, TimeZone, Utc, Weekday};
 use chrono_tz::Africa::Lagos;
 use serde_json::json;
 use std::future::Future;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::config::{Config, BOT_NAME};
 use crate::db::{
-    Database, DigestItem, ReminderRecord, UrgentAlertRecord, UrgentDraft,
+    Database, DigestItem, FollowupRecord, ReminderRecord, UrgentAlertRecord, UrgentDraft,
 };
 use crate::safety::redact_secrets;
 
@@ -361,10 +361,307 @@ where
     Ok(fired)
 }
 
+pub fn format_recurrence_badge(recurrence: Option<&str>) -> String {
+    let Some(rec) = recurrence.map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    if let Some(time_part) = rec.strip_prefix("daily@") {
+        format!(" 🔁 (daily {})", time_part)
+    } else if let Some(time_part) = rec.strip_prefix("weekdays@") {
+        format!(" 🔁 (weekdays {})", time_part)
+    } else if let Some(time_part) = rec.strip_prefix("weekends@") {
+        format!(" 🔁 (weekends {})", time_part)
+    } else if let Some(rest) = rec.strip_prefix("weekly:") {
+        if let Some((days, time_part)) = rest.split_once('@') {
+            format!(" 🔁 ({} {})", days, time_part)
+        } else {
+            format!(" 🔁 ({})", rest)
+        }
+    } else {
+        format!(" 🔁 ({})", rec)
+    }
+}
+
+pub fn parse_clock_time_token(raw: &str) -> Option<(u32, u32)> {
+    let s = raw.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (is_am, is_pm, core) = if let Some(v) = s.strip_suffix("am") {
+        (true, false, v.trim())
+    } else if let Some(v) = s.strip_suffix("pm") {
+        (false, true, v.trim())
+    } else {
+        (false, false, s.as_str())
+    };
+
+    let (h_raw, m_raw) = if let Some((h, m)) = core.split_once(':') {
+        (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?)
+    } else if is_am || is_pm {
+        (core.parse::<u32>().ok()?, 0)
+    } else {
+        return None;
+    };
+
+    if m_raw >= 60 {
+        return None;
+    }
+    let hour_24 = if is_am {
+        if h_raw == 0 || h_raw > 12 {
+            return None;
+        }
+        if h_raw == 12 { 0 } else { h_raw }
+    } else if is_pm {
+        if h_raw == 0 || h_raw > 12 {
+            return None;
+        }
+        if h_raw == 12 { 12 } else { h_raw + 12 }
+    } else {
+        if h_raw >= 24 {
+            return None;
+        }
+        h_raw
+    };
+    Some((hour_24, m_raw))
+}
+
+pub fn parse_weekday_token(raw: &str) -> Option<(Weekday, &'static str)> {
+    match raw.trim().to_lowercase().as_str() {
+        "mon" | "monday" | "mondays" => Some((Weekday::Mon, "mon")),
+        "tue" | "tues" | "tuesday" | "tuesdays" => Some((Weekday::Tue, "tue")),
+        "wed" | "weds" | "wednesday" | "wednesdays" => Some((Weekday::Wed, "wed")),
+        "thu" | "thur" | "thurs" | "thursday" | "thursdays" => Some((Weekday::Thu, "thu")),
+        "fri" | "friday" | "fridays" => Some((Weekday::Fri, "fri")),
+        "sat" | "saturday" | "saturdays" => Some((Weekday::Sat, "sat")),
+        "sun" | "sunday" | "sundays" => Some((Weekday::Sun, "sun")),
+        _ => None,
+    }
+}
+
+fn next_lagos_occurrence<F>(after_ms: i64, hour: u32, minute: u32, day_filter: F) -> Option<i64>
+where
+    F: Fn(Weekday) -> bool,
+{
+    let base_utc = Utc.timestamp_millis_opt(after_ms).single()?;
+    let base_lagos = base_utc.with_timezone(&Lagos);
+    for day_offset in 0..=8 {
+        let candidate_date = (base_lagos + ChronoDuration::days(day_offset)).date_naive();
+        if !day_filter(candidate_date.weekday()) {
+            continue;
+        }
+        let naive_dt = candidate_date.and_hms_opt(hour, minute, 0)?;
+        if let Some(lagos_dt) = Lagos.from_local_datetime(&naive_dt).single().or_else(|| {
+            Lagos.from_local_datetime(&naive_dt).earliest()
+        }) {
+            let candidate_ms = lagos_dt.with_timezone(&Utc).timestamp_millis();
+            if candidate_ms > after_ms {
+                return Some(candidate_ms);
+            }
+        }
+    }
+    None
+}
+
+/// Computes the next occurrence timestamp (in UTC ms) for a recurrence descriptor in `Africa/Lagos`.
+pub fn compute_next_recurrence_ms(recurrence: &str, after_ms: i64) -> Option<i64> {
+    let rec = recurrence.trim().to_lowercase();
+    if let Some(t) = rec.strip_prefix("daily@") {
+        let (h, m) = parse_clock_time_token(t)?;
+        return next_lagos_occurrence(after_ms, h, m, |_| true);
+    }
+    if let Some(t) = rec.strip_prefix("weekdays@") {
+        let (h, m) = parse_clock_time_token(t)?;
+        return next_lagos_occurrence(after_ms, h, m, |w| {
+            !matches!(w, Weekday::Sat | Weekday::Sun)
+        });
+    }
+    if let Some(t) = rec.strip_prefix("weekends@") {
+        let (h, m) = parse_clock_time_token(t)?;
+        return next_lagos_occurrence(after_ms, h, m, |w| {
+            matches!(w, Weekday::Sat | Weekday::Sun)
+        });
+    }
+    if let Some(rest) = rec.strip_prefix("weekly:") {
+        let (days_str, t) = rest.split_once('@')?;
+        let (h, m) = parse_clock_time_token(t)?;
+        let mut allowed = Vec::new();
+        for tok in days_str.split(',') {
+            if let Some((wd, _)) = parse_weekday_token(tok) {
+                if !allowed.contains(&wd) {
+                    allowed.push(wd);
+                }
+            }
+        }
+        if allowed.is_empty() {
+            return None;
+        }
+        return next_lagos_occurrence(after_ms, h, m, |w| allowed.contains(&w));
+    }
+    None
+}
+
+fn parse_simple_relative_duration_ms(raw: &str) -> Option<i64> {
+    let s = raw.trim().to_lowercase();
+    let s = s.strip_prefix("in ").unwrap_or(&s).trim();
+    if s.is_empty() {
+        return None;
+    }
+    let split_idx = s
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    if split_idx == 0 {
+        return None;
+    }
+    let val: i64 = s[..split_idx].parse().ok()?;
+    if val <= 0 {
+        return None;
+    }
+    let unit = s[split_idx..].trim();
+    match unit {
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(val * 60_000),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(val * 3_600_000),
+        "d" | "day" | "days" => Some(val * 86_400_000),
+        _ => None,
+    }
+}
+
+/// Parses relative durations (`30m`, `2h`), clock times (`7pm`, `19:30`, `tomorrow 8am`),
+/// and recurring schedules (`daily 8am`, `weekdays 7am`, `every monday 9am`, `every mon,wed,fri 6pm`)
+/// in `Africa/Lagos` timezone. Returns `(due_at_ms, Option<recurrence_spec>)`.
+pub fn parse_reminder_schedule(spec: &str, now_ms: i64) -> Option<(i64, Option<String>)> {
+    let cleaned = spec
+        .trim()
+        .to_lowercase()
+        .replace(" at ", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    // 1) Relative duration: "30m", "2h", "1d", "in 45m"
+    if let Some(dur_ms) = parse_simple_relative_duration_ms(&cleaned) {
+        return Some((now_ms + dur_ms, None));
+    }
+
+    // 2) Single clock token: "7pm", "8:30am", "19:30"
+    let base_clean = cleaned.strip_prefix("at ").unwrap_or(&cleaned).trim();
+    if let Some((h, m)) = parse_clock_time_token(base_clean) {
+        let due = next_lagos_occurrence(now_ms, h, m, |_| true)?;
+        return Some((due, None));
+    }
+
+    let tokens: Vec<&str> = base_clean.split_whitespace().collect();
+    if tokens.len() >= 2 {
+        let time_tok = tokens[tokens.len() - 1];
+        if let Some((h, m)) = parse_clock_time_token(time_tok) {
+            let prefix = tokens[..tokens.len() - 1].join(" ");
+            let hhmm = format!("{:02}:{:02}", h, m);
+            match prefix.as_str() {
+                "today" => {
+                    let due = next_lagos_occurrence(now_ms, h, m, |_| true)?;
+                    return Some((due, None));
+                }
+                "tomorrow" | "tmrw" => {
+                    let base_utc = Utc.timestamp_millis_opt(now_ms).single()?;
+                    let tmrw_date = (base_utc.with_timezone(&Lagos) + ChronoDuration::days(1)).date_naive();
+                    let naive_dt = tmrw_date.and_hms_opt(h, m, 0)?;
+                    let lagos_dt = Lagos
+                        .from_local_datetime(&naive_dt)
+                        .single()
+                        .or_else(|| Lagos.from_local_datetime(&naive_dt).earliest())?;
+                    return Some((lagos_dt.with_timezone(&Utc).timestamp_millis(), None));
+                }
+                "daily" | "everyday" | "every day" => {
+                    let rec = format!("daily@{}", hhmm);
+                    let due = compute_next_recurrence_ms(&rec, now_ms)?;
+                    return Some((due, Some(rec)));
+                }
+                "weekdays" | "weekday" | "every weekday" | "every weekdays" => {
+                    let rec = format!("weekdays@{}", hhmm);
+                    let due = compute_next_recurrence_ms(&rec, now_ms)?;
+                    return Some((due, Some(rec)));
+                }
+                "weekends" | "weekend" | "every weekend" | "every weekends" => {
+                    let rec = format!("weekends@{}", hhmm);
+                    let due = compute_next_recurrence_ms(&rec, now_ms)?;
+                    return Some((due, Some(rec)));
+                }
+                _ => {
+                    let day_part = prefix.strip_prefix("every ").unwrap_or(&prefix).trim();
+                    let is_recurring = prefix.starts_with("every ");
+                    let mut slugs: Vec<&'static str> = Vec::new();
+                    let mut weekdays: Vec<Weekday> = Vec::new();
+                    for raw_day in day_part.split(|c: char| c == ',' || c.is_whitespace()) {
+                        if raw_day.is_empty() || raw_day == "and" {
+                            continue;
+                        }
+                        let (wd, slug) = parse_weekday_token(raw_day)?;
+                        if !weekdays.contains(&wd) {
+                            weekdays.push(wd);
+                            slugs.push(slug);
+                        }
+                    }
+                    if !weekdays.is_empty() {
+                        if is_recurring || slugs.len() > 1 {
+                            let rec = format!("weekly:{}@{}", slugs.join(","), hhmm);
+                            let due = compute_next_recurrence_ms(&rec, now_ms)?;
+                            return Some((due, Some(rec)));
+                        } else {
+                            let target_wd = weekdays[0];
+                            let due = next_lagos_occurrence(now_ms, h, m, |w| w == target_wd)?;
+                            return Some((due, None));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn format_followup_card(f: &FollowupRecord) -> String {
+    let kind_badge = match f.kind.as_str() {
+        "falcon_promised" => "🤝 *You promised to get back*",
+        "waiting_on_them" => "⏳ *Waiting on their reply*",
+        _ => "🧊 *Cold inquiry / thread*",
+    };
+    let who = match f.contact_name.as_deref() {
+        Some(n) if !n.trim().is_empty() => format!("{} (+{})", n.trim(), f.sender),
+        _ => format!("+{}", f.sender),
+    };
+    let status_tag = if f.status == "ready" {
+        "READY"
+    } else {
+        "WATCHING"
+    };
+    format!(
+        "• *[#{id} | {status_tag}]* {kind_badge} — *{who}*\n  Reason: {reason}\n  Draft: _\"{draft}\"_\n  Actions: `send followup {id}` | `send followup {id}: <custom text>` | `snooze followup {id}` | `skip followup {id}`",
+        id = f.id,
+        status_tag = status_tag,
+        kind_badge = kind_badge,
+        who = who,
+        reason = f.reason,
+        draft = f.suggested_reply
+    )
+}
+
 pub fn format_digest_message(
     items: &[DigestItem],
     unacked_alerts: &[UrgentAlertRecord],
     reminders: &[ReminderRecord],
+    header: &str,
+) -> String {
+    format_digest_message_with_followups(items, unacked_alerts, reminders, &[], header)
+}
+
+pub fn format_digest_message_with_followups(
+    items: &[DigestItem],
+    unacked_alerts: &[UrgentAlertRecord],
+    reminders: &[ReminderRecord],
+    ready_followups: &[FollowupRecord],
     header: &str,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
@@ -379,6 +676,19 @@ pub fn format_digest_message(
             "🚨 *Active Urgent Alerts ({})*:\n{}",
             unacked_alerts.len(),
             lines.join("\n")
+        ));
+    }
+
+    if !ready_followups.is_empty() {
+        let lines: Vec<String> = ready_followups
+            .iter()
+            .take(6)
+            .map(format_followup_card)
+            .collect();
+        sections.push(format!(
+            "📬 *Smart Follow-Ups Ready for Approval ({})*:\n{}",
+            ready_followups.len(),
+            lines.join("\n\n")
         ));
     }
 
@@ -455,14 +765,15 @@ pub fn format_digest_message(
     if !reminders.is_empty() {
         let lines: Vec<String> = reminders
             .iter()
-            .take(5)
+            .take(6)
             .map(|r| {
                 let dt: DateTime<Utc> = Utc
                     .timestamp_millis_opt(r.due_at)
                     .single()
                     .unwrap_or_else(Utc::now);
                 let lagos_str = dt.with_timezone(&Lagos).format("%b %d %I:%M %p").to_string();
-                format!("• [{}] {}", lagos_str, r.text)
+                let badge = format_recurrence_badge(r.recurrence.as_deref());
+                format!("• [#{}] [{}]{} {}", r.id, lagos_str, badge, r.text)
             })
             .collect();
         sections.push(format!(
@@ -473,10 +784,16 @@ pub fn format_digest_message(
     }
 
     if sections.len() == 1 {
-        sections.push("All clear — no pending handoffs, notes, or urgent alerts.".to_string());
+        sections.push("All clear — no pending handoffs, follow-ups, notes, or urgent alerts.".to_string());
     }
 
     sections.join("\n\n")
+}
+
+/// Promotes any due `watching` follow-ups to `ready` so they appear in `followups` and the 7:00 AM briefing.
+pub async fn tick_promote_followups(db: &Database, now_ms: i64) -> Result<usize> {
+    let promoted = db.promote_due_followups(now_ms).await?;
+    Ok(promoted.len())
 }
 
 /// Delivers the daily morning summary once per day at `cfg.digest_hour_lagos` (default 7:00 AM Africa/Lagos).
@@ -505,11 +822,13 @@ where
         return Ok(false);
     }
 
+    let _ = db.promote_due_followups(now_ms).await;
     let items = db.list_pending_digest_items(40).await?;
     let unacked = db.list_unacked_urgent_alerts().await?;
     let reminders = db.list_pending_reminders(10).await?;
+    let ready_followups = db.list_followups(Some("ready"), 10).await?;
 
-    if items.is_empty() && unacked.is_empty() && reminders.is_empty() {
+    if items.is_empty() && unacked.is_empty() && reminders.is_empty() && ready_followups.is_empty() {
         db.set_setting("last_digest_date", &today_key).await?;
         return Ok(false);
     }
@@ -519,7 +838,13 @@ where
         BOT_NAME,
         lagos.format("%a, %d %b")
     );
-    let msg = format_digest_message(&items, &unacked, &reminders, &header);
+    let msg = format_digest_message_with_followups(
+        &items,
+        &unacked,
+        &reminders,
+        &ready_followups,
+        &header,
+    );
     notify_wa(msg).await?;
 
     db.set_setting("last_digest_date", &today_key).await?;
@@ -528,7 +853,8 @@ where
     Ok(true)
 }
 
-/// Fires any due owner reminders to WhatsApp `"Message yourself"`.
+/// Fires any due owner reminders to WhatsApp `"Message yourself"`, automatically rescheduling
+/// recurring reminders (`daily`, `weekdays`, `weekends`, `weekly:...`) to their next occurrence.
 pub async fn tick_due_reminders<WF, WFut>(
     db: &Database,
     now_ms: i64,
@@ -541,9 +867,19 @@ where
     let due = db.list_due_reminders(now_ms).await?;
     let mut delivered = 0usize;
     for r in due {
-        let msg = format!("⏰ *{} Reminder*\n{}", BOT_NAME, r.text);
+        let badge = format_recurrence_badge(r.recurrence.as_deref());
+        let msg = format!("⏰ *{} Reminder*{}\n{}", BOT_NAME, badge, r.text);
         notify_wa(msg).await?;
-        db.mark_reminder_delivered(r.id).await?;
+        if let Some(rec) = r.recurrence.as_deref() {
+            let base_after = now_ms.max(r.due_at) + 60_000;
+            if let Some(next_due) = compute_next_recurrence_ms(rec, base_after) {
+                db.reschedule_recurring_reminder(r.id, next_due).await?;
+            } else {
+                db.mark_reminder_delivered(r.id).await?;
+            }
+        } else {
+            db.mark_reminder_delivered(r.id).await?;
+        }
         delivered += 1;
     }
     Ok(delivered)

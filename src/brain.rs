@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::alerts::{is_urgent_draft_complete, URGENT_INTAKE_MAX_TURNS};
 use crate::config::{AiAttempt, Config, BOT_NAME, DEFAULT_CF_MODELS, EXAMS, HANDOFF_REPLY, SUBJECTS};
 use crate::db::{
-    BookingDraft, BookingRecord, ChatTurn, ContactMemory, ConversationState, Database,
-    EmotionEntry, FlagRecord, LearningEpisode, OwnerMemoryItem, OwnerStatus, UrgentDraft,
+    memory_token_jaccard, BookingDraft, BookingRecord, ChatTurn, ContactMemory, ConversationState,
+    Database, EmotionEntry, FlagRecord, LearningEpisode, OwnerMemoryItem, OwnerStatus, UrgentDraft,
 };
 use crate::safety::{
     approval_trigger, detect_injection, is_life_safety_emergency, redact_secrets,
@@ -144,6 +144,7 @@ Reply with ONE JSON object only, no markdown fences or extra text:
   "emotion": "neutral",
   "emotion_intensity": "low",
   "emotion_subtext": "",
+  "followup": null,
   "memory_update": {{
     "relationship": null,
     "tone": null,
@@ -811,6 +812,187 @@ pub fn merge_unique_strings(existing: &[String], incoming: &[String], max: usize
     }
 }
 
+/// Merges contact facts while replacing older near-duplicate or updated facts (`memory_token_jaccard >= 0.70`)
+/// so contact memory stays conflict-free when details change over time.
+pub fn merge_semantic_facts(existing: &[String], incoming: &[String], max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in existing {
+        let clean = item.trim();
+        if !clean.is_empty() && !clean.eq_ignore_ascii_case("null") {
+            out.push(clean.chars().take(200).collect());
+        }
+    }
+    for inc in incoming {
+        let clean = inc.trim();
+        if clean.is_empty() || clean.eq_ignore_ascii_case("null") {
+            continue;
+        }
+        let truncated: String = clean.chars().take(200).collect();
+        if let Some(slot) = out.iter_mut().find(|old| {
+            old.eq_ignore_ascii_case(&truncated)
+                || memory_token_jaccard(old, &truncated) >= 0.70
+        }) {
+            *slot = truncated;
+        } else {
+            out.push(truncated);
+        }
+    }
+    if out.len() > max {
+        out.split_off(out.len() - max)
+    } else {
+        out
+    }
+}
+
+/// Deterministic detector for when a contact either promises to get back to Falcon (`waiting_on_them`)
+/// or starts an Aurikrex tutoring inquiry / booking without completing confirmation (`cold_lead`).
+pub fn detect_customer_followup_signal(
+    customer_text: &str,
+    draft: &BookingDraft,
+    contact_name: Option<&str>,
+) -> Option<(String, String, String, i64)> {
+    let lower = customer_text.trim().to_lowercase();
+    if lower.len() < 4 {
+        return None;
+    }
+    let first_name = contact_name
+        .and_then(|n| n.split_whitespace().next())
+        .filter(|s| !s.is_empty());
+
+    let waiting_phrases = [
+        "i'll get back",
+        "i will get back",
+        "let me check",
+        "i'll let you know",
+        "i will let you know",
+        "will confirm",
+        "i'll confirm",
+        "i'll send it",
+        "i will send it",
+        "give me some time",
+        "i'll revert",
+        "talk to my parents",
+        "ask my mum",
+        "ask my dad",
+        "check my schedule",
+    ];
+    if waiting_phrases.iter().any(|p| lower.contains(p)) {
+        let snippet: String = customer_text.trim().chars().take(90).collect();
+        let greeting = match first_name {
+            Some(n) => format!("Hey {}, ", n),
+            None => "Hey! ".to_string(),
+        };
+        let draft_reply = format!(
+            "{}just checking in on what you mentioned earlier — let me know whenever you're ready.",
+            greeting
+        );
+        return Some((
+            "waiting_on_them".to_string(),
+            format!("They said they'd get back: \"{}\"", snippet),
+            draft_reply,
+            24,
+        ));
+    }
+
+    let has_partial_draft = draft.subject.is_some()
+        || draft.exam.is_some()
+        || draft.day.is_some()
+        || draft.time.is_some();
+    let inquiry_keywords = [
+        "tutor",
+        "tutoring",
+        "lesson",
+        "classes",
+        "jamb",
+        "waec",
+        "neco",
+        "jupeb",
+        "a-level",
+        "physics",
+        "chemistry",
+        "maths",
+        "syncgrade",
+        "aurikrex",
+    ];
+    if has_partial_draft || inquiry_keywords.iter().any(|k| lower.contains(k)) {
+        let subj = draft
+            .subject
+            .as_deref()
+            .unwrap_or("your classes");
+        let greeting = match first_name {
+            Some(n) => format!("Hey {}, ", n),
+            None => "Hey! ".to_string(),
+        };
+        let draft_reply = format!(
+            "{}checking in on your inquiry about {} — would you still like to lock in a session this week?",
+            greeting, subj
+        );
+        return Some((
+            "cold_lead".to_string(),
+            "Inquired about Aurikrex tutoring/classes but thread went quiet before booking confirmation".to_string(),
+            draft_reply,
+            28,
+        ));
+    }
+
+    None
+}
+
+/// Deterministic detector for when Falcon personally tells someone in a DM that he'll get back to them,
+/// check something, or send something later (`falcon_promised`).
+pub fn detect_owner_followup_promise(
+    owner_text: &str,
+    contact_name: Option<&str>,
+) -> Option<(String, String, String, i64)> {
+    let lower = owner_text.trim().to_lowercase();
+    if lower.len() < 5 {
+        return None;
+    }
+    let promise_phrases = [
+        "i'll get back",
+        "i will get back",
+        "let me check",
+        "i'll check",
+        "i will check",
+        "i'll send",
+        "i will send",
+        "will send it",
+        "let me confirm",
+        "i'll confirm",
+        "give me a bit",
+        "give me some time",
+        "i'll let you know",
+        "i will let you know",
+        "will revert",
+        "i'll follow up",
+        "catch up later",
+        "talk later",
+        "check and get back",
+    ];
+    if !promise_phrases.iter().any(|p| lower.contains(p)) {
+        return None;
+    }
+    let hours = if lower.contains("tomorrow") { 20 } else { 16 };
+    let snippet: String = owner_text.trim().chars().take(100).collect();
+    let first_name = contact_name
+        .and_then(|n| n.split_whitespace().next())
+        .filter(|s| !s.is_empty());
+    let greeting = match first_name {
+        Some(n) => format!("Hey {}, ", n),
+        None => "Hey, ".to_string(),
+    };
+    let draft_reply = format!(
+        "{}following up on what I mentioned earlier — here's an update.",
+        greeting
+    );
+    Some((
+        "falcon_promised".to_string(),
+        format!("You told them: \"{}\"", snippet),
+        draft_reply,
+        hours,
+    ))
+}
+
 pub fn compact_history_into_memory(contact_mem: &mut ContactMemory, evicted_turns: &[ChatTurn]) {
     if evicted_turns.is_empty() {
         return;
@@ -851,6 +1033,14 @@ struct MemoryUpdatePayload {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct FollowupSuggestionPayload {
+    pub kind: Option<String>,
+    pub reason: Option<String>,
+    pub suggested_reply: Option<String>,
+    pub hours: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct LlmResponsePayload {
     reply: Option<String>,
     customer_name: Option<String>,
@@ -869,6 +1059,7 @@ struct LlmResponsePayload {
     emotion: Option<String>,
     emotion_intensity: Option<String>,
     emotion_subtext: Option<String>,
+    followup: Option<FollowupSuggestionPayload>,
     memory_update: Option<MemoryUpdatePayload>,
 }
 
@@ -965,6 +1156,21 @@ fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
                 })
             });
 
+            let followup = v.get("followup").and_then(|f| {
+                if !f.is_object() {
+                    return None;
+                }
+                let hours = f
+                    .get("hours")
+                    .and_then(|h| h.as_i64().or_else(|| h.as_str()?.parse().ok()));
+                Some(FollowupSuggestionPayload {
+                    kind: json_str_opt(f, "kind"),
+                    reason: json_str_opt(f, "reason"),
+                    suggested_reply: json_str_opt(f, "suggested_reply"),
+                    hours,
+                })
+            });
+
             return Some(LlmResponsePayload {
                 reply: json_str_opt(&v, "reply"),
                 customer_name: json_str_opt(&v, "customer_name"),
@@ -980,6 +1186,7 @@ fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
                 emotion: json_str_opt(&v, "emotion"),
                 emotion_intensity: json_str_opt(&v, "emotion_intensity"),
                 emotion_subtext: json_str_opt(&v, "emotion_subtext"),
+                followup,
                 memory_update,
             });
         }
@@ -1093,6 +1300,8 @@ where
     }
 
     let clean_text = sanitize_inbound(text);
+    // Customer messaged again -> resolve any earlier pending follow-up watch before evaluating this turn
+    let _ = db.resolve_followups_for_sender(sender).await;
 
     // Fast inbound prompt-injection & secret-extraction defense
     if detect_injection(text) {
@@ -1488,7 +1697,7 @@ where
 
     state.history.push(ChatTurn {
         role: "user".to_string(),
-        content: clean_text,
+        content: clean_text.clone(),
     });
     state.history.push(ChatTurn {
         role: "assistant".to_string(),
@@ -1549,7 +1758,7 @@ where
             contact_mem.tone = Some(tone.chars().take(40).collect());
         }
         if !mu.add_facts.is_empty() {
-            contact_mem.facts = merge_unique_strings(&contact_mem.facts, &mu.add_facts, 25);
+            contact_mem.facts = merge_semantic_facts(&contact_mem.facts, &mu.add_facts, 25);
         }
         if !mu.open_threads.is_empty() {
             contact_mem.open_threads = merge_unique_strings(&contact_mem.open_threads, &mu.open_threads, 15);
@@ -1578,6 +1787,48 @@ where
     }
     db.save_contact_memory(&contact_mem).await?;
 
+    // Smart Follow-Up Queue: if booking wasn't just completed, record a follow-up watch
+    // whenever the LLM or deterministic detector spots a pending promise or unconfirmed inquiry.
+    if booking_saved.is_none() {
+        let cname_ref = state
+            .name
+            .as_deref()
+            .or(contact_mem.display_name.as_deref());
+        let resolved_fu = data
+            .followup
+            .as_ref()
+            .and_then(|f| {
+                let reason = f.reason.as_deref()?.trim();
+                let reply_draft = f.suggested_reply.as_deref()?.trim();
+                if reason.is_empty() || reply_draft.is_empty() {
+                    return None;
+                }
+                let kind = f
+                    .kind
+                    .as_deref()
+                    .unwrap_or("cold_lead")
+                    .to_string();
+                let hours = f.hours.unwrap_or(24).clamp(2, 168);
+                Some((kind, reason.to_string(), reply_draft.to_string(), hours))
+            })
+            .or_else(|| detect_customer_followup_signal(&clean_text, &state.draft, cname_ref));
+
+        if let Some((kind, reason, suggested_reply, hours)) = resolved_fu {
+            let due_at = now_ms + hours * 3_600_000;
+            let _ = db
+                .upsert_followup(
+                    sender,
+                    cname_ref,
+                    &kind,
+                    &reason,
+                    &suggested_reply,
+                    due_at,
+                    now_ms,
+                )
+                .await;
+        }
+    }
+
     Ok(HandleMessageResult {
         reply,
         booking_saved,
@@ -1600,6 +1851,7 @@ pub struct LearnedReflection {
     pub relationship: Option<String>,
     pub tone: Option<String>,
     pub person_chat_pattern: Option<String>,
+    pub followup: Option<FollowupSuggestionPayload>,
 }
 
 /// Records that Falcon opened/read a chat on his phone/desktop without replying.
@@ -1700,6 +1952,7 @@ where
     db.delete_pending_reply(sender).await?;
     let _ = db.delete_flags_for_chat(sender).await;
     let _ = db.ack_urgent_alerts(Some(sender)).await;
+    let _ = db.resolve_followups_for_sender(sender).await;
 
     let mut contact_mem = db
         .get_contact_memory(sender)
@@ -1727,6 +1980,24 @@ where
     contact_mem.last_seen_at = now_ms;
     contact_mem.updated_at = now_ms;
     db.save_contact_memory(&contact_mem).await?;
+
+    // Deterministic check: if Falcon personally promised in his DM reply to check/get back to this contact,
+    // queue an approval-first follow-up watch automatically.
+    if let Some((kind, reason, suggested_reply, hours)) =
+        detect_owner_followup_promise(text, contact_mem.display_name.as_deref())
+    {
+        let _ = db
+            .upsert_followup(
+                sender,
+                contact_mem.display_name.as_deref(),
+                &kind,
+                &reason,
+                &suggested_reply,
+                now_ms + hours * 3_600_000,
+                now_ms,
+            )
+            .await;
+    }
 
     if let Some(llm_fn) = learn_llm {
         let reply_len = text.trim().len();
@@ -1781,8 +2052,29 @@ where
                         .contact_fact
                         .filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("null"))
                     {
-                        cm.facts = merge_unique_strings(&cm.facts, &[cf], 25);
+                        cm.facts = merge_semantic_facts(&cm.facts, &[cf], 25);
                         changed = true;
+                    }
+                    if let Some(fu) = parsed.followup {
+                        if let (Some(reason), Some(draft_reply)) =
+                            (fu.reason.as_deref(), fu.suggested_reply.as_deref())
+                        {
+                            if !reason.trim().is_empty() && !draft_reply.trim().is_empty() {
+                                let kind = fu.kind.as_deref().unwrap_or("falcon_promised");
+                                let hours = fu.hours.unwrap_or(18).clamp(2, 168);
+                                let _ = db
+                                    .upsert_followup(
+                                        sender,
+                                        cm.display_name.as_deref(),
+                                        kind,
+                                        reason.trim(),
+                                        draft_reply.trim(),
+                                        now_ms + hours * 3_600_000,
+                                        now_ms,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                     if let Some(rel) = parsed
                         .relationship

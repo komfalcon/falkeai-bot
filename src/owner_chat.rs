@@ -9,9 +9,12 @@ use chrono_tz::Africa::Lagos;
 use serde_json::Value;
 use std::future::Future;
 
-use crate::alerts::{format_digest_message, send_ntfy_http};
+use crate::alerts::{
+    format_digest_message_with_followups, format_recurrence_badge, parse_reminder_schedule,
+    send_ntfy_http,
+};
 use crate::brain::{extract_json_object, HISTORY_MAX};
-use crate::commands::resolve_contact_target;
+use crate::commands::{resolve_contact_target, user_explicitly_requested_voice};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, ConversationState, Database, OwnerStatus};
 use crate::safety::{detect_injection, redact_secrets};
@@ -23,6 +26,8 @@ pub const OWNER_SELF_CHAT_KEY: &str = "__owner_self_chat__";
 pub struct OwnerChatOutcome {
     pub reply: String,
     pub outbounds: Vec<(String, String)>,
+    pub voice_reply: bool,
+    pub spoken_summary: Option<String>,
 }
 
 fn looks_like_raw_json(s: &str) -> bool {
@@ -213,12 +218,14 @@ where
         .unwrap_or_else(Utc::now);
     let parts = lagos_parts(now_utc, cfg.open_hour, cfg.close_hour);
 
+    let _ = db.promote_due_followups(now_ms).await;
     let owner_status = db.get_owner_status(now_ms).await?;
     let unacked = db.list_unacked_urgent_alerts().await?;
     let digest_items = db.list_pending_digest_items(20).await?;
     let flags = db.list_flags(12).await?;
     let pending_replies = db.list_pending_replies().await.unwrap_or_default();
     let reminders = db.list_pending_reminders(10).await?;
+    let open_followups = db.list_followups(Some("open"), 12).await.unwrap_or_default();
     let contacts = db.find_contact_memories("").await?;
     let recent_convos = db.list_recent_conversations(8).await?;
     let owner_mem = db.list_owner_memory(30).await?;
@@ -296,10 +303,33 @@ where
                     .unwrap_or_else(Utc::now)
                     .with_timezone(&Lagos)
                     .format("%b %d %I:%M %p");
-                format!("  * [{}] {}", dt, r.text)
+                let badge = format_recurrence_badge(r.recurrence.as_deref());
+                format!("  * [#{}] [{}{}]: {}", r.id, dt, badge, r.text)
             })
             .collect();
         ctx_blocks.push(format!("Upcoming reminders:\n{}", lines.join("\n")));
+    }
+
+    if !open_followups.is_empty() {
+        let lines: Vec<String> = open_followups
+            .iter()
+            .map(|f| {
+                format!(
+                    "  * [#{} | {} | {}] {} (+{}): {} -> Suggested draft: \"{}\"",
+                    f.id,
+                    f.status,
+                    f.kind,
+                    f.contact_name.as_deref().unwrap_or("Unknown"),
+                    f.sender,
+                    sanitize_preview_for_owner_prompt(&f.reason, 100),
+                    sanitize_preview_for_owner_prompt(&f.suggested_reply, 100)
+                )
+            })
+            .collect();
+        ctx_blocks.push(format!(
+            "Smart Follow-Up Queue (Approval-First):\n{}",
+            lines.join("\n")
+        ));
     }
 
     if !recent_convos.is_empty() {
@@ -356,8 +386,8 @@ where
     if !owner_mem.is_empty() {
         let lines: Vec<String> = owner_mem
             .iter()
-            .take(20)
-            .map(|m| format!("  * [{} | {}] {}", m.category, m.visibility, m.content))
+            .take(25)
+            .map(|m| format!("  * [#{} | {} | {}] {}", m.id, m.category, m.visibility, m.content))
             .collect();
         ctx_blocks.push(format!("What you already know about Falcon:\n{}", lines.join("\n")));
     }
@@ -367,17 +397,24 @@ where
 Think J.A.R.V.I.S.: sharp, concise, witty when natural, completely loyal, zero fluff, zero robotic filler.
 
 ## What You Can Do Here
-1. Answer questions about his WhatsApp activity, contacts, emotions, pending handoffs, bookings, or schedule using the live data below.
+1. Answer questions about his WhatsApp activity, contacts, emotions, pending handoffs, follow-ups, bookings, schedule, or shared web/social links using the live data below.
 2. Execute real actions on his behalf by including items in `"actions"`:
    - Send a DM to a contact immediately (bypasses any 5-min wait or 2-hour cooldown): `{{"type": "send_dm", "target": "phone or name", "message": "exact text to send"}}`
      * If Falcon asks you to "reply to [someone] immediately" or "message [someone] about X", craft the natural WhatsApp message in `"message"` and include this `"send_dm"` action so it sends right now!
+   - Approve & send a queued follow-up card: `{{"type": "send_followup", "id": 1, "message": "optional custom override text"}}`
+   - Dismiss/skip a follow-up card: `{{"type": "dismiss_followup", "id": 1}}`
+   - Snooze a follow-up card: `{{"type": "snooze_followup", "id": 1, "hours": 24}}`
    - Resume/unpause a chat from 2-hour cooldown or hold without sending a message yet: `{{"type": "resume_chat", "target": "phone or name"}}`
    - Update Falcon's availability: `{{"type": "set_availability", "mode": "available|busy|deep_work|sleeping", "duration_minutes": 120, "note": "optional note"}}`
    - Set contact tier: `{{"type": "set_contact_tier", "target": "phone or name", "tier": "vip|normal|silent"}}`
-   - Save a durable fact about Falcon: `{{"type": "save_owner_memory", "category": "bio|projects|aurikrex|schedule|relationships|style|preferences", "visibility": "public|close|private_internal", "content": "concise fact"}}`
+   - Save or update a durable fact about Falcon: `{{"type": "save_owner_memory", "category": "bio|projects|aurikrex|schedule|relationships|style|preferences", "visibility": "public|close|private_internal", "content": "concise fact", "replaces_ids": []}}`
      * Use `public` for Aurikrex/public bio, `close` for friends/VIPs, `private_internal` for private guidance only for you and Falcon.
-   - Add a reminder: `{{"type": "add_reminder", "in_minutes": 60, "text": "reminder text"}}`
+     * If Falcon's new fact updates or contradicts an existing `[#ID | ...]` in "What you already know about Falcon", include that old ID in `"replaces_ids": [ID]` so the old fact is cleanly superseded!
+   - Delete an obsolete owner memory: `{{"type": "delete_owner_memory", "id": 12}}`
+   - Tidy/deduplicate owner memories: `{{"type": "tidy_memories"}}`
+   - Add a one-off or recurring reminder: `{{"type": "add_reminder", "schedule": "30m|7pm|tomorrow 8am|daily 8am|weekdays 7am|every monday 9am", "in_minutes": 60, "text": "reminder text"}}`
    - Cancel a reminder: `{{"type": "delete_reminder", "id": 3}}`
+   - Set self-chat voice note reply mode: `{{"type": "set_voice_mode", "mode": "auto|on|off"}}`
    - Acknowledge active urgent alerts: `{{"type": "ack_alerts", "target": null}}`
    - Send a live test ntfy push notification: `{{"type": "test_ntfy"}}`
    - Show full briefing: `{{"type": "briefing"}}`
@@ -425,8 +462,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                 redact_secrets(&e.to_string(), cfg)
             );
             return Ok(OwnerChatOutcome {
-                reply: "Hit a quick snag reaching the AI right now — fast commands like `status`, `briefing`, `ack`, `flagged`, and `help` still work immediately.".to_string(),
+                reply: "Hit a quick snag reaching the AI right now — fast commands like `status`, `briefing`, `followups`, `ack`, `flagged`, and `help` still work immediately.".to_string(),
                 outbounds: Vec::new(),
+                voice_reply: false,
+                spoken_summary: None,
             });
         }
     };
@@ -488,10 +527,68 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                         let _ = db.delete_pending_reply(&num).await;
                         let _ = db.delete_flags_for_chat(&num).await;
                         let _ = db.ack_urgent_alerts(Some(&num)).await;
+                        let _ = db.resolve_followups_for_sender(&num).await;
                         outbounds.push((format!("{}@s.whatsapp.net", num), msg.to_string()));
                         action_notes.push(format!("Sent to +{}", num));
                     } else {
                         action_notes.push(format!("Couldn't resolve contact \"{}\"", target));
+                    }
+                }
+            }
+            "send_followup" | "approve_followup" => {
+                if let Some(fid) = act["id"].as_i64() {
+                    if let Some(f) = db.get_followup_by_id(fid).await? {
+                        let custom = act["message"]
+                            .as_str()
+                            .or_else(|| act["text"].as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let msg_to_send = custom.unwrap_or(&f.suggested_reply).to_string();
+                        let mut st = db
+                            .get_conversation(&f.sender)
+                            .await?
+                            .unwrap_or_else(|| ConversationState::new(&f.sender));
+                        st.history.push(ChatTurn {
+                            role: "assistant".to_string(),
+                            content: format!("[Falcon]: {}", msg_to_send),
+                        });
+                        if st.history.len() > HISTORY_MAX {
+                            let excess = st.history.len() - HISTORY_MAX;
+                            st.history.drain(0..excess);
+                        }
+                        st.bot_active = true;
+                        st.owner_read_unanswered = false;
+                        st.paused_until = 0;
+                        st.updated_at = now_ms;
+                        db.save_conversation(&st).await?;
+                        let _ = db.update_followup_status(fid, "sent", None, now_ms).await;
+                        outbounds.push((
+                            format!("{}@s.whatsapp.net", f.sender),
+                            msg_to_send,
+                        ));
+                        action_notes.push(format!("Sent follow-up #{} to +{}", fid, f.sender));
+                    }
+                }
+            }
+            "dismiss_followup" | "skip_followup" => {
+                if let Some(fid) = act["id"].as_i64() {
+                    if db
+                        .update_followup_status(fid, "dismissed", None, now_ms)
+                        .await?
+                    {
+                        action_notes.push(format!("Dismissed follow-up #{}", fid));
+                    }
+                }
+            }
+            "snooze_followup" => {
+                if let Some(fid) = act["id"].as_i64() {
+                    let hours = act["hours"].as_i64().unwrap_or(24).clamp(1, 168);
+                    let new_due = now_ms + hours * 3_600_000;
+                    if db
+                        .update_followup_status(fid, "watching", Some(new_due), now_ms)
+                        .await?
+                    {
+                        action_notes.push(format!("Snoozed follow-up #{} ({}h)", fid, hours));
                     }
                 }
             }
@@ -553,19 +650,64 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                     let cat = act["category"].as_str().unwrap_or("profile").trim();
                     let vis = act["visibility"].as_str().unwrap_or("public").trim();
                     let content = act["content"].as_str().unwrap_or("").trim();
+                    let replaces_ids: Vec<i64> = act["replaces_ids"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                        .unwrap_or_default();
                     if !content.is_empty() {
                         let _ = db
-                            .add_owner_memory_scoped(cat, vis, content, "self_chat_ai")
+                            .add_owner_memory_with_replaces(
+                                cat,
+                                vis,
+                                content,
+                                "self_chat_ai",
+                                &replaces_ids,
+                            )
                             .await?;
                     }
                 }
+                "delete_owner_memory" | "forget_owner_memory" => {
+                    if let Some(mid) = act["id"].as_i64() {
+                        let removed = db.delete_owner_memory(&mid.to_string()).await?;
+                        if removed > 0 {
+                            action_notes.push(format!("Removed memory #{}", mid));
+                        }
+                    } else if let Some(q) = act["query"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        let removed = db.delete_owner_memory(q).await?;
+                        if removed > 0 {
+                            action_notes.push(format!("Removed {} memory item(s)", removed));
+                        }
+                    }
+                }
+                "tidy_memories" | "clean_memories" => {
+                    let sup = db.tidy_owner_memory_deterministic().await?;
+                    action_notes.push(format!("Tidied memories ({} superseded)", sup));
+                }
                 "add_reminder" => {
-                    let in_mins = act["in_minutes"].as_i64().unwrap_or(0);
                     let r_text = act["text"].as_str().unwrap_or("").trim();
-                    if in_mins > 0 && !r_text.is_empty() {
-                        let due_at = now_ms + in_mins * 60_000;
-                        let id = db.add_reminder(due_at, r_text, now_ms).await?;
-                        action_notes.push(format!("Reminder #{} set", id));
+                    let sched_str = act["schedule"].as_str().unwrap_or("").trim();
+                    let in_mins = act["in_minutes"].as_i64().unwrap_or(0);
+                    if !r_text.is_empty() {
+                        if !sched_str.is_empty() {
+                            if let Some((due_at, recurrence)) =
+                                parse_reminder_schedule(sched_str, now_ms)
+                            {
+                                let id = db
+                                    .add_reminder_with_recurrence(
+                                        due_at,
+                                        r_text,
+                                        recurrence.as_deref(),
+                                        now_ms,
+                                    )
+                                    .await?;
+                                let badge = format_recurrence_badge(recurrence.as_deref());
+                                action_notes.push(format!("Reminder #{}{} set", id, badge));
+                            }
+                        } else if in_mins > 0 {
+                            let due_at = now_ms + in_mins * 60_000;
+                            let id = db.add_reminder(due_at, r_text, now_ms).await?;
+                            action_notes.push(format!("Reminder #{} set", id));
+                        }
                     }
                 }
                 "delete_reminder" | "cancel_reminder" => {
@@ -574,6 +716,15 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                             action_notes.push(format!("Cancelled reminder #{}", rid));
                         }
                     }
+                }
+                "set_voice_mode" => {
+                    let mode = match act["mode"].as_str().unwrap_or("auto").trim().to_lowercase().as_str() {
+                        "on" | "always" => "on",
+                        "off" | "mute" | "text" => "off",
+                        _ => "auto",
+                    };
+                    db.set_setting("self_voice_mode", mode).await?;
+                    action_notes.push(format!("Voice mode: {}", mode));
                 }
                 "test_ntfy" => {
                     match send_ntfy_http(
@@ -601,10 +752,12 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                     let items = db.list_pending_digest_items(30).await?;
                     let alerts = db.list_unacked_urgent_alerts().await?;
                     let rems = db.list_pending_reminders(10).await?;
-                    let digest = format_digest_message(
+                    let ready_fu = db.list_followups(Some("ready"), 10).await?;
+                    let digest = format_digest_message_with_followups(
                         &items,
                         &alerts,
                         &rems,
+                        &ready_fu,
                         &format!("📋 *{} On-Demand Briefing*", BOT_NAME),
                     );
                     reply_text = digest;
@@ -633,8 +786,11 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
     self_state.updated_at = now_ms;
     db.save_conversation(&self_state).await?;
 
+    let voice_reply = user_explicitly_requested_voice(text);
     Ok(OwnerChatOutcome {
         reply: reply_text,
         outbounds,
+        voice_reply,
+        spoken_summary: None,
     })
 }

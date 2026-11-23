@@ -26,6 +26,33 @@ var stdoutMu sync.Mutex
 var botReadMu sync.Mutex
 var botMarkedReadChats = make(map[string]time.Time)
 var botMarkedReadMsgs = make(map[string]time.Time)
+var botSentMu sync.Mutex
+var botSentMsgs = make(map[string]time.Time)
+
+func recordBotSentMsg(msgID string) {
+	if msgID == "" {
+		return
+	}
+	botSentMu.Lock()
+	defer botSentMu.Unlock()
+	now := time.Now()
+	botSentMsgs[msgID] = now
+	for k, t := range botSentMsgs {
+		if now.Sub(t) > 60*time.Second {
+			delete(botSentMsgs, k)
+		}
+	}
+}
+
+func wasSentByBot(msgID string) bool {
+	if msgID == "" {
+		return false
+	}
+	botSentMu.Lock()
+	defer botSentMu.Unlock()
+	t, ok := botSentMsgs[msgID]
+	return ok && time.Since(t) < 60*time.Second
+}
 
 func recordBotMarkRead(chatJID string, msgID string) {
 	botReadMu.Lock()
@@ -85,6 +112,9 @@ type BridgeCommand struct {
 	Text           string   `json:"text"`
 	State          string   `json:"state"`
 	Mentions       []string `json:"mentions"`
+	AudioPath      string   `json:"audio_path"`
+	Mime           string   `json:"mime"`
+	Seconds        uint32   `json:"seconds"`
 }
 
 func cleanPhone(raw string) string {
@@ -306,6 +336,9 @@ func main() {
 			}
 
 		case *events.Message:
+			if v.Info.IsFromMe && wasSentByBot(string(v.Info.ID)) {
+				return
+			}
 			unwrapped := unwrapEdited(v.Message)
 			text, isVoice, matchedURLs, isUserMsg := extractTextAndURLs(unwrapped)
 			if !isUserMsg {
@@ -505,7 +538,51 @@ func handleCommand(ctx context.Context, client *whatsmeow.Client, cmd BridgeComm
 				},
 			}
 		}
-		_, _ = client.SendMessage(ctx, chatJID, msg)
+		if resp, err := client.SendMessage(ctx, chatJID, msg); err == nil {
+			recordBotSentMsg(string(resp.ID))
+		}
+
+	case "send_voice":
+		if cmd.AudioPath != "" {
+			defer os.Remove(cmd.AudioPath)
+		}
+		chatJID, err := types.ParseJID(cmd.ChatJID)
+		if err != nil || cmd.AudioPath == "" {
+			return
+		}
+		data, err := os.ReadFile(cmd.AudioPath)
+		if err != nil || len(data) == 0 || len(data) > 5*1024*1024 {
+			return
+		}
+		up, err := client.Upload(ctx, data, whatsmeow.MediaAudio)
+		if err != nil {
+			emit(map[string]any{"event": "error", "message": "voice upload failed: " + err.Error()})
+			return
+		}
+		mime := strings.TrimSpace(cmd.Mime)
+		if mime == "" {
+			mime = "audio/ogg; codecs=opus"
+		}
+		secs := cmd.Seconds
+		if secs == 0 {
+			secs = 4
+		}
+		msg := &waE2E.Message{
+			AudioMessage: &waE2E.AudioMessage{
+				URL:           proto.String(up.URL),
+				DirectPath:    proto.String(up.DirectPath),
+				MediaKey:      up.MediaKey,
+				Mimetype:      proto.String(mime),
+				FileEncSHA256: up.FileEncSHA256,
+				FileSHA256:    up.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+				PTT:           proto.Bool(true),
+				Seconds:       proto.Uint32(secs),
+			},
+		}
+		if resp, err := client.SendMessage(ctx, chatJID, msg); err == nil {
+			recordBotSentMsg(string(resp.ID))
+		}
 
 	case "send_presence":
 		chatJID, err := types.ParseJID(cmd.ChatJID)

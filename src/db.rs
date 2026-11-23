@@ -57,6 +57,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         visibility TEXT NOT NULL DEFAULT 'public',
         content TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'owner',
+        active INTEGER NOT NULL DEFAULT 1,
+        superseded_by INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )",
@@ -151,8 +153,21 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         due_at INTEGER NOT NULL,
         text TEXT NOT NULL,
+        recurrence TEXT,
         delivered INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS followups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        contact_name TEXT,
+        kind TEXT NOT NULL DEFAULT 'cold_lead',
+        reason TEXT NOT NULL,
+        suggested_reply TEXT NOT NULL,
+        due_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'watching',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
     )",
 ];
 
@@ -267,8 +282,26 @@ pub struct ReminderRecord {
     pub id: i64,
     pub due_at: i64,
     pub text: String,
+    #[serde(default)]
+    pub recurrence: Option<String>,
     pub delivered: bool,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowupRecord {
+    pub id: i64,
+    pub sender: String,
+    pub contact_name: Option<String>,
+    /// "falcon_promised" | "waiting_on_them" | "cold_lead"
+    pub kind: String,
+    pub reason: String,
+    pub suggested_reply: String,
+    pub due_at: i64,
+    /// "watching" | "ready" | "sent" | "dismissed"
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -346,6 +379,10 @@ fn default_visibility() -> String {
     "public".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactMemory {
     pub sender: String,
@@ -400,6 +437,10 @@ pub struct OwnerMemoryItem {
     pub visibility: String,
     pub content: String,
     pub source: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -461,6 +502,8 @@ struct LocalStoreData {
     digest_queue: Vec<DigestItem>,
     #[serde(default)]
     reminders: Vec<ReminderRecord>,
+    #[serde(default)]
+    followups: Vec<FollowupRecord>,
     next_id: i64,
 }
 
@@ -528,6 +571,62 @@ fn row_i64(row: &HashMap<String, Value>, key: &str) -> i64 {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
         Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
         _ => 0,
+    }
+}
+
+fn memory_tokens(text: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "is", "are", "was", "were", "to", "for", "and", "or", "in", "on", "at", "of",
+        "with", "that", "this", "from", "by", "as", "be", "has", "have", "had",
+    ];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            if cur.len() >= 2 && !STOPWORDS.contains(&cur.as_str()) {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    if cur.len() >= 2 && !STOPWORDS.contains(&cur.as_str()) {
+        out.push(cur);
+    }
+    out
+}
+
+/// Computes semantic token similarity (Jaccard + subject-prefix bonus) between two memory facts.
+/// Used to detect when a newer fact updates or supersedes an older fact (threshold `>= 0.68`).
+pub fn memory_token_jaccard(a: &str, b: &str) -> f64 {
+    let ta = memory_tokens(a);
+    let tb = memory_tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    // Check shared leading subject prefix (e.g. "falcon tutoring rate ..." vs "falcon tutoring rate ...")
+    let prefix_match = ta
+        .iter()
+        .zip(tb.iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+
+    let set_a: HashSet<&str> = ta.iter().map(|s| s.as_str()).collect();
+    let set_b: HashSet<&str> = tb.iter().map(|s| s.as_str()).collect();
+    let inter = set_a.intersection(&set_b).count() as f64;
+    let union = set_a.union(&set_b).count() as f64;
+    if union == 0.0 {
+        return 0.0;
+    }
+    let jaccard = inter / union;
+    if prefix_match >= 3 && jaccard >= 0.40 {
+        jaccard.max(0.72)
+    } else if prefix_match >= 2 && jaccard >= 0.50 {
+        jaccard.max(0.70)
+    } else {
+        jaccard
     }
 }
 
@@ -618,6 +717,18 @@ impl Database {
                 "ALTER TABLE owner_memory ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'",
                 vec![],
             )
+            .await;
+        let _ = self
+            .execute_remote(
+                "ALTER TABLE owner_memory ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+                vec![],
+            )
+            .await;
+        let _ = self
+            .execute_remote("ALTER TABLE owner_memory ADD COLUMN superseded_by INTEGER", vec![])
+            .await;
+        let _ = self
+            .execute_remote("ALTER TABLE reminders ADD COLUMN recurrence TEXT", vec![])
             .await;
         Ok(())
     }
@@ -1132,7 +1243,7 @@ impl Database {
         }
     }
 
-    // ---- Owner Memory (Layer 3 - Permanent, Audience-Scoped) ----
+    // ---- Owner Memory (Layer 3 - Permanent, Audience-Scoped + Semantic Superseding) ----
     pub async fn add_owner_memory(&self, category: &str, content: &str, source: &str) -> Result<i64> {
         self.add_owner_memory_scoped(category, "public", content, source)
             .await
@@ -1145,10 +1256,27 @@ impl Database {
         content: &str,
         source: &str,
     ) -> Result<i64> {
+        self.add_owner_memory_with_replaces(category, visibility, content, source, &[])
+            .await
+    }
+
+    pub async fn add_owner_memory_with_replaces(
+        &self,
+        category: &str,
+        visibility: &str,
+        content: &str,
+        source: &str,
+        replaces_ids: &[i64],
+    ) -> Result<i64> {
         let clean = content.trim();
         if clean.is_empty() {
             return Ok(0);
         }
+        let cat = if category.trim().is_empty() {
+            "general"
+        } else {
+            category.trim()
+        };
         let vis = match visibility.trim().to_lowercase().as_str() {
             "close" | "friends" | "vip" => "close",
             "private" | "private_internal" | "internal" => "private_internal",
@@ -1165,19 +1293,46 @@ impl Database {
                     .find(|m| m.content.eq_ignore_ascii_case(clean))
                 {
                     existing.updated_at = now;
-                    existing.category = category.to_string();
+                    existing.category = cat.to_string();
                     existing.visibility = vis.to_string();
+                    existing.active = true;
+                    existing.superseded_by = None;
                     let id = existing.id;
+                    for m in &mut guard.data.owner_memory {
+                        if m.id != id
+                            && m.active
+                            && (replaces_ids.contains(&m.id)
+                                || (m.category.eq_ignore_ascii_case(cat)
+                                    && memory_token_jaccard(&m.content, clean) >= 0.68))
+                        {
+                            m.active = false;
+                            m.superseded_by = Some(id);
+                            m.updated_at = now;
+                        }
+                    }
                     guard.flush()?;
                     return Ok(id);
                 }
                 let id = guard.alloc_id();
+                for m in &mut guard.data.owner_memory {
+                    if m.active
+                        && (replaces_ids.contains(&m.id)
+                            || (m.category.eq_ignore_ascii_case(cat)
+                                && memory_token_jaccard(&m.content, clean) >= 0.68))
+                    {
+                        m.active = false;
+                        m.superseded_by = Some(id);
+                        m.updated_at = now;
+                    }
+                }
                 guard.data.owner_memory.push(OwnerMemoryItem {
                     id,
-                    category: category.to_string(),
+                    category: cat.to_string(),
                     visibility: vis.to_string(),
                     content: clean.to_string(),
                     source: source.to_string(),
+                    active: true,
+                    superseded_by: None,
                     created_at: now,
                     updated_at: now,
                 });
@@ -1191,51 +1346,163 @@ impl Database {
                         vec![SqlParam::from(clean)],
                     )
                     .await?;
-                if let Some(row) = existing.rows.first() {
+                let new_id = if let Some(row) = existing.rows.first() {
                     let id = row_i64(row, "id");
                     self.execute_remote(
-                        "UPDATE owner_memory SET updated_at = ?, category = ?, visibility = ? WHERE id = ?",
+                        "UPDATE owner_memory SET updated_at = ?, category = ?, visibility = ?, active = 1, superseded_by = NULL WHERE id = ?",
                         vec![
                             SqlParam::Int(now),
-                            SqlParam::from(category),
+                            SqlParam::from(cat),
                             SqlParam::from(vis),
                             SqlParam::Int(id),
                         ],
                     )
                     .await?;
-                    return Ok(id);
-                }
-                let res = self
+                    id
+                } else {
+                    let res = self
+                        .execute_remote(
+                            "INSERT INTO owner_memory (category, visibility, content, source, active, superseded_by, created_at, updated_at) VALUES (?, ?, ?, ?, 1, NULL, ?, ?)",
+                            vec![
+                                SqlParam::from(cat),
+                                SqlParam::from(vis),
+                                SqlParam::from(clean),
+                                SqlParam::from(source),
+                                SqlParam::Int(now),
+                                SqlParam::Int(now),
+                            ],
+                        )
+                        .await?;
+                    res.last_insert_rowid
+                };
+
+                // Supersede explicitly listed IDs + any near-duplicate active facts in the same category
+                let mut to_supersede: Vec<i64> = replaces_ids
+                    .iter()
+                    .copied()
+                    .filter(|&old_id| old_id > 0 && old_id != new_id)
+                    .collect();
+                if let Ok(active_same_cat) = self
                     .execute_remote(
-                        "INSERT INTO owner_memory (category, visibility, content, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        vec![
-                            SqlParam::from(category),
-                            SqlParam::from(vis),
-                            SqlParam::from(clean),
-                            SqlParam::from(source),
-                            SqlParam::Int(now),
-                            SqlParam::Int(now),
-                        ],
+                        "SELECT id, content FROM owner_memory WHERE COALESCE(active, 1) = 1 AND LOWER(category) = LOWER(?) AND id != ?",
+                        vec![SqlParam::from(cat), SqlParam::Int(new_id)],
                     )
-                    .await?;
-                Ok(res.last_insert_rowid)
+                    .await
+                {
+                    for row in &active_same_cat.rows {
+                        let old_id = row_i64(row, "id");
+                        let old_content = row_str(row, "content").unwrap_or_default();
+                        if old_id > 0
+                            && !to_supersede.contains(&old_id)
+                            && memory_token_jaccard(&old_content, clean) >= 0.68
+                        {
+                            to_supersede.push(old_id);
+                        }
+                    }
+                }
+                if !to_supersede.is_empty() {
+                    let _ = self
+                        .supersede_owner_memories(&to_supersede, Some(new_id))
+                        .await;
+                }
+                Ok(new_id)
             }
         }
+    }
+
+    pub async fn supersede_owner_memories(
+        &self,
+        old_ids: &[i64],
+        new_id: Option<i64>,
+    ) -> Result<u64> {
+        if old_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().timestamp_millis();
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut count = 0u64;
+                for m in &mut guard.data.owner_memory {
+                    if old_ids.contains(&m.id) && m.active {
+                        m.active = false;
+                        m.superseded_by = new_id;
+                        m.updated_at = now;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    guard.flush()?;
+                }
+                Ok(count)
+            }
+            TursoBackend::Remote { .. } => {
+                let mut total = 0u64;
+                for &old_id in old_ids {
+                    let sup_param = match new_id {
+                        Some(nid) => SqlParam::Int(nid),
+                        None => SqlParam::Null,
+                    };
+                    let r = self
+                        .execute_remote(
+                            "UPDATE owner_memory SET active = 0, superseded_by = ?, updated_at = ? WHERE id = ?",
+                            vec![sup_param, SqlParam::Int(now), SqlParam::Int(old_id)],
+                        )
+                        .await?;
+                    total += r.rows_affected;
+                }
+                Ok(total)
+            }
+        }
+    }
+
+    /// Deterministically sweeps all active owner memories (newest first) and marks older
+    /// conflicting/near-duplicate facts within the same category as superseded.
+    pub async fn tidy_owner_memory_deterministic(&self) -> Result<usize> {
+        let items = self.list_owner_memory(200).await?;
+        let mut kept: Vec<OwnerMemoryItem> = Vec::new();
+        let mut superseded_pairs: Vec<(i64, i64)> = Vec::new();
+        for item in items {
+            if !item.active {
+                continue;
+            }
+            if let Some(newer) = kept.iter().find(|k| {
+                k.category.eq_ignore_ascii_case(&item.category)
+                    && (k.content.eq_ignore_ascii_case(&item.content)
+                        || memory_token_jaccard(&k.content, &item.content) >= 0.68)
+            }) {
+                superseded_pairs.push((item.id, newer.id));
+            } else {
+                kept.push(item);
+            }
+        }
+        for (old_id, new_id) in &superseded_pairs {
+            let _ = self
+                .supersede_owner_memories(&[*old_id], Some(*new_id))
+                .await;
+        }
+        Ok(superseded_pairs.len())
     }
 
     pub async fn list_owner_memory(&self, limit: i64) -> Result<Vec<OwnerMemoryItem>> {
         match &self.backend {
             TursoBackend::Local(s) => {
                 let guard = s.lock().unwrap();
-                let mut list = guard.data.owner_memory.clone();
-                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let mut list: Vec<OwnerMemoryItem> = guard
+                    .data
+                    .owner_memory
+                    .iter()
+                    .filter(|m| m.active)
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| b.id.cmp(&a.id)));
                 list.truncate(limit as usize);
                 Ok(list)
             }
             TursoBackend::Remote { .. } => {
                 let res = self
                     .execute_remote(
-                        "SELECT * FROM owner_memory ORDER BY updated_at DESC LIMIT ?",
+                        "SELECT * FROM owner_memory WHERE COALESCE(active, 1) = 1 ORDER BY updated_at DESC, id DESC LIMIT ?",
                         vec![SqlParam::Int(limit)],
                     )
                     .await?;
@@ -1250,6 +1517,8 @@ impl Database {
                             .unwrap_or_else(|| "public".to_string()),
                         content: row_str(r, "content").unwrap_or_default(),
                         source: row_str(r, "source").unwrap_or_default(),
+                        active: row_str(r, "active").map(|s| s != "0").unwrap_or(true),
+                        superseded_by: row_str(r, "superseded_by").and_then(|s| s.parse().ok()),
                         created_at: row_i64(r, "created_at"),
                         updated_at: row_i64(r, "updated_at"),
                     })
@@ -2489,12 +2758,27 @@ impl Database {
         }
     }
 
-    // ---- Reminders ----
+    // ---- Reminders (One-Off & Recurring) ----
     pub async fn add_reminder(&self, due_at: i64, text: &str, now_ms: i64) -> Result<i64> {
+        self.add_reminder_with_recurrence(due_at, text, None, now_ms)
+            .await
+    }
+
+    pub async fn add_reminder_with_recurrence(
+        &self,
+        due_at: i64,
+        text: &str,
+        recurrence: Option<&str>,
+        now_ms: i64,
+    ) -> Result<i64> {
         let clean = text.trim();
         if clean.is_empty() {
             return Ok(0);
         }
+        let rec = recurrence
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         match &self.backend {
             TursoBackend::Local(s) => {
                 let mut guard = s.lock().unwrap();
@@ -2503,6 +2787,7 @@ impl Database {
                     id,
                     due_at,
                     text: clean.to_string(),
+                    recurrence: rec,
                     delivered: false,
                     created_at: now_ms,
                 });
@@ -2512,15 +2797,38 @@ impl Database {
             TursoBackend::Remote { .. } => {
                 let res = self
                     .execute_remote(
-                        "INSERT INTO reminders (due_at, text, delivered, created_at) VALUES (?, ?, 0, ?)",
+                        "INSERT INTO reminders (due_at, text, recurrence, delivered, created_at) VALUES (?, ?, ?, 0, ?)",
                         vec![
                             SqlParam::Int(due_at),
                             SqlParam::from(clean),
+                            SqlParam::from(rec),
                             SqlParam::Int(now_ms),
                         ],
                     )
                     .await?;
                 Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn reschedule_recurring_reminder(&self, id: i64, next_due_at: i64) -> Result<()> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(r) = guard.data.reminders.iter_mut().find(|r| r.id == id) {
+                    r.due_at = next_due_at;
+                    r.delivered = false;
+                }
+                guard.flush()?;
+                Ok(())
+            }
+            TursoBackend::Remote { .. } => {
+                self.execute_remote(
+                    "UPDATE reminders SET due_at = ?, delivered = 0 WHERE id = ?",
+                    vec![SqlParam::Int(next_due_at), SqlParam::Int(id)],
+                )
+                .await?;
+                Ok(())
             }
         }
     }
@@ -2551,6 +2859,7 @@ impl Database {
                         id: row_i64(r, "id"),
                         due_at: row_i64(r, "due_at"),
                         text: row_str(r, "text").unwrap_or_default(),
+                        recurrence: row_str(r, "recurrence").filter(|s| !s.is_empty()),
                         delivered: row_i64(r, "delivered") != 0,
                         created_at: row_i64(r, "created_at"),
                     })
@@ -2588,6 +2897,7 @@ impl Database {
                         id: row_i64(r, "id"),
                         due_at: row_i64(r, "due_at"),
                         text: row_str(r, "text").unwrap_or_default(),
+                        recurrence: row_str(r, "recurrence").filter(|s| !s.is_empty()),
                         delivered: row_i64(r, "delivered") != 0,
                         created_at: row_i64(r, "created_at"),
                     })
@@ -2633,6 +2943,351 @@ impl Database {
                 let res = self
                     .execute_remote("DELETE FROM reminders WHERE id = ?", vec![SqlParam::Int(id)])
                     .await?;
+                Ok(res.rows_affected > 0)
+            }
+        }
+    }
+
+    // ---- Smart Follow-Up Queue (Approval-First across Personal, Business & Aurikrex Chats) ----
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_followup(
+        &self,
+        sender: &str,
+        contact_name: Option<&str>,
+        kind: &str,
+        reason: &str,
+        suggested_reply: &str,
+        due_at: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let clean_sender = sender.trim();
+        let clean_reason = reason.trim();
+        let clean_reply = suggested_reply.trim();
+        if clean_sender.is_empty() || clean_reason.is_empty() || clean_reply.is_empty() {
+            return Ok(0);
+        }
+        let clean_kind = match kind.trim().to_lowercase().as_str() {
+            "falcon_promised" | "owner_promised" => "falcon_promised",
+            "waiting_on_them" | "they_promised" => "waiting_on_them",
+            _ => "cold_lead",
+        };
+        let status = if due_at <= now_ms { "ready" } else { "watching" };
+        let cname = contact_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(existing) = guard
+                    .data
+                    .followups
+                    .iter_mut()
+                    .find(|f| f.sender == clean_sender && matches!(f.status.as_str(), "watching" | "ready"))
+                {
+                    if cname.is_some() {
+                        existing.contact_name = cname;
+                    }
+                    existing.kind = clean_kind.to_string();
+                    existing.reason = clean_reason.to_string();
+                    existing.suggested_reply = clean_reply.to_string();
+                    existing.due_at = due_at;
+                    existing.status = status.to_string();
+                    existing.updated_at = now_ms;
+                    let id = existing.id;
+                    guard.flush()?;
+                    return Ok(id);
+                }
+                let id = guard.alloc_id();
+                guard.data.followups.push(FollowupRecord {
+                    id,
+                    sender: clean_sender.to_string(),
+                    contact_name: cname,
+                    kind: clean_kind.to_string(),
+                    reason: clean_reason.to_string(),
+                    suggested_reply: clean_reply.to_string(),
+                    due_at,
+                    status: status.to_string(),
+                    created_at: now_ms,
+                    updated_at: now_ms,
+                });
+                guard.flush()?;
+                Ok(id)
+            }
+            TursoBackend::Remote { .. } => {
+                let existing = self
+                    .execute_remote(
+                        "SELECT id, contact_name FROM followups WHERE sender = ? AND status IN ('watching', 'ready') ORDER BY id DESC LIMIT 1",
+                        vec![SqlParam::from(clean_sender)],
+                    )
+                    .await?;
+                if let Some(row) = existing.rows.first() {
+                    let id = row_i64(row, "id");
+                    let merged_name = cname.or_else(|| row_str(row, "contact_name"));
+                    self.execute_remote(
+                        "UPDATE followups SET contact_name = ?, kind = ?, reason = ?, suggested_reply = ?, due_at = ?, status = ?, updated_at = ? WHERE id = ?",
+                        vec![
+                            SqlParam::from(merged_name),
+                            SqlParam::from(clean_kind),
+                            SqlParam::from(clean_reason),
+                            SqlParam::from(clean_reply),
+                            SqlParam::Int(due_at),
+                            SqlParam::from(status),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(id),
+                        ],
+                    )
+                    .await?;
+                    return Ok(id);
+                }
+                let res = self
+                    .execute_remote(
+                        "INSERT INTO followups (sender, contact_name, kind, reason, suggested_reply, due_at, status, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        vec![
+                            SqlParam::from(clean_sender),
+                            SqlParam::from(cname),
+                            SqlParam::from(clean_kind),
+                            SqlParam::from(clean_reason),
+                            SqlParam::from(clean_reply),
+                            SqlParam::Int(due_at),
+                            SqlParam::from(status),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(now_ms),
+                        ],
+                    )
+                    .await?;
+                Ok(res.last_insert_rowid)
+            }
+        }
+    }
+
+    pub async fn resolve_followups_for_sender(&self, sender: &str) -> Result<u64> {
+        let now_ms = Utc::now().timestamp_millis();
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut count = 0u64;
+                for f in &mut guard.data.followups {
+                    if f.sender == sender && matches!(f.status.as_str(), "watching" | "ready") {
+                        f.status = "dismissed".to_string();
+                        f.updated_at = now_ms;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    guard.flush()?;
+                }
+                Ok(count)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "UPDATE followups SET status = 'dismissed', updated_at = ? WHERE sender = ? AND status IN ('watching', 'ready')",
+                        vec![SqlParam::Int(now_ms), SqlParam::from(sender)],
+                    )
+                    .await?;
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
+    pub async fn promote_due_followups(&self, now_ms: i64) -> Result<Vec<FollowupRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut promoted = Vec::new();
+                for f in &mut guard.data.followups {
+                    if f.status == "watching" && f.due_at <= now_ms {
+                        f.status = "ready".to_string();
+                        f.updated_at = now_ms;
+                        promoted.push(f.clone());
+                    }
+                }
+                if !promoted.is_empty() {
+                    guard.flush()?;
+                }
+                Ok(promoted)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM followups WHERE status = 'watching' AND due_at <= ? ORDER BY due_at ASC",
+                        vec![SqlParam::Int(now_ms)],
+                    )
+                    .await?;
+                let mut promoted = Vec::new();
+                for r in &res.rows {
+                    let id = row_i64(r, "id");
+                    let _ = self
+                        .execute_remote(
+                            "UPDATE followups SET status = 'ready', updated_at = ? WHERE id = ?",
+                            vec![SqlParam::Int(now_ms), SqlParam::Int(id)],
+                        )
+                        .await;
+                    promoted.push(FollowupRecord {
+                        id,
+                        sender: row_str(r, "sender").unwrap_or_default(),
+                        contact_name: row_str(r, "contact_name"),
+                        kind: row_str(r, "kind").unwrap_or_else(|| "cold_lead".to_string()),
+                        reason: row_str(r, "reason").unwrap_or_default(),
+                        suggested_reply: row_str(r, "suggested_reply").unwrap_or_default(),
+                        due_at: row_i64(r, "due_at"),
+                        status: "ready".to_string(),
+                        created_at: row_i64(r, "created_at"),
+                        updated_at: now_ms,
+                    });
+                }
+                Ok(promoted)
+            }
+        }
+    }
+
+    pub async fn list_followups(
+        &self,
+        status_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<FollowupRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                let mut list: Vec<FollowupRecord> = guard
+                    .data
+                    .followups
+                    .iter()
+                    .filter(|f| match status_filter {
+                        None => true,
+                        Some("open") => matches!(f.status.as_str(), "ready" | "watching"),
+                        Some(st) => f.status == st,
+                    })
+                    .cloned()
+                    .collect();
+                list.sort_by(|a, b| {
+                    let a_ready = a.status == "ready";
+                    let b_ready = b.status == "ready";
+                    b_ready.cmp(&a_ready).then_with(|| a.due_at.cmp(&b.due_at))
+                });
+                list.truncate(limit as usize);
+                Ok(list)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = match status_filter {
+                    None => {
+                        self.execute_remote(
+                            "SELECT * FROM followups ORDER BY due_at ASC LIMIT ?",
+                            vec![SqlParam::Int(limit)],
+                        )
+                        .await?
+                    }
+                    Some("open") => {
+                        self.execute_remote(
+                            "SELECT * FROM followups WHERE status IN ('ready', 'watching') ORDER BY CASE WHEN status = 'ready' THEN 0 ELSE 1 END, due_at ASC LIMIT ?",
+                            vec![SqlParam::Int(limit)],
+                        )
+                        .await?
+                    }
+                    Some(st) => {
+                        self.execute_remote(
+                            "SELECT * FROM followups WHERE status = ? ORDER BY due_at ASC LIMIT ?",
+                            vec![SqlParam::from(st), SqlParam::Int(limit)],
+                        )
+                        .await?
+                    }
+                };
+                Ok(res
+                    .rows
+                    .iter()
+                    .map(|r| FollowupRecord {
+                        id: row_i64(r, "id"),
+                        sender: row_str(r, "sender").unwrap_or_default(),
+                        contact_name: row_str(r, "contact_name"),
+                        kind: row_str(r, "kind").unwrap_or_else(|| "cold_lead".to_string()),
+                        reason: row_str(r, "reason").unwrap_or_default(),
+                        suggested_reply: row_str(r, "suggested_reply").unwrap_or_default(),
+                        due_at: row_i64(r, "due_at"),
+                        status: row_str(r, "status").unwrap_or_else(|| "watching".to_string()),
+                        created_at: row_i64(r, "created_at"),
+                        updated_at: row_i64(r, "updated_at"),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub async fn get_followup_by_id(&self, id: i64) -> Result<Option<FollowupRecord>> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let guard = s.lock().unwrap();
+                Ok(guard.data.followups.iter().find(|f| f.id == id).cloned())
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "SELECT * FROM followups WHERE id = ? LIMIT 1",
+                        vec![SqlParam::Int(id)],
+                    )
+                    .await?;
+                Ok(res.rows.first().map(|r| FollowupRecord {
+                    id: row_i64(r, "id"),
+                    sender: row_str(r, "sender").unwrap_or_default(),
+                    contact_name: row_str(r, "contact_name"),
+                    kind: row_str(r, "kind").unwrap_or_else(|| "cold_lead".to_string()),
+                    reason: row_str(r, "reason").unwrap_or_default(),
+                    suggested_reply: row_str(r, "suggested_reply").unwrap_or_default(),
+                    due_at: row_i64(r, "due_at"),
+                    status: row_str(r, "status").unwrap_or_else(|| "watching".to_string()),
+                    created_at: row_i64(r, "created_at"),
+                    updated_at: row_i64(r, "updated_at"),
+                }))
+            }
+        }
+    }
+
+    pub async fn update_followup_status(
+        &self,
+        id: i64,
+        status: &str,
+        new_due_at: Option<i64>,
+        now_ms: i64,
+    ) -> Result<bool> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                if let Some(f) = guard.data.followups.iter_mut().find(|f| f.id == id) {
+                    f.status = status.to_string();
+                    if let Some(due) = new_due_at {
+                        f.due_at = due;
+                    }
+                    f.updated_at = now_ms;
+                    guard.flush()?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = if let Some(due) = new_due_at {
+                    self.execute_remote(
+                        "UPDATE followups SET status = ?, due_at = ?, updated_at = ? WHERE id = ?",
+                        vec![
+                            SqlParam::from(status),
+                            SqlParam::Int(due),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(id),
+                        ],
+                    )
+                    .await?
+                } else {
+                    self.execute_remote(
+                        "UPDATE followups SET status = ?, updated_at = ? WHERE id = ?",
+                        vec![
+                            SqlParam::from(status),
+                            SqlParam::Int(now_ms),
+                            SqlParam::Int(id),
+                        ],
+                    )
+                    .await?
+                };
                 Ok(res.rows_affected > 0)
             }
         }

@@ -111,6 +111,14 @@ pub enum BridgeCommand {
         #[serde(default)]
         mentions: Vec<String>,
     },
+    SendVoice {
+        chat_jid: String,
+        audio_path: String,
+        #[serde(default)]
+        mime: String,
+        #[serde(default)]
+        seconds: u32,
+    },
     SendPresence {
         chat_jid: String,
         state: String,

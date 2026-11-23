@@ -9,6 +9,7 @@ pub mod moderation;
 pub mod owner_chat;
 pub mod safety;
 pub mod util;
+pub mod web_reader;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -25,17 +26,22 @@ use tracing::{error, info, warn};
 
 use crate::alerts::{
     fire_urgent_alert_if_allowed, send_ntfy_http, tick_due_reminders, tick_morning_digest,
-    tick_stale_urgent_intakes, tick_urgent_alerts,
+    tick_promote_followups, tick_stale_urgent_intakes, tick_urgent_alerts,
 };
 use crate::brain::{
     call_llm_http, handle_customer_message, record_owner_read, record_owner_reply,
     HandleMessageResult, HISTORY_MAX,
 };
-use crate::commands::{get_reply_mode, is_self_chat, run_owner_command, take_approved_outbounds};
+use crate::commands::{
+    get_reply_mode, get_self_voice_mode, is_self_chat, run_owner_command,
+    should_reply_with_voice_in_self_chat, take_approved_outbounds,
+};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, Database, DigestItem, PendingReply};
 use crate::ipc::{BridgeCommand, BridgeEvent, GroupSummary};
-use crate::media::{enrich_incoming_media, MediaBudget};
+use crate::media::{
+    enrich_incoming_media, should_send_text_companion, synthesize_voice_note, MediaBudget,
+};
 use crate::moderation::{
     moderate_group_message, CachedRoster, GroupMessageInput, ModerationOutcome, ModerationTracker,
 };
@@ -44,6 +50,7 @@ use crate::safety::{
     redact_secrets, sanitize_display_name, InboundVerdict, LoopGuard, OutboundEchoGuard,
 };
 use crate::util::{number_of_jid, split_bubbles};
+use crate::web_reader::enrich_text_with_web_links;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmActionStatus {
@@ -384,6 +391,8 @@ struct AppContext {
     loop_guard: Arc<LoopGuard>,
     echo_guard: Arc<OutboundEchoGuard>,
     media_budget: Arc<MediaBudget>,
+    tts_budget: Arc<MediaBudget>,
+    web_budget: Arc<MediaBudget>,
     bridge_tx: mpsc::UnboundedSender<BridgeCommand>,
     self_identity: Mutex<(String, Option<String>)>,
     seen_ids: Mutex<(HashSet<String>, VecDeque<String>)>,
@@ -422,6 +431,50 @@ impl AppContext {
         self.send_cmd(BridgeCommand::SendPresence {
             chat_jid: chat_jid.to_string(),
             state: "paused".to_string(),
+        });
+    }
+
+    /// Sends a self-chat reply as a text message, a synthesized PTT voice note, or both (when the
+    /// reply contains long structured details, links, or command IDs). Strictly scoped to self-chat.
+    async fn send_self_chat_reply(&self, chat_jid: &str, reply_text: &str, want_voice: bool) {
+        if reply_text.trim().is_empty() {
+            return;
+        }
+        let today_key = Utc::now().format("%Y-%m-%d").to_string();
+        if want_voice && self.tts_budget.try_consume(self.cfg.max_tts_per_day, &today_key) {
+            match synthesize_voice_note(&self.cfg, reply_text).await {
+                Ok((audio_path, mime, seconds)) => {
+                    self.send_cmd(BridgeCommand::SendVoice {
+                        chat_jid: chat_jid.to_string(),
+                        audio_path: audio_path.to_string_lossy().to_string(),
+                        mime,
+                        seconds,
+                    });
+                    if should_send_text_companion(reply_text) {
+                        self.echo_guard
+                            .record(reply_text, Utc::now().timestamp_millis());
+                        self.send_cmd(BridgeCommand::SendMessage {
+                            chat_jid: chat_jid.to_string(),
+                            text: reply_text.to_string(),
+                            mentions: vec![],
+                        });
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Self-chat TTS voice note fallback to text: {}",
+                        redact_secrets(&e.to_string(), &self.cfg)
+                    );
+                }
+            }
+        }
+        self.echo_guard
+            .record(reply_text, Utc::now().timestamp_millis());
+        self.send_cmd(BridgeCommand::SendMessage {
+            chat_jid: chat_jid.to_string(),
+            text: reply_text.to_string(),
+            mentions: vec![],
         });
     }
 
@@ -757,6 +810,7 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                     if self_input.trim().is_empty() {
                         return Ok(());
                     }
+                    let incoming_was_voice = is_voice || media_kind.as_deref() == Some("audio");
                     let ctx_groups = Arc::clone(&ctx);
                     let reply = run_owner_command(&ctx.db, &ctx.cfg, &self_input, || {
                         let c = Arc::clone(&ctx_groups);
@@ -779,22 +833,34 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                             ctx.send_human_like(&target_jid, "", &msg_text).await;
                         }
                     }
+                    let voice_mode = get_self_voice_mode(&ctx.db)
+                        .await
+                        .unwrap_or_else(|_| "auto".to_string());
+                    let want_voice = should_reply_with_voice_in_self_chat(
+                        &voice_mode,
+                        incoming_was_voice,
+                        &self_input,
+                    );
                     if let Some(reply_text) = reply {
-                        ctx.echo_guard
-                            .record(&reply_text, Utc::now().timestamp_millis());
-                        ctx.send_cmd(BridgeCommand::SendMessage {
-                            chat_jid,
-                            text: reply_text,
-                            mentions: vec![],
-                        });
+                        ctx.send_self_chat_reply(&chat_jid, &reply_text, want_voice)
+                            .await;
                     } else if ctx.cfg.has_ai() {
-                        // Conversational J.A.R.V.I.S. Self-Chat fallback for natural-language requests
+                        // Enrich any shared web/social links before passing to J.A.R.V.I.S. self-chat
+                        let enriched_self_input = enrich_text_with_web_links(
+                            &ctx.cfg,
+                            &ctx.web_budget,
+                            &self_input,
+                            &matched_urls,
+                            2,
+                            false,
+                        )
+                        .await;
                         let cfg_clone = ctx.cfg.clone();
                         let now_ms = Utc::now().timestamp_millis();
                         if let Ok(outcome) = handle_owner_self_chat(
                             &ctx.db,
                             &ctx.cfg,
-                            &self_input,
+                            &enriched_self_input,
                             now_ms,
                             |msgs| async move { call_llm_http(&cfg_clone, &msgs).await },
                         )
@@ -806,13 +872,12 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                                 ctx.send_human_like(&target_jid, "", &msg_text).await;
                             }
                             if !outcome.reply.trim().is_empty() {
-                                ctx.echo_guard
-                                    .record(&outcome.reply, Utc::now().timestamp_millis());
-                                ctx.send_cmd(BridgeCommand::SendMessage {
-                                    chat_jid,
-                                    text: outcome.reply,
-                                    mentions: vec![],
-                                });
+                                ctx.send_self_chat_reply(
+                                    &chat_jid,
+                                    &outcome.reply,
+                                    want_voice || outcome.voice_reply,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -977,8 +1042,8 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                 return Ok(());
             }
 
-            // Enrich voice notes (Cloudflare Whisper) and images/screenshots (Mistral Vision), deleting /tmp file immediately
-            let enriched = enrich_incoming_media(
+            // Enrich voice notes (Groq/Cloudflare Whisper), images/screenshots (Mistral Vision), and shared web/social links
+            let enriched_media = enrich_incoming_media(
                 &ctx.cfg,
                 &ctx.media_budget,
                 &text,
@@ -986,6 +1051,15 @@ async fn handle_bridge_event(ctx: Arc<AppContext>, event: BridgeEvent) -> Result
                 media_kind.as_deref(),
                 media_path.as_deref(),
                 media_mime.as_deref(),
+            )
+            .await;
+            let enriched = enrich_text_with_web_links(
+                &ctx.cfg,
+                &ctx.web_budget,
+                &enriched_media,
+                &matched_urls,
+                1,
+                true,
             )
             .await;
 
@@ -1197,6 +1271,8 @@ async fn main() -> Result<()> {
     let loop_guard = Arc::new(LoopGuard::new());
     let echo_guard = Arc::new(OutboundEchoGuard::new());
     let media_budget = Arc::new(MediaBudget::new());
+    let tts_budget = Arc::new(MediaBudget::new());
+    let web_budget = Arc::new(MediaBudget::new());
     let active_ctx: Arc<Mutex<Option<Arc<AppContext>>>> = Arc::new(Mutex::new(None));
 
     // Periodic Signal session backup so Heroku dyno restarts never lose rotated WhatsApp keys
@@ -1223,6 +1299,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let now_ms = Utc::now().timestamp_millis();
+                let _ = tick_promote_followups(&db_bg, now_ms).await;
                 let cfg_n1 = cfg_bg.clone();
                 let _ = tick_urgent_alerts(&db_bg, &cfg_bg, now_ms, move |title, body| {
                     let c = cfg_n1.clone();
@@ -1377,6 +1454,8 @@ async fn main() -> Result<()> {
             loop_guard: Arc::clone(&loop_guard),
             echo_guard: Arc::clone(&echo_guard),
             media_budget: Arc::clone(&media_budget),
+            tts_budget: Arc::clone(&tts_budget),
+            web_budget: Arc::clone(&web_budget),
             bridge_tx,
             self_identity: Mutex::new((String::new(), None)),
             seen_ids: Mutex::new((HashSet::new(), VecDeque::new())),
@@ -1450,6 +1529,9 @@ mod tests {
             ntfy_token: Some("ntfy_tok_secret_12345".to_string()),
             digest_hour_lagos: 7,
             max_media_per_day: 40,
+            tts_voice: "troy".to_string(),
+            max_tts_per_day: 25,
+            max_web_reads_per_day: 40,
             default_reply_mode: "everyone".to_string(),
             reply_wait_ms: 300_000,
             takeover_pause_ms: 7_200_000,
@@ -3287,5 +3369,349 @@ mod tests {
         // 6) Urgent payment confirmation / deal keywords trigger immediately without casual false positives
         assert!(urgent_trigger("Sent payment confirmation for the deal", false).is_some());
         assert!(urgent_trigger("How much do tutoring classes cost?", false).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_five_new_jarvis_upgrades() {
+        use crate::alerts::{
+            compute_next_recurrence_ms, format_recurrence_badge, parse_reminder_schedule,
+            tick_due_reminders, tick_morning_digest, tick_promote_followups,
+        };
+        use crate::brain::{
+            detect_customer_followup_signal, detect_owner_followup_promise, merge_semantic_facts,
+        };
+        use crate::commands::{get_self_voice_mode, should_reply_with_voice_in_self_chat};
+        use crate::db::memory_token_jaccard;
+        use crate::media::{
+            estimate_speech_seconds, prepare_spoken_script, should_send_text_companion,
+        };
+        use crate::web_reader::{
+            extract_http_urls, format_fxtwitter_json, format_github_repo_json, format_reddit_json,
+            is_public_ip, parse_and_validate_url_syntax, summarize_html_document,
+        };
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+
+        // =========================================================================
+        // 1) Self-Chat Voice Reply Back (TTS Script Prep, Companion Rules & Mode Toggle)
+        // =========================================================================
+        assert_eq!(get_self_voice_mode(&db).await.unwrap(), "auto");
+        assert!(should_reply_with_voice_in_self_chat("auto", true, "What's on my schedule?"));
+        assert!(!should_reply_with_voice_in_self_chat("auto", false, "What's on my schedule?"));
+        assert!(should_reply_with_voice_in_self_chat("auto", false, "Read me my briefing"));
+        assert!(should_reply_with_voice_in_self_chat("on", false, "status"));
+        assert!(!should_reply_with_voice_in_self_chat("off", true, "status"));
+        assert!(should_reply_with_voice_in_self_chat("off", false, "Please reply with voice"));
+
+        let v_on = run_owner_command(&db, &cfg, "voice on", || async { Ok(vec![]) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(v_on.contains("*on*"));
+        assert_eq!(get_self_voice_mode(&db).await.unwrap(), "on");
+
+        let script = prepare_spoken_script(
+            "☀️ *FalkeAI Briefing*\n• Call *Tunde* at https://aurikrex.tech\n━━━\n• Review PR",
+            450,
+        );
+        assert!(!script.contains('*'));
+        assert!(!script.contains("https://"));
+        assert!(script.contains("a link"));
+        assert!(estimate_speech_seconds(&script) >= 2);
+        assert!(should_send_text_companion("Check https://aurikrex.tech for details"));
+        assert!(!should_send_text_companion("All clear, boss — nothing urgent right now."));
+
+        // =========================================================================
+        // 2) Recurring & Clock-Time Reminders (Africa/Lagos UTC+1)
+        // =========================================================================
+        // 2026-11-23 06:00:00 UTC = Monday 2026-11-23 07:00:00 Africa/Lagos
+        let mon_7am_lagos = Utc
+            .with_ymd_and_hms(2026, 11, 23, 6, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+
+        // Clock-time one-off today ("7pm" -> 19:00 Lagos = 18:00 UTC same day)
+        let (due_7pm, rec_7pm) = parse_reminder_schedule("7pm", mon_7am_lagos).unwrap();
+        assert!(rec_7pm.is_none());
+        assert_eq!(
+            due_7pm,
+            Utc.with_ymd_and_hms(2026, 11, 23, 18, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+
+        // "tomorrow 8am" -> Tuesday 2026-11-24 08:00 Lagos = 07:00 UTC
+        let (due_tmrw, rec_tmrw) = parse_reminder_schedule("tomorrow 8am", mon_7am_lagos).unwrap();
+        assert!(rec_tmrw.is_none());
+        assert_eq!(
+            due_tmrw,
+            Utc.with_ymd_and_hms(2026, 11, 24, 7, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+
+        // Recurring "daily 8am" -> Monday 08:00 Lagos (1 hour later) with "daily@08:00"
+        let (due_daily, rec_daily) = parse_reminder_schedule("daily 8am", mon_7am_lagos).unwrap();
+        assert_eq!(rec_daily.as_deref(), Some("daily@08:00"));
+        assert_eq!(
+            due_daily,
+            Utc.with_ymd_and_hms(2026, 11, 23, 7, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+        assert!(format_recurrence_badge(rec_daily.as_deref()).contains("daily 08:00"));
+
+        // Recurring "every mon,wed,fri 6pm"
+        let (due_mwf, rec_mwf) =
+            parse_reminder_schedule("every mon,wed,fri 6pm", mon_7am_lagos).unwrap();
+        assert_eq!(rec_mwf.as_deref(), Some("weekly:mon,wed,fri@18:00"));
+        assert_eq!(
+            due_mwf,
+            Utc.with_ymd_and_hms(2026, 11, 23, 17, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+        // Next occurrence after Monday 6pm is Wednesday 6pm!
+        let next_wed = compute_next_recurrence_ms("weekly:mon,wed,fri@18:00", due_mwf + 60_000).unwrap();
+        assert_eq!(
+            next_wed,
+            Utc.with_ymd_and_hms(2026, 11, 25, 17, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+
+        // When a recurring reminder fires in tick_due_reminders, it reschedules instead of disappearing!
+        let rec_id = db
+            .add_reminder_with_recurrence(
+                due_daily,
+                "Morning Physics review",
+                Some("daily@08:00"),
+                mon_7am_lagos,
+            )
+            .await
+            .unwrap();
+        let fired_msgs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fm_c = Arc::clone(&fired_msgs);
+        let fired_count = tick_due_reminders(&db, due_daily + 1000, move |m| {
+            fm_c.lock().unwrap().push(m);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fired_count, 1);
+        assert!(fired_msgs.lock().unwrap()[0].contains("🔁 (daily 08:00)"));
+        let pending_rems = db.list_pending_reminders(10).await.unwrap();
+        assert_eq!(pending_rems.len(), 1);
+        assert_eq!(pending_rems[0].id, rec_id);
+        assert_eq!(
+            pending_rems[0].due_at,
+            Utc.with_ymd_and_hms(2026, 11, 24, 7, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        );
+        let _ = db.delete_reminder(rec_id).await.unwrap();
+
+        // =========================================================================
+        // 3) Smart Follow-Up Queue Across All Conversations (Approval-First)
+        // =========================================================================
+        // A) Falcon promises in a personal/business DM to get back to someone -> queues `falcon_promised`
+        assert!(detect_owner_followup_promise("Let me check and I'll get back to you", Some("Chidi")).is_some());
+        record_owner_reply::<fn(Vec<ChatTurn>) -> std::future::Ready<Result<String>>, _>(
+            &db,
+            &cfg,
+            "2348022223333",
+            "Let me check my calendar and I'll get back to you tomorrow",
+            &["2348022223333".to_string()],
+            mon_7am_lagos,
+            None,
+        )
+        .await
+        .unwrap();
+        let open_fu = db.list_followups(Some("open"), 10).await.unwrap();
+        assert_eq!(open_fu.len(), 1);
+        assert_eq!(open_fu[0].kind, "falcon_promised");
+        assert_eq!(open_fu[0].status, "watching");
+
+        // B) If the contact replies before the timer expires, the follow-up auto-resolves!
+        let _ = handle_customer_message(
+            &db,
+            &cfg,
+            "2348022223333",
+            "Thanks bro!",
+            &["2348022223333".to_string()],
+            mon_7am_lagos + 60_000,
+            |_| async { Ok(r#"{"reply":"Anytime bro!","flag_human":false}"#.to_string()) },
+        )
+        .await
+        .unwrap();
+        assert!(db.list_followups(Some("open"), 10).await.unwrap().is_empty());
+
+        // C) Customer says "I'll talk to my parents and get back to you" -> queues `waiting_on_them`
+        assert!(detect_customer_followup_signal(
+            "I'll talk to my parents and get back to you",
+            &BookingDraft::default(),
+            Some("Ada")
+        )
+        .is_some());
+        let fu_id = db
+            .upsert_followup(
+                "2348055556666",
+                Some("Ada"),
+                "waiting_on_them",
+                "Ada said she would check with her parents about JAMB Physics tutoring",
+                "Hey Ada, just checking in on the JAMB Physics classes — let me know whenever you're ready!",
+                mon_7am_lagos + 24 * 3_600_000,
+                mon_7am_lagos,
+            )
+            .await
+            .unwrap();
+
+        // After 24h, tick_promote_followups promotes it to `ready` and includes it in the 7:00 AM briefing
+        let tue_7am_lagos = mon_7am_lagos + 24 * 3_600_000 + 5_000;
+        assert_eq!(tick_promote_followups(&db, tue_7am_lagos).await.unwrap(), 1);
+
+        let briefing_msgs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bm_c = Arc::clone(&briefing_msgs);
+        assert!(tick_morning_digest(&db, &cfg, tue_7am_lagos, move |m| {
+            bm_c.lock().unwrap().push(m);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap());
+        assert!(briefing_msgs.lock().unwrap()[0].contains("Smart Follow-Ups Ready for Approval"));
+        assert!(briefing_msgs.lock().unwrap()[0].contains(&format!("send followup {}", fu_id)));
+
+        // Falcon approves via `send followup <id>` -> queues outbound DM & marks `sent`
+        let send_fu_resp = run_owner_command(
+            &db,
+            &cfg,
+            &format!("send followup {}: Hey Ada, any update from your parents?", fu_id),
+            || async { Ok(vec![]) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(send_fu_resp.contains("Sent follow-up"));
+        let outbounds = take_approved_outbounds(&db).await.unwrap();
+        assert_eq!(outbounds.len(), 1);
+        assert_eq!(outbounds[0].0, "2348055556666@s.whatsapp.net");
+        assert!(db.list_followups(Some("open"), 10).await.unwrap().is_empty());
+
+        // =========================================================================
+        // 4) Memory Hygiene & Conflict Resolution
+        // =========================================================================
+        let old_mem_id = db
+            .add_owner_memory_scoped(
+                "schedule",
+                "public",
+                "Falcon's deep work hours are 9am to 12pm on weekdays",
+                "self_chat",
+            )
+            .await
+            .unwrap();
+        let new_mem_id = db
+            .add_owner_memory_scoped(
+                "schedule",
+                "public",
+                "Falcon's deep work hours are 10am to 2pm on weekdays",
+                "self_chat",
+            )
+            .await
+            .unwrap();
+        assert_ne!(old_mem_id, new_mem_id);
+        assert!(
+            memory_token_jaccard(
+                "Falcon's deep work hours are 9am to 12pm on weekdays",
+                "Falcon's deep work hours are 10am to 2pm on weekdays"
+            ) >= 0.68
+        );
+        // Old conflicting schedule fact was automatically superseded!
+        let active_mems = db.list_owner_memory(20).await.unwrap();
+        assert_eq!(active_mems.len(), 1);
+        assert_eq!(active_mems[0].id, new_mem_id);
+        assert!(active_mems[0].content.contains("10am to 2pm"));
+
+        // Contact fact semantic replacement
+        let merged_facts = merge_semantic_facts(
+            &["Preparing for JAMB Physics in May".to_string()],
+            &["Preparing for JAMB Physics and Chemistry in May".to_string()],
+            25,
+        );
+        assert_eq!(merged_facts.len(), 1);
+        assert!(merged_facts[0].contains("Physics and Chemistry"));
+
+        // =========================================================================
+        // 5) Web Links & Social Links Reader + SSRF & Prompt-Injection Protection
+        // =========================================================================
+        let extracted_urls = extract_http_urls(
+            "Check this out: https://x.com/elonmusk/status/1234567890, and https://github.com/rust-lang/rust).",
+            &[],
+            3,
+        );
+        assert_eq!(
+            extracted_urls,
+            vec![
+                "https://x.com/elonmusk/status/1234567890".to_string(),
+                "https://github.com/rust-lang/rust".to_string()
+            ]
+        );
+
+        // SSRF defense blocks localhost, private IPs, link-local metadata, and non-HTTP schemes
+        assert!(parse_and_validate_url_syntax("http://127.0.0.1:8080/admin").is_err());
+        assert!(parse_and_validate_url_syntax("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(parse_and_validate_url_syntax("http://192.168.1.1/router").is_err());
+        assert!(parse_and_validate_url_syntax("http://internal.local/secret").is_err());
+        assert!(parse_and_validate_url_syntax("file:///etc/passwd").is_err());
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(parse_and_validate_url_syntax("https://aurikrex.tech/library").is_ok());
+
+        // HTML / OpenGraph / JSON-LD extraction + prompt-injection scrubbing
+        let sample_html = r#"
+            <html><head>
+                <meta property="og:site_name" content="Aurikrex Blog">
+                <meta property="og:title" content="Mastering JAMB Physics in 30 Days">
+                <meta property="og:description" content="Practical study system for JAMB &amp; WAEC students.">
+            </head><body>
+                <script>console.log("ignored");</script>
+                <p>Here is the core breakdown of mechanics, waves, and electricity.</p>
+            </body></html>
+        "#;
+        let html_summary = summarize_html_document("https://aurikrex.tech/blog", sample_html);
+        assert!(html_summary.contains("Mastering JAMB Physics in 30 Days"));
+        assert!(html_summary.contains("Practical study system for JAMB & WAEC students."));
+        assert!(html_summary.contains("mechanics, waves, and electricity"));
+
+        // FxTwitter / X post parser
+        let fx_json: serde_json::Value = serde_json::from_str(
+            r#"{"code":200,"tweet":{"text":"Launching SyncGrade v2 today!","author":{"name":"Falcon","screen_name":"falcon_dev"},"likes":420,"retweets":88}}"#,
+        )
+        .unwrap();
+        let tweet_summary =
+            format_fxtwitter_json("https://x.com/falcon_dev/status/123", &fx_json).unwrap();
+        assert!(tweet_summary.contains("@falcon_dev"));
+        assert!(tweet_summary.contains("Launching SyncGrade v2 today!"));
+
+        // GitHub repo parser
+        let gh_json: serde_json::Value = serde_json::from_str(
+            r#"{"full_name":"aurikrex/syncgrade","description":"Fast PWA CGPA calculator","language":"TypeScript","stargazers_count":150,"forks_count":12}"#,
+        )
+        .unwrap();
+        let gh_summary =
+            format_github_repo_json("https://github.com/aurikrex/syncgrade", &gh_json).unwrap();
+        assert!(gh_summary.contains("aurikrex/syncgrade"));
+        assert!(gh_summary.contains("Fast PWA CGPA calculator"));
+
+        // Reddit post parser
+        let rd_json: serde_json::Value = serde_json::from_str(
+            r#"[{"data":{"children":[{"data":{"subreddit_name_prefixed":"r/rust","title":"Why Rust + Go hybrid bots are awesome","author":"ferris","score":900,"selftext":"Zero GC pauses and tiny memory footprint."}}]}}]"#,
+        )
+        .unwrap();
+        let rd_summary =
+            format_reddit_json("https://www.reddit.com/r/rust/comments/abc/test", &rd_json).unwrap();
+        assert!(rd_summary.contains("r/rust"));
+        assert!(rd_summary.contains("Why Rust + Go hybrid bots are awesome"));
     }
 }

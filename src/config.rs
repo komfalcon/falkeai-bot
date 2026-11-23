@@ -46,6 +46,9 @@ pub struct Config {
     pub ntfy_token: Option<String>,
     pub digest_hour_lagos: u32,
     pub max_media_per_day: usize,
+    pub tts_voice: String,
+    pub max_tts_per_day: usize,
+    pub max_web_reads_per_day: usize,
     pub default_reply_mode: String,
     pub reply_wait_ms: i64,
     pub takeover_pause_ms: i64,
@@ -422,6 +425,18 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(40);
+        let tts_voice = env::var("TTS_VOICE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "troy".to_string());
+        let max_tts_per_day: usize = env::var("MAX_TTS_PER_DAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25);
+        let max_web_reads_per_day: usize = env::var("MAX_WEB_READS_PER_DAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
 
         let default_reply_mode = match env::var("REPLY_MODE").unwrap_or_default().as_str() {
             "unsaved" => "unsaved".to_string(),
@@ -462,6 +477,9 @@ impl Config {
             ntfy_token,
             digest_hour_lagos,
             max_media_per_day,
+            tts_voice,
+            max_tts_per_day,
+            max_web_reads_per_day,
             default_reply_mode,
             reply_wait_ms: wait_mins.max(0) * 60_000,
             takeover_pause_ms: pause_mins.max(1) * 60_000,
