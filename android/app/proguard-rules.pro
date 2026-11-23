@@ -1,0 +1,4 @@
+-keep class com.k2fsa.sherpa.onnx.** { *; }
+-keep class tech.aurikrex.falkeai.data.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**

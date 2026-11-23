@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FalkeAI</string>
+    <string name="notification_listener_label">FalkeAI Notification &amp; Bank Alert Bridge</string>
+    <string name="accessibility_service_label">FalkeAI Screen Vision, Dictation &amp; Social Search</string>
+    <string name="accessibility_service_description">Optional on-demand helper: allows FalkeAI to silently inspect your current screen when you ask a voice question, dictate text into focused inputs ("Type this"), and read search results inside your logged-in social apps.</string>
+    <string name="tile_lock_in">FalkeAI Lock In</string>
+</resources>

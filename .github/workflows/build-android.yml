@@ -1,0 +1,84 @@
+name: Build FalkeAI Android Companion APK
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "android/**"
+      - ".github/workflows/build-android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Download sherpa-onnx Android AAR (v2.0.3)
+        run: |
+          mkdir -p android/app/libs
+          curl -fL --retry 3 -o android/app/libs/sherpa-onnx.aar \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar"
+          ls -lh android/app/libs/sherpa-onnx.aar
+
+      - name: Download & Bundle Lean 3.3M int8 English KWS Wake-Word Model (~8 MB)
+        run: |
+          mkdir -p android/app/src/main/assets/kws
+          curl -fL --retry 3 -o /tmp/kws-model.tar.bz2 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2"
+          tar -xjf /tmp/kws-model.tar.bz2 -C /tmp
+          MODEL_DIR="/tmp/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+          for part in encoder decoder joiner; do
+            INT8=$(ls "$MODEL_DIR"/${part}*.int8.onnx 2>/dev/null | head -n 1 || true)
+            if [ -n "$INT8" ]; then
+              cp "$INT8" android/app/src/main/assets/kws/
+            else
+              FULL=$(ls "$MODEL_DIR"/${part}*.onnx 2>/dev/null | grep -v '\.int8\.onnx' | head -n 1 || true)
+              cp "$FULL" android/app/src/main/assets/kws/
+            fi
+          done
+          cp "$MODEL_DIR"/tokens.txt android/app/src/main/assets/kws/
+          cp "$MODEL_DIR"/keywords.txt android/app/src/main/assets/kws/
+          ls -lh android/app/src/main/assets/kws/
+
+      - name: Run Kotlin Unit Tests & Assemble Debug APK
+        working-directory: android
+        run: |
+          gradle testDebugUnitTest assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk ../FalkeAI-Companion.apk
+          ls -lh ../FalkeAI-Companion.apk
+
+      - name: Upload FalkeAI-Companion.apk Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FalkeAI-Companion-APK
+          path: FalkeAI-Companion.apk
+          retention-days: 30
+
+      - name: Publish 1-Tap GitHub Release (android-latest)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete android-latest --yes --cleanup-tag || true
+          gh release create android-latest ./FalkeAI-Companion.apk \
+            --title "FalkeAI Android Companion (Latest APK)" \
+            --notes "Automated build of FalkeAI Android Companion (tuned for Infinix Hot 10T / Android 11 XOS 7.6). Lean ~35 MB RAM on-device multi-wake-word engine (sherpa-onnx 3.3M int8 Zipformer), preloaded wake words: Hey Falke, Jarvis, Hey Jarvis, FalkeAI, Buddy you there. Download FalkeAI-Companion.apk directly on your phone and install!"
