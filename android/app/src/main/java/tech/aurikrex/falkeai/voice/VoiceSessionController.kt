@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
@@ -85,6 +87,7 @@ class VoiceSessionController(
     private var activeJob: Job? = null
     private var undoJob: Job? = null
     private var activePlayer: MediaPlayer? = null
+    private var activeFocusRequest: AudioFocusRequest? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
@@ -125,6 +128,36 @@ class VoiceSessionController(
                     null
                 }
 
+                // Feature M: True 0 MB Offline Spoken Voice Mode via on-device SpeechRecognizer + LocalCommandRouter!
+                if ((!isNetworkOnline() || !prefs.isPaired()) && postCallPhone == null) {
+                    _uiState.value = _uiState.value.copy(
+                        state = VoiceState.LISTENING,
+                        statusLine = "Offline voice mode (0 MB data) — speak command…"
+                    )
+                    val offlineSpoken = OfflineSpeechBridge.captureSinglePhrase(context)
+                    if (!offlineSpoken.isNullOrBlank()) {
+                        val cmd = LocalCommandRouter.route(offlineSpoken)
+                        val reply = if (cmd != null) {
+                            actionExecutor.executeLocalCommand(cmd)
+                        } else {
+                            "You're offline. Offline voice supports Calls, SMS, Alarms, Timers, DND, Torch, and Dictation."
+                        }
+                        _uiState.value = _uiState.value.copy(
+                            state = VoiceState.SPEAKING,
+                            lastTranscript = offlineSpoken,
+                            lastReply = reply,
+                            lastActions = listOf("Offline 0MB Voice"),
+                            statusLine = reply
+                        )
+                        speakWithAndroidTts(reply)
+                        _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
+                        return@launch
+                    }
+                    val fallbackMsg = "Offline and couldn't recognize speech — try typing your command below."
+                    _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, lastReply = fallbackMsg, statusLine = fallbackMsg)
+                    return@launch
+                }
+
                 _uiState.value = _uiState.value.copy(
                     state = VoiceState.LISTENING,
                     statusLine = if (postCallPhone != null) "Recording call note for ${postCallName ?: postCallPhone}…" else "Listening… speak naturally",
@@ -163,14 +196,6 @@ class VoiceSessionController(
                 }
 
                 _uiState.value = _uiState.value.copy(state = VoiceState.THINKING, statusLine = "Thinking…")
-
-                if (!isNetworkOnline() || !prefs.isPaired()) {
-                    val offlineMsg = "You're offline. Type a fast command (Call, SMS, Alarm, Timer, DND, Torch) — offline cellular commands work with zero data."
-                    _uiState.value = _uiState.value.copy(state = VoiceState.SPEAKING, lastReply = offlineMsg, statusLine = offlineMsg)
-                    speakWithAndroidTts(offlineMsg)
-                    _uiState.value = _uiState.value.copy(state = VoiceState.IDLE)
-                    return@launch
-                }
 
                 val devCtx = buildLiveDeviceContext(screenText)
                 val audioB64 = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
@@ -323,14 +348,19 @@ class VoiceSessionController(
                     statusLine = "Speaking…"
                 )
 
-                // Play Groq Orpheus WAV (or Cloudflare Aura-1) directly; seamless fallback to Android TTS
-                val playedCloudAudio = if (!resp.ttsAudioBase64.isNullOrBlank()) {
-                    playBase64Audio(resp.ttsAudioBase64, resp.ttsMime ?: "audio/wav")
-                } else {
-                    false
-                }
-                if (!playedCloudAudio && resp.replyText.isNotBlank()) {
-                    speakWithAndroidTts(resp.replyText)
+                // Duck background music (e.g. Spotify) smoothly while FalkeAI speaks!
+                requestDuckingAudioFocus()
+                try {
+                    val playedCloudAudio = if (!resp.ttsAudioBase64.isNullOrBlank()) {
+                        playBase64Audio(resp.ttsAudioBase64, resp.ttsMime ?: "audio/wav")
+                    } else {
+                        false
+                    }
+                    if (!playedCloudAudio && resp.replyText.isNotBlank()) {
+                        speakWithAndroidTts(resp.replyText)
+                    }
+                } finally {
+                    abandonDuckingAudioFocus()
                 }
 
                 // Feature #2: 5-second Auto Follow-Up Window (keep listening briefly without wake word!)
@@ -577,7 +607,28 @@ class VoiceSessionController(
         }
     }
 
+    private fun requestDuckingAudioFocus() {
+        val am = context.getSystemService(AudioManager::class.java) ?: return
+        val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .build()
+        activeFocusRequest = req
+        runCatching { am.requestAudioFocus(req) }
+    }
+
+    private fun abandonDuckingAudioFocus() {
+        val am = context.getSystemService(AudioManager::class.java) ?: return
+        activeFocusRequest?.let { runCatching { am.abandonAudioFocusRequest(it) } }
+        activeFocusRequest = null
+    }
+
     private fun stopAudioPlayback() {
+        abandonDuckingAudioFocus()
         runCatching {
             activePlayer?.stop()
             activePlayer?.release()

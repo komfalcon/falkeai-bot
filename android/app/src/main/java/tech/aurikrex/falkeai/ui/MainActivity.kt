@@ -841,8 +841,11 @@ private fun SetupAndInfinixTab(onPaired: () -> Unit) {
 
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {
+    ) { grantedMap ->
         health = OemSurvivalHelper.inspectHealth(context)
+        if (grantedMap[Manifest.permission.RECORD_AUDIO] == true && app.prefs.wakeWordEnabled) {
+            FalkeWakeWordService.start(context)
+        }
     }
 
     LazyColumn(

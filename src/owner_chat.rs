@@ -220,6 +220,63 @@ pub fn parse_owner_chat_response(raw: &str) -> (String, Vec<Value>) {
     )
 }
 
+/// Deterministic intent firewall against Indirect Prompt Injection:
+/// Inspects ONLY Falcon's own raw utterance (stripping any appended `[Web/Social Link Context...]`
+/// or `[Image attached...]` blocks) to verify Falcon genuinely asked to contact/message/call/draft
+/// someone before executing external communication actions.
+pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
+    let owner_only = raw_text
+        .split("\n\n[Web/Social Link Context")
+        .next()
+        .unwrap_or(raw_text)
+        .split("\n[Image attached")
+        .next()
+        .unwrap_or(raw_text);
+    let lower = format!(" {} ", owner_only.to_lowercase());
+    const INTENT_VERBS: &[&str] = &[
+        " send ",
+        " tell ",
+        " reply",
+        " respond",
+        " message",
+        " msg ",
+        " text ",
+        " sms",
+        " dm ",
+        " whatsapp",
+        " call ",
+        " dial ",
+        " phone ",
+        " ring ",
+        " reach ",
+        " contact ",
+        " draft",
+        " compose",
+        " write ",
+        " email to",
+        " mail to",
+        " schedule",
+        " approve",
+        " followup",
+        " follow-up",
+        " follow up",
+        " let him",
+        " let her",
+        " let them",
+        " inform ",
+        " notify ",
+        " say ",
+        " ping ",
+    ];
+    INTENT_VERBS.iter().any(|kw| lower.contains(kw))
+}
+
+/// Blocks shortcodes (< 7 digits, e.g. premium SMS billing codes or emergency numbers) from automated dialing/SMS.
+pub fn is_safe_dial_or_sms_number(raw: &str) -> bool {
+    let digits_count = raw.chars().filter(|c| c.is_ascii_digit()).count();
+    (7..=15).contains(&digits_count)
+}
+
 /// Sanitizes external DM snippets before embedding them into J.A.R.V.I.S.'s privileged self-chat prompt
 /// so an attacker cannot smuggle an indirect prompt injection (e.g. fake `"actions"` JSON) via a DM preview.
 fn sanitize_preview_for_owner_prompt(text: &str, max_chars: usize) -> String {
@@ -711,18 +768,36 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
     let local_gmail_cache = GmailTokenCache::new();
     let eff_gmail_cache = gmail_cache.unwrap_or(&local_gmail_cache);
 
+    let comms_allowed = owner_intent_allows_outbound_comms(text);
+
     for act in actions.iter().take(8) {
         let kind = act["type"].as_str().unwrap_or("").trim().to_lowercase();
         if DEVICE_ACTION_TYPES.contains(&kind.as_str()) {
+            if matches!(kind.as_str(), "call_contact" | "send_sms" | "notification_reply")
+                && !comms_allowed
+            {
+                action_notes.push(format!("Blocked unrequested outbound action ({})", kind));
+                continue;
+            }
             let mut normalized_act = act.clone();
             // Resolve saved phone number on server side if target name was given for call_contact / send_sms
             if matches!(kind.as_str(), "call_contact" | "send_sms") {
                 if let Some(target_str) = act["target"].as_str().filter(|s| !s.trim().is_empty()) {
                     if let Ok(Some(num)) = resolve_contact_target(db, target_str).await {
+                        if !is_safe_dial_or_sms_number(&num) {
+                            action_notes.push(format!("Blocked unsafe number ({})", num));
+                            continue;
+                        }
                         if let Some(obj) = normalized_act.as_object_mut() {
                             obj.entry("phone".to_string())
                                 .or_insert_with(|| json!(format!("+{}", num)));
                         }
+                    }
+                }
+                if let Some(explicit_phone) = normalized_act["phone"].as_str() {
+                    if !explicit_phone.trim().is_empty() && !is_safe_dial_or_sms_number(explicit_phone) {
+                        action_notes.push("Blocked shortcode / invalid phone number".to_string());
+                        continue;
                     }
                 }
             }
@@ -732,6 +807,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
         }
         match kind.as_str() {
             "send_dm" | "send_message" | "dm" | "message" | "reply" => {
+                if !comms_allowed {
+                    action_notes.push("Blocked unrequested send_dm".to_string());
+                    continue;
+                }
                 let target = act["target"]
                     .as_str()
                     .or_else(|| act["to"].as_str())
@@ -789,6 +868,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                 }
             }
             "send_followup" | "approve_followup" => {
+                if !comms_allowed {
+                    action_notes.push("Blocked unrequested send_followup".to_string());
+                    continue;
+                }
                 if let Some(fid) = act["id"].as_i64() {
                     if let Some(f) = db.get_followup_by_id(fid).await? {
                         let custom = act["message"]
@@ -1018,6 +1101,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                     reply_text = digest;
                 }
                 "schedule_message" => {
+                    if !comms_allowed {
+                        action_notes.push("Blocked unrequested schedule_message".to_string());
+                        continue;
+                    }
                     let target = act["target"].as_str().unwrap_or("").trim();
                     let channel = act["channel"].as_str().unwrap_or("whatsapp").trim();
                     let sched = act["schedule"].as_str().unwrap_or("").trim();
@@ -1027,6 +1114,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                             parse_reminder_schedule(sched, now_ms),
                             resolve_contact_target(db, target).await?,
                         ) {
+                            if !is_safe_dial_or_sms_number(&num) {
+                                action_notes.push("Blocked unsafe scheduled number".to_string());
+                                continue;
+                            }
                             let id = db
                                 .add_scheduled_message(
                                     &num,
@@ -1066,6 +1157,10 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                     }
                 }
                 "create_gmail_draft" => {
+                    if !comms_allowed {
+                        action_notes.push("Blocked unrequested create_gmail_draft".to_string());
+                        continue;
+                    }
                     let to = act["to"].as_str().unwrap_or("").trim();
                     let subject = act["subject"].as_str().unwrap_or("Re: Follow-up").trim();
                     let body = act["body"].as_str().unwrap_or("").trim();

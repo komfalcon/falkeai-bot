@@ -312,9 +312,9 @@ pub fn format_github_json(v: &Value, kind: &str) -> String {
                 .iter()
                 .take(8)
                 .map(|n| {
-                    let repo = n["repository"]["full_name"].as_str().unwrap_or("repo");
-                    let title = n["subject"]["title"].as_str().unwrap_or("(no title)");
-                    let reason = n["reason"].as_str().unwrap_or("update");
+                    let repo = sanitize_search_field(n["repository"]["full_name"].as_str().unwrap_or("repo"), 80);
+                    let title = sanitize_search_field(n["subject"]["title"].as_str().unwrap_or("(no title)"), 140);
+                    let reason = sanitize_search_field(n["reason"].as_str().unwrap_or("update"), 40);
                     format!("• [{}] ({}) {}", repo, reason, title)
                 })
                 .collect();
@@ -331,16 +331,22 @@ pub fn format_github_json(v: &Value, kind: &str) -> String {
                 .iter()
                 .take(6)
                 .map(|item| {
-                    let name = item["full_name"]
-                        .as_str()
-                        .or_else(|| item["title"].as_str())
-                        .unwrap_or("item");
-                    let desc = item["description"]
-                        .as_str()
-                        .or_else(|| item["state"].as_str())
-                        .unwrap_or("");
+                    let name = sanitize_search_field(
+                        item["full_name"]
+                            .as_str()
+                            .or_else(|| item["title"].as_str())
+                            .unwrap_or("item"),
+                        100,
+                    );
+                    let desc = sanitize_search_field(
+                        item["description"]
+                            .as_str()
+                            .or_else(|| item["state"].as_str())
+                            .unwrap_or(""),
+                        140,
+                    );
                     let url = item["html_url"].as_str().unwrap_or("");
-                    format!("• {} — {} ({})", name, desc.chars().take(120).collect::<String>(), url)
+                    format!("• {} — {} ({})", name, desc, url)
                 })
                 .collect();
             format!("GitHub Results ({}):\n{}", arr.len(), lines.join("\n"))

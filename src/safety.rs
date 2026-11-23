@@ -5,10 +5,51 @@
 //! - Outbound: redact secrets, system-prompt leaks and third-party phone numbers.
 //! - Anti-spam: duplicate payloads, inbound loops, auto-reply bursts, outbound echoes.
 
+use sha2::{Digest, Sha256};
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+
+/// Generates 32 cryptographically strong random bytes with zero external crates:
+/// combines `/dev/urandom` (on Linux/Heroku) with multiple OS-CSPRNG-seeded `RandomState`
+/// instances (`BCryptGenRandom` on Windows, `getrandom` syscall on Linux), high-resolution
+/// timestamps, stack addresses, and a monotonic counter through SHA-256.
+pub fn os_csprng_32_bytes() -> [u8; 32] {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut urandom_buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut urandom_buf);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"falkeai-csprng-v2:");
+    hasher.update(urandom_buf);
+    hasher.update(seq.to_le_bytes());
+    let stack_addr = (&urandom_buf as *const [u8; 32]) as usize as u64;
+    hasher.update(stack_addr.to_le_bytes());
+    if let Ok(dur) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        hasher.update(dur.as_nanos().to_le_bytes());
+    }
+    // Each RandomState::new() pulls fresh 128-bit entropy straight from the OS CSPRNG!
+    for round in 0..8u64 {
+        let rs = RandomState::new();
+        let mut h = rs.build_hasher();
+        h.write_u64(round ^ seq);
+        hasher.update(h.finish().to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
 
 /// Falcon's own public numbers (allowed to appear in replies).
 const OWNER_PUBLIC_NUMBERS: [&str; 2] = ["2349113683395", "09113683395"];
@@ -296,6 +337,9 @@ fn looks_like_secret_token(word: &str) -> bool {
     let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.');
     if w.starts_with("eyJ") && w.len() >= 24 {
         return true; // JWT (Turso tokens)
+    }
+    if w.starts_with("fkd_") || w.starts_with("FALKE-") {
+        return w.len() >= 10;
     }
     if w.starts_with("hf_")
         || w.starts_with("sk-")

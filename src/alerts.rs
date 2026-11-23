@@ -1022,9 +1022,25 @@ where
     NWFut: Future<Output = Result<()>>,
 {
     let due = db.list_due_scheduled_messages(now_ms).await?;
+    if due.is_empty() {
+        return Ok(0);
+    }
+    let has_paired_phone = !db.list_active_phone_devices().await?.is_empty();
     let mut sent = 0usize;
     for msg in due {
         if msg.channel == "sms" {
+            if !has_paired_phone {
+                db.update_scheduled_message_status(msg.id, "failed", now_ms)
+                    .await?;
+                let _ = notify_wa(format!(
+                    "⚠️ Scheduled SMS #{} to {} (+{}) could not be sent because no Android phone is paired yet (`pair android`).",
+                    msg.id,
+                    msg.contact_name.as_deref().unwrap_or("Contact"),
+                    msg.target
+                ))
+                .await;
+                continue;
+            }
             send_sms_to_phone(
                 "send_sms".to_string(),
                 json!({

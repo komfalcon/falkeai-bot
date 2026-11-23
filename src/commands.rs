@@ -171,24 +171,29 @@ pub fn should_reply_with_voice_in_self_chat(
     }
 }
 
-/// Generates a single-use 5-minute pairing code (`FALKE-XXXXXX`) for the Kotlin Android Companion app.
+/// Generates a single-use 5-minute pairing code (`FALKE-XXXX-XXXX`, 40-bit OS CSPRNG entropy)
+/// for the Kotlin Android Companion app.
 pub async fn generate_android_pair_code(
     db: &Database,
     cfg: &Config,
     now_ms: i64,
 ) -> Result<(String, i64)> {
-    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(now_ms * 1_000_000);
+    let rand_bytes = crate::safety::os_csprng_32_bytes();
     let mut hasher = Sha256::new();
-    hasher.update(nanos.to_le_bytes());
+    hasher.update(rand_bytes);
     hasher.update(cfg.phone_bridge_secret.as_bytes());
     hasher.update(cfg.pair_phone.as_bytes());
     let digest = hasher.finalize();
     const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-    let mut suffix = String::with_capacity(6);
-    for &b in digest.iter().take(6) {
-        suffix.push(ALPHABET[(b as usize) % ALPHABET.len()] as char);
+    let mut p1 = String::with_capacity(4);
+    let mut p2 = String::with_capacity(4);
+    for &b in digest.iter().take(4) {
+        p1.push(ALPHABET[(b as usize) % ALPHABET.len()] as char);
     }
-    let code = format!("FALKE-{}", suffix);
+    for &b in digest.iter().skip(4).take(4) {
+        p2.push(ALPHABET[(b as usize) % ALPHABET.len()] as char);
+    }
+    let code = format!("FALKE-{}-{}", p1, p2);
     let expires_at = now_ms + 5 * 60_000;
     let payload = json!({
         "code": code,
@@ -438,7 +443,13 @@ where
             },
         ));
     }
-    if lower.starts_with("schedule ") {
+    if lower == "schedule" {
+        return Ok(Some(
+            "⚠️ Usage: `schedule tomorrow 9am -> Chidi: Bring Physics notes` or `schedule sms 7pm -> 08012345678: On my way`"
+                .to_string(),
+        ));
+    }
+    if lower.starts_with("schedule ") && raw.contains("->") {
         let rest_raw = raw["schedule ".len()..].trim();
         let (channel, body) = if let Some(after_sms) = rest_raw
             .strip_prefix("sms ")

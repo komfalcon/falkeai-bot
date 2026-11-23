@@ -79,6 +79,27 @@ class SecurePrefs(context: Context) {
 
     fun isPaired(): Boolean = serverUrl.isNotBlank() && deviceToken.isNotBlank()
 
+    @Synchronized
+    fun hasProcessedSmsEvent(eventId: Long): Boolean {
+        if (eventId <= 0L) return false
+        val raw = prefs.getString(KEY_PROCESSED_SMS_IDS, "") ?: ""
+        return raw.split(',').any { it.toLongOrNull() == eventId }
+    }
+
+    @Synchronized
+    fun markSmsEventProcessed(eventId: Long) {
+        if (eventId <= 0L) return
+        val existing = (prefs.getString(KEY_PROCESSED_SMS_IDS, "") ?: "")
+            .split(',')
+            .mapNotNull { it.toLongOrNull() }
+            .toMutableList()
+        if (!existing.contains(eventId)) {
+            existing.add(eventId)
+            val trimmed = existing.takeLast(100).joinToString(",")
+            prefs.edit().putString(KEY_PROCESSED_SMS_IDS, trimmed).apply()
+        }
+    }
+
     fun clearPairing() {
         prefs.edit()
             .remove(KEY_DEVICE_TOKEN)
@@ -105,5 +126,6 @@ class SecurePrefs(context: Context) {
         private const val KEY_BILINGUAL_MODE = "bilingual_mode"
         private const val KEY_CONFIRM_UNKNOWN = "confirm_unknown"
         private const val KEY_WAKE_WORDS = "wake_words_json"
+        private const val KEY_PROCESSED_SMS_IDS = "processed_sms_ids"
     }
 }

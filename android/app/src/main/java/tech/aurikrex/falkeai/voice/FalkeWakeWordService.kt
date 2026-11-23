@@ -38,7 +38,11 @@ class FalkeWakeWordService : Service() {
         super.onCreate()
         activeInstance = this
         NotificationChannels.ensureAll(this)
-        startMicForeground("Listening for Hey Falke, Jarvis, Buddy you there…")
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startMicForeground("Listening for Hey Falke, Jarvis, Buddy you there…")
+        } else {
+            stopSelf()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,6 +98,7 @@ class FalkeWakeWordService : Service() {
         val launch = Intent(this, FalkeAssistActivity::class.java).apply {
             putExtra(FalkeAssistActivity.EXTRA_WAKE_WORD, keyword)
             putExtra(FalkeAssistActivity.EXTRA_AUTO_LISTEN, true)
+            putExtra(FalkeAssistActivity.EXTRA_INTERNAL_TOKEN, FalkeApplication.instance.internalLaunchToken)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         runCatching { startActivity(launch) }
@@ -147,6 +152,10 @@ class FalkeWakeWordService : Service() {
         val running: StateFlow<Boolean> = _running
 
         fun start(context: Context) {
+            // Prevent Android 14/15 SecurityException on FOREGROUND_SERVICE_TYPE_MICROPHONE before mic permission is granted
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
             val intent = Intent(context, FalkeWakeWordService::class.java)
             runCatching { ContextCompat.startForegroundService(context, intent) }
         }

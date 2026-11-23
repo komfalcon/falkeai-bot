@@ -6,8 +6,12 @@ import tech.aurikrex.falkeai.data.FalkeDatabase
 import tech.aurikrex.falkeai.data.SecurePrefs
 import tech.aurikrex.falkeai.monitors.FalkeWatchdogWorker
 import tech.aurikrex.falkeai.voice.VoiceSessionController
+import java.util.UUID
 
 class FalkeApplication : Application() {
+    /** Per-process token preventing third-party apps from spoofing exported FalkeAssistActivity extras. */
+    val internalLaunchToken: String = UUID.randomUUID().toString()
+
     lateinit var prefs: SecurePrefs
         private set
     lateinit var db: FalkeDatabase

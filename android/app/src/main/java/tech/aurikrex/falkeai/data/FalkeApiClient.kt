@@ -45,7 +45,7 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
     private fun baseUrl(): String {
         val raw = prefs.serverUrl.trim().trimEnd('/')
         if (raw.isEmpty()) throw IllegalStateException("Server URL not configured")
-        return if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
+        return normalizeHttpsUrl(raw)
     }
 
     private fun authedBuilder(path: String): Request.Builder {
@@ -60,9 +60,7 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
     suspend fun pair(serverBaseUrl: String, pairCode: String, deviceName: String): Result<PairResponse> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val normalized = serverBaseUrl.trim().trimEnd('/').let {
-                    if (it.startsWith("http://") || it.startsWith("https://")) it else "https://$it"
-                }
+                val normalized = normalizeHttpsUrl(serverBaseUrl)
                 val body = json.encodeToString(PairRequest(pairCode.trim(), deviceName.trim()))
                     .toRequestBody(mediaJson)
                 val req = Request.Builder()
@@ -79,6 +77,9 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
                     prefs.serverUrl = normalized
                     prefs.deviceToken = parsed.deviceToken
                     prefs.deviceName = parsed.deviceName.ifBlank { deviceName }
+                    if (parsed.latestEventId > prefs.lastEventId) {
+                        prefs.lastEventId = parsed.latestEventId
+                    }
                     parsed
                 }
             }
@@ -206,5 +207,29 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
 
     fun markSseDisconnected() {
         _sseConnected.value = false
+    }
+
+    companion object {
+        /**
+         * Strictly upgrades `http://` -> `https://` for all remote hosts so Bearer device tokens
+         * can NEVER be leaked in cleartext over Wi-Fi / cellular networks.
+         */
+        fun normalizeHttpsUrl(rawUrl: String): String {
+            val trimmed = rawUrl.trim().trimEnd('/')
+            require(trimmed.isNotEmpty()) { "Server URL cannot be empty" }
+            if (trimmed.startsWith("https://", ignoreCase = true)) {
+                return "https://" + trimmed.substring(8)
+            }
+            if (trimmed.startsWith("http://", ignoreCase = true)) {
+                val rest = trimmed.substring(7)
+                val host = rest.substringBefore('/').substringBefore(':').lowercase()
+                return if (host == "127.0.0.1" || host == "localhost" || host == "10.0.2.2") {
+                    "http://$rest"
+                } else {
+                    "https://$rest"
+                }
+            }
+            return "https://$trimmed"
+        }
     }
 }

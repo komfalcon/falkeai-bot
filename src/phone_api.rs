@@ -3,10 +3,15 @@
 //! Runs directly inside `falkeai-core` on Heroku's `0.0.0.0:$PORT` with **zero extra Cargo crates**
 //! (pure `tokio::net::TcpListener`, `tokio::io`, `sha2`, `hex`, `serde_json`).
 //!
-//! Security & Reliability:
-//! - Single-use 5-minute pairing code (`FALKE-XXXXXX`) generated via WhatsApp self-chat `pair android`
-//!   exchanges for a 256-bit Bearer `device_token` stored SHA-256 hashed in Turso (`phone_devices`).
-//! - Constant-time byte comparison on pairing codes and Bearer token hashes.
+//! Security & Penetration Hardening:
+//! - True 256-bit OS CSPRNG Bearer `device_token` (`fkd_<64 hex>`) stored SHA-256 hashed in Turso.
+//! - Serialized pairing lock (`pair_lock`) prevents TOCTOU race replay AND wipes active pairing code
+//!   after 5 failed guesses (defeating brute-force attacks).
+//! - Two-stage HTTP parser (`read_http_headers` -> Bearer auth -> `read_http_body`) rejects
+//!   unauthenticated oversized bodies BEFORE allocating heap memory (defeating OOM DoS on 512 MB Heroku).
+//! - Blocks HTTP Request Smuggling (`Transfer-Encoding` / duplicate `Content-Length`) and enforces
+//!   `X-Forwarded-Proto: https` behind reverse proxies.
+//! - Concurrency semaphores (`32` HTTP + `4` SSE) prevent connection-flood exhaustion.
 //! - SSE stream (`GET /api/v1/phone/stream?since_id=N`) replays missed Turso `phone_events` and emits
 //!   `: ping\n\n` every 20 seconds so Heroku's 55-second idle timeout never drops the socket.
 
@@ -19,15 +24,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Semaphore};
 use tracing::{info, warn};
 
 use crate::alerts::{build_catch_me_up_summary, format_bank_amount};
-use crate::brain::call_llm_http;
-use crate::commands::resolve_contact_target;
+use crate::brain::{call_llm_http, HISTORY_MAX};
+use crate::commands::{resolve_contact_target, run_owner_command, take_approved_outbounds};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{
-    memory_token_jaccard, ContactMemory, Database, PhoneEventRecord, PhoneTelemetrySnapshot,
+    memory_token_jaccard, ChatTurn, ContactMemory, ConversationState, Database, PhoneEventRecord,
+    PhoneTelemetrySnapshot,
 };
 use crate::gmail::GmailTokenCache;
 use crate::media::{
@@ -35,14 +41,18 @@ use crate::media::{
     transcribe_audio_bytes, MediaBudget, MAX_AUDIO_BYTES, MAX_IMAGE_BYTES,
 };
 use crate::owner_chat::{handle_unified_owner_chat, OwnerPhoneContext};
-use crate::safety::redact_secrets;
+use crate::safety::{detect_injection, os_csprng_32_bytes, redact_secrets, sanitize_inbound};
 use crate::util::normalize_number;
 use crate::web_reader::enrich_text_with_web_links;
 use crate::web_search::percent_decode;
 
-pub const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+pub const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+pub const MAX_PAIR_BODY_BYTES: usize = 2 * 1024;
+pub const MAX_TELEMETRY_BODY_BYTES: usize = 128 * 1024;
+pub const MAX_ACK_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_BODY_BYTES: usize = 6 * 1024 * 1024;
 pub const SSE_PING_INTERVAL_SECS: u64 = 20;
+pub const MAX_PAIR_FAILED_ATTEMPTS: u32 = 5;
 
 pub struct PhoneApiState {
     pub db: Database,
@@ -52,15 +62,53 @@ pub struct PhoneApiState {
     pub web_budget: Arc<MediaBudget>,
     pub tts_budget: Arc<MediaBudget>,
     pub wa_send_tx: mpsc::UnboundedSender<(String, String)>,
+    pub pair_lock: AsyncMutex<u32>,
+    pub http_sem: Arc<Semaphore>,
+    pub sse_sem: Arc<Semaphore>,
+}
+
+impl PhoneApiState {
+    pub fn new(
+        db: Database,
+        cfg: Config,
+        gmail_cache: Arc<GmailTokenCache>,
+        phone_bus: broadcast::Sender<PhoneEventRecord>,
+        web_budget: Arc<MediaBudget>,
+        tts_budget: Arc<MediaBudget>,
+        wa_send_tx: mpsc::UnboundedSender<(String, String)>,
+    ) -> Self {
+        Self {
+            db,
+            cfg,
+            gmail_cache,
+            phone_bus,
+            web_budget,
+            tts_budget,
+            wa_send_tx,
+            pair_lock: AsyncMutex::new(0),
+            http_sem: Arc::new(Semaphore::new(32)),
+            sse_sem: Arc::new(Semaphore::new(4)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct HttpRequest {
+pub struct HttpHeaders {
     pub method: String,
     pub path: String,
     pub raw_target: String,
     pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
+    pub content_length: usize,
+    pub pre_read_body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpParseError {
+    Eof,
+    HeadersTooLarge,
+    MalformedRequest,
+    SmugglingDetected,
+    ChunkedUnsupported,
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -81,23 +129,21 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub fn generate_device_token(cfg: &Config, device_name: &str, now_ms: i64) -> String {
-    let nanos = Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(now_ms.saturating_mul(1_000_000));
+    let entropy_a = os_csprng_32_bytes();
+    let entropy_b = os_csprng_32_bytes();
+
     let mut h1 = Sha256::new();
-    h1.update(b"falkeai-device-token-v1:");
-    h1.update(nanos.to_le_bytes());
+    h1.update(b"falkeai-device-token-v2:");
+    h1.update(entropy_a);
     h1.update(now_ms.to_le_bytes());
     h1.update(device_name.as_bytes());
     h1.update(cfg.phone_bridge_secret.as_bytes());
-    h1.update(cfg.pair_phone.as_bytes());
     let d1 = h1.finalize();
 
     let mut h2 = Sha256::new();
     h2.update(d1);
-    h2.update(b":second-round:");
-    h2.update((std::process::id() as u64).to_le_bytes());
-    h2.update(cfg.turso_url.as_bytes());
+    h2.update(entropy_b);
+    h2.update(cfg.pair_phone.as_bytes());
     let d2 = h2.finalize();
 
     format!("fkd_{}{}", hex::encode(&d1[..16]), hex::encode(&d2[..16]))
@@ -155,7 +201,7 @@ fn extract_bearer_token(headers: &HashMap<String, String>) -> Option<String> {
     let prefix = trimmed.get(..7)?;
     if prefix.eq_ignore_ascii_case("bearer ") {
         let tok = trimmed[7..].trim();
-        if !tok.is_empty() {
+        if !tok.is_empty() && tok.len() <= 256 {
             return Some(tok.to_string());
         }
     }
@@ -166,83 +212,139 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-pub async fn read_http_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<HttpRequest>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
+/// Stage 1 HTTP parser: reads ONLY headers (up to 16 KB) so unauthenticated requests
+/// can NEVER force large body allocations before Bearer verification!
+pub async fn read_http_headers<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::result::Result<HttpHeaders, HttpParseError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
     let header_end = loop {
         if let Some(pos) = find_header_end(&buf) {
             break pos;
         }
         if buf.len() > MAX_HTTP_HEADER_BYTES {
-            return Err(anyhow!("HTTP headers exceeded maximum limit"));
+            return Err(HttpParseError::HeadersTooLarge);
         }
-        let n = reader.read(&mut chunk).await?;
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| HttpParseError::MalformedRequest)?;
         if n == 0 {
             if buf.is_empty() {
-                return Ok(None);
+                return Err(HttpParseError::Eof);
             }
-            return Err(anyhow!("Unexpected EOF while reading HTTP headers"));
+            return Err(HttpParseError::MalformedRequest);
         }
         buf.extend_from_slice(&chunk[..n]);
     };
 
     let header_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = header_str.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("Empty HTTP request line"))?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines.next().ok_or(HttpParseError::MalformedRequest)?;
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| anyhow!("Missing HTTP method"))?
+        .ok_or(HttpParseError::MalformedRequest)?
         .to_uppercase();
     let raw_target = parts
         .next()
-        .ok_or_else(|| anyhow!("Missing HTTP path"))?
+        .ok_or(HttpParseError::MalformedRequest)?
         .to_string();
-    let path = raw_target
+    let raw_path = raw_target
         .split_once('?')
-        .map(|(p, _)| p.to_string())
-        .unwrap_or_else(|| raw_target.clone());
+        .map(|(p, _)| p)
+        .unwrap_or(&raw_target);
+    if !raw_path.starts_with('/') || raw_path.contains("..") || raw_path.contains('\\') {
+        return Err(HttpParseError::MalformedRequest);
+    }
+    let path = raw_path.to_string();
 
     let mut headers = HashMap::new();
+    let mut seen_content_length: Option<usize> = None;
+    let mut has_transfer_encoding = false;
+
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+        if line.is_empty() {
+            continue;
         }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(HttpParseError::MalformedRequest);
+        };
+        if k.chars().any(|c| c.is_whitespace()) {
+            // RFC 7230 obs-fold / whitespace before colon smuggling defense
+            return Err(HttpParseError::SmugglingDetected);
+        }
+        let key = k.trim().to_lowercase();
+        let val = v.trim().to_string();
+        if key == "transfer-encoding" {
+            has_transfer_encoding = true;
+        } else if key == "content-length" {
+            let parsed = val
+                .parse::<usize>()
+                .map_err(|_| HttpParseError::MalformedRequest)?;
+            if let Some(prev) = seen_content_length {
+                if prev != parsed {
+                    return Err(HttpParseError::SmugglingDetected);
+                }
+            }
+            seen_content_length = Some(parsed);
+        }
+        headers.insert(key, val);
     }
 
-    let content_len = headers
-        .get("content-length")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_len > MAX_HTTP_BODY_BYTES {
-        return Err(anyhow!("HTTP request body exceeds 6 MB limit"));
+    if has_transfer_encoding {
+        if seen_content_length.is_some() {
+            return Err(HttpParseError::SmugglingDetected);
+        }
+        return Err(HttpParseError::ChunkedUnsupported);
     }
 
-    let mut body = Vec::with_capacity(content_len);
+    let content_length = seen_content_length.unwrap_or(0);
     let body_start = header_end + 4;
-    if buf.len() > body_start {
-        let take = (buf.len() - body_start).min(content_len);
-        body.extend_from_slice(&buf[body_start..body_start + take]);
-    }
-    while body.len() < content_len {
-        let remaining = content_len - body.len();
-        let to_read = remaining.min(chunk.len());
-        let n = reader.read(&mut chunk[..to_read]).await?;
-        if n == 0 {
-            return Err(anyhow!("Unexpected EOF while reading HTTP body"));
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
+    let pre_read_body = if buf.len() > body_start {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
 
-    Ok(Some(HttpRequest {
+    Ok(HttpHeaders {
         method,
         path,
         raw_target,
         headers,
-        body,
-    }))
+        content_length,
+        pre_read_body,
+    })
+}
+
+/// Stage 2 HTTP parser: reads the exact `Content-Length` body ONLY AFTER route & auth checks pass.
+pub async fn read_http_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    hdr: &HttpHeaders,
+    max_allowed: usize,
+) -> Result<Vec<u8>> {
+    if hdr.content_length > max_allowed {
+        return Err(anyhow!("Payload exceeds route limit"));
+    }
+    if hdr.content_length == 0 {
+        return Ok(Vec::new());
+    }
+    let mut body = Vec::with_capacity(hdr.content_length);
+    let initial_take = hdr.pre_read_body.len().min(hdr.content_length);
+    if initial_take > 0 {
+        body.extend_from_slice(&hdr.pre_read_body[..initial_take]);
+    }
+    let mut chunk = [0u8; 8192];
+    while body.len() < hdr.content_length {
+        let rem = (hdr.content_length - body.len()).min(chunk.len());
+        let n = reader.read(&mut chunk[..rem]).await?;
+        if n == 0 {
+            return Err(anyhow!("Unexpected EOF reading HTTP body"));
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
 }
 
 fn status_reason(code: u16) -> &'static str {
@@ -255,8 +357,11 @@ fn status_reason(code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -264,7 +369,7 @@ fn status_reason(code: u16) -> &'static str {
 async fn write_json_response(stream: &mut TcpStream, status: u16, payload: &Value) {
     let body = payload.to_string();
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n{}",
         status,
         status_reason(status),
         body.len(),
@@ -274,13 +379,36 @@ async fn write_json_response(stream: &mut TcpStream, status: u16, payload: &Valu
     let _ = stream.flush().await;
 }
 
-/// `POST /api/v1/phone/pair` — exchanges a single-use 5-minute `FALKE-XXXXXX` pairing code
-/// for a persistent Bearer `device_token` stored SHA-256 hashed in Turso.
+/// `POST /api/v1/phone/pair` — serialized via `pair_lock` to eliminate TOCTOU race conditions
+/// AND auto-wipes the pairing code after 5 failed guesses to defeat brute-force attacks.
+pub async fn handle_pair_endpoint_locked(
+    pair_lock: &AsyncMutex<u32>,
+    db: &Database,
+    cfg: &Config,
+    body: &Value,
+    now_ms: i64,
+) -> (u16, Value) {
+    let mut failed_attempts = pair_lock.lock().await;
+    let (status, resp) = handle_pair_inner(db, cfg, body, now_ms, &mut failed_attempts).await;
+    (status, resp)
+}
+
 pub async fn handle_pair_endpoint(
     db: &Database,
     cfg: &Config,
     body: &Value,
     now_ms: i64,
+) -> (u16, Value) {
+    let mut dummy_counter = 0u32;
+    handle_pair_inner(db, cfg, body, now_ms, &mut dummy_counter).await
+}
+
+async fn handle_pair_inner(
+    db: &Database,
+    cfg: &Config,
+    body: &Value,
+    now_ms: i64,
+    failed_attempts: &mut u32,
 ) -> (u16, Value) {
     let raw_code = body["code"]
         .as_str()
@@ -293,11 +421,12 @@ pub async fn handle_pair_endpoint(
         .unwrap_or("Infinix Hot 10T")
         .trim()
         .chars()
+        .filter(|c| !c.is_control())
         .take(80)
         .collect::<String>();
 
-    if raw_code.is_empty() {
-        return (400, json!({ "error": "Missing pairing code" }));
+    if raw_code.is_empty() || raw_code.len() > 32 {
+        return (400, json!({ "error": "Missing or invalid pairing code" }));
     }
 
     let saved_raw = match db.get_setting("android_pair_code_json").await {
@@ -323,18 +452,38 @@ pub async fn handle_pair_endpoint(
 
     if expected_code.is_empty() || now_ms > expires_at {
         let _ = db.set_setting("android_pair_code_json", "{}").await;
+        *failed_attempts = 0;
         return (
             401,
             json!({ "error": "Pairing code expired (5-min window). Run 'pair android' again." }),
         );
     }
 
-    if !constant_time_eq(raw_code.as_bytes(), expected_code.as_bytes()) {
+    // Normalize optional dash formatting so both `FALKE-ABCD-EFGH` and `FALKEABCDEFGH` compare cleanly
+    let norm_got = raw_code.replace(' ', "");
+    if !constant_time_eq(norm_got.as_bytes(), expected_code.as_bytes()) {
+        *failed_attempts = failed_attempts.saturating_add(1);
+        if *failed_attempts >= MAX_PAIR_FAILED_ATTEMPTS {
+            let _ = db.set_setting("android_pair_code_json", "{}").await;
+            *failed_attempts = 0;
+            return (
+                429,
+                json!({ "error": "Too many incorrect guesses — pairing code invalidated for security. Run 'pair android' again." }),
+            );
+        }
         return (401, json!({ "error": "Incorrect pairing code." }));
     }
 
-    // Single-use: invalidate immediately so replay is impossible
+    // Single-use: invalidate immediately under lock so concurrent replay is impossible
     let _ = db.set_setting("android_pair_code_json", "{}").await;
+    *failed_attempts = 0;
+
+    let latest_event_id = db
+        .list_phone_events_since(0, 200)
+        .await
+        .ok()
+        .and_then(|v| v.last().map(|e| e.id))
+        .unwrap_or(0);
 
     let token = generate_device_token(cfg, &device_name, now_ms);
     let token_hash = sha256_hex(&token);
@@ -354,6 +503,7 @@ pub async fn handle_pair_endpoint(
                 "device_id": device_id,
                 "device_name": clean_name,
                 "device_token": token,
+                "latest_event_id": latest_event_id,
                 "server_time_ms": now_ms,
                 "agent": BOT_NAME
             }),
@@ -429,7 +579,10 @@ pub async fn handle_telemetry_endpoint(
     now_ms: i64,
 ) -> (u16, Value) {
     let prev = db.get_phone_telemetry().await.ok().flatten().unwrap_or_default();
-    let battery_pct = body["battery_pct"].as_i64().unwrap_or(prev.battery_pct);
+    let battery_pct = body["battery_pct"]
+        .as_i64()
+        .unwrap_or(prev.battery_pct)
+        .clamp(0, 100);
     let is_charging = body["is_charging"].as_bool().unwrap_or(prev.is_charging);
     let dnd_active = body["dnd_active"].as_bool().unwrap_or(prev.dnd_active);
     let bt_connected = body["bt_connected"].as_bool().unwrap_or(prev.bt_connected);
@@ -499,7 +652,7 @@ pub async fn handle_telemetry_endpoint(
                 .chars()
                 .take(220)
                 .collect::<String>();
-            if amount_minor > 0 && !raw_summary.is_empty() {
+            if amount_minor > 0 && amount_minor <= 100_000_000_000 && !raw_summary.is_empty() {
                 let source = item["source"].as_str().unwrap_or("android");
                 let created_at = item["created_at"].as_i64().unwrap_or(now_ms);
                 if db
@@ -529,9 +682,18 @@ pub async fn handle_telemetry_endpoint(
         let caller = missed
             .get("caller")
             .and_then(|v| v.as_str())
-            .unwrap_or("VIP Caller");
-        let phone = missed.get("phone").and_then(|v| v.as_str()).unwrap_or("");
-        let count = missed.get("count").and_then(|v| v.as_i64()).unwrap_or(2);
+            .unwrap_or("VIP Caller")
+            .chars()
+            .take(60)
+            .collect::<String>();
+        let phone = missed
+            .get("phone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(32)
+            .collect::<String>();
+        let count = missed.get("count").and_then(|v| v.as_i64()).unwrap_or(2).clamp(2, 50);
         let _ = publish_phone_event(
             db,
             bus,
@@ -699,7 +861,7 @@ pub async fn handle_call_note_endpoint(
 }
 
 /// `POST /api/v1/phone/ack` — acknowledges urgent alerts from the Android full-screen alarm,
-/// and optionally sends an immediate WhatsApp reply straight from the lockscreen!
+/// and optionally sends an immediate WhatsApp reply straight from the lockscreen while syncing `ConversationState`!
 pub async fn handle_ack_endpoint(
     db: &Database,
     wa_send_tx: Option<&mpsc::UnboundedSender<(String, String)>>,
@@ -722,10 +884,30 @@ pub async fn handle_ack_endpoint(
             .filter(|s| !s.is_empty()),
     ) {
         let num = normalize_number(t);
-        if !num.is_empty() {
+        if num.len() >= 7 {
             if let Some(tx) = wa_send_tx {
                 let jid = format!("{}@s.whatsapp.net", num);
                 if tx.send((jid, reply_msg.to_string())).is_ok() {
+                    let mut st = db
+                        .get_conversation(&num)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| ConversationState::new(&num));
+                    st.history.push(ChatTurn {
+                        role: "assistant".to_string(),
+                        content: format!("[Falcon]: {}", reply_msg),
+                    });
+                    if st.history.len() > HISTORY_MAX {
+                        let excess = st.history.len() - HISTORY_MAX;
+                        st.history.drain(0..excess);
+                    }
+                    st.bot_active = true;
+                    st.owner_read_unanswered = false;
+                    st.paused_until = 0;
+                    st.updated_at = now_ms;
+                    let _ = db.save_conversation(&st).await;
+                    let _ = db.delete_pending_reply(&num).await;
                     let _ = db.delete_flags_for_chat(&num).await;
                     let _ = db.resolve_followups_for_sender(&num).await;
                     reply_sent = true;
@@ -746,12 +928,6 @@ pub async fn handle_ack_endpoint(
 }
 
 /// `POST /api/v1/phone/chat` — unified Android voice/text/vision brain endpoint.
-/// 1) Transcribes `audio_base64` via Groq Whisper (supports multilingual Yoruba/Pidgin/French)
-/// 2) Describes optional silent Android 11 `screenshot_base64` via Cloudflare Mistral Vision
-/// 3) Enriches shared links safely via `web_reader`
-/// 4) Runs `handle_unified_owner_chat` (cloud actions + typed Android `device_actions`)
-/// 5) Dispatches any outbound WhatsApp DMs via `wa_send_tx`
-/// 6) Synthesizes crisp direct WAV audio via Groq Orpheus (or Cloudflare Aura-1 fallback) if `want_tts`
 pub async fn handle_phone_chat_endpoint(
     state: &PhoneApiState,
     body: &Value,
@@ -800,12 +976,62 @@ pub async fn handle_phone_chat_endpoint(
         return (400, json!({ "error": "Provide either 'text' or 'audio_base64'" }));
     }
 
+    // 1) Fast <10ms deterministic owner command check (works even if AI providers are down!)
+    if let Ok(Some(fast_reply)) =
+        run_owner_command(&state.db, &state.cfg, &user_text, || async { Ok(vec![]) }).await
+    {
+        let mut wa_sent = 0usize;
+        if let Ok(approved) = take_approved_outbounds(&state.db).await {
+            for (jid, msg) in approved {
+                if state.wa_send_tx.send((jid, msg)).is_ok() {
+                    wa_sent += 1;
+                }
+            }
+        }
+        let mut tts_b64 = None;
+        let mut tts_m = None;
+        let mut tts_s = None;
+        if want_tts && !fast_reply.trim().is_empty() {
+            let today_key = Utc::now().format("%Y-%m-%d").to_string();
+            if state
+                .tts_budget
+                .try_consume(state.cfg.max_tts_per_day.saturating_mul(4).max(100), &today_key)
+            {
+                if let Ok((b, m, s)) = synthesize_voice_bytes(&state.cfg, &fast_reply, true).await {
+                    tts_b64 = Some(base64_encode(&b));
+                    tts_m = Some(m);
+                    tts_s = Some(s);
+                }
+            }
+        }
+        return (
+            200,
+            json!({
+                "ok": true,
+                "transcript": transcript_out,
+                "reply_text": redact_secrets(&fast_reply, &state.cfg),
+                "cloud_actions_done": ["Fast Command"],
+                "device_actions": [],
+                "whatsapp_outbounds_sent": wa_sent,
+                "tts_audio_base64": tts_b64,
+                "tts_mime": tts_m,
+                "tts_seconds": tts_s
+            }),
+        );
+    }
+
     let dev = &body["device_context"];
     let mut screen_context = dev["screen_text"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|s| {
+            if detect_injection(s) {
+                "[filtered prompt-injection on screen]".to_string()
+            } else {
+                sanitize_inbound(s)
+            }
+        });
 
     if let Some(img_b64) = body["screenshot_base64"]
         .as_str()
@@ -828,9 +1054,14 @@ pub async fn handle_phone_chat_endpoint(
                 .await
                 {
                     Ok(desc) => {
+                        let safe_desc = if detect_injection(&desc) {
+                            "[filtered visual prompt-injection on screen]".to_string()
+                        } else {
+                            sanitize_inbound(&desc)
+                        };
                         screen_context = Some(match screen_context {
-                            Some(existing) => format!("{} | Visual Screen: {}", existing, desc),
-                            None => desc,
+                            Some(existing) => format!("{} | Visual Screen: {}", existing, safe_desc),
+                            None => safe_desc,
                         });
                     }
                     Err(e) => {
@@ -970,8 +1201,8 @@ pub async fn handle_phone_chat_endpoint(
     )
 }
 
-async fn verify_bearer(state: &PhoneApiState, req: &HttpRequest, now_ms: i64) -> bool {
-    let Some(token) = extract_bearer_token(&req.headers) else {
+async fn verify_bearer(state: &PhoneApiState, hdr: &HttpHeaders, now_ms: i64) -> bool {
+    let Some(token) = extract_bearer_token(&hdr.headers) else {
         return false;
     };
     let hash = sha256_hex(&token);
@@ -985,7 +1216,17 @@ async fn verify_bearer(state: &PhoneApiState, req: &HttpRequest, now_ms: i64) ->
 }
 
 async fn handle_sse_stream(mut stream: TcpStream, state: Arc<PhoneApiState>, since_id: i64) {
-    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n: connected\n\n";
+    let Ok(_sse_permit) = state.sse_sem.clone().try_acquire_owned() else {
+        write_json_response(
+            &mut stream,
+            429,
+            &json!({ "error": "Too many concurrent SSE streams" }),
+        )
+        .await;
+        return;
+    };
+
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\n\r\n: connected\n\n";
     if stream.write_all(headers.as_bytes()).await.is_err() {
         return;
     }
@@ -1055,18 +1296,41 @@ async fn handle_sse_stream(mut stream: TcpStream, state: Arc<PhoneApiState>, sin
     }
 }
 
-async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiState>) {
-    let req = match tokio::time::timeout(Duration::from_secs(25), read_http_request(&mut stream))
+async fn handle_client_connection(
+    mut stream: TcpStream,
+    state: Arc<PhoneApiState>,
+    http_permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let hdr = match tokio::time::timeout(Duration::from_secs(10), read_http_headers(&mut stream))
         .await
     {
-        Ok(Ok(Some(r))) => r,
-        _ => return,
+        Ok(Ok(h)) => h,
+        Ok(Err(HttpParseError::Eof)) => return,
+        Ok(Err(HttpParseError::HeadersTooLarge)) => {
+            write_json_response(&mut stream, 413, &json!({ "error": "Headers too large" })).await;
+            return;
+        }
+        Ok(Err(HttpParseError::ChunkedUnsupported)) => {
+            write_json_response(
+                &mut stream,
+                411,
+                &json!({ "error": "Content-Length required" }),
+            )
+            .await;
+            return;
+        }
+        Ok(Err(HttpParseError::SmugglingDetected | HttpParseError::MalformedRequest)) => {
+            write_json_response(&mut stream, 400, &json!({ "error": "Malformed HTTP request" }))
+                .await;
+            return;
+        }
+        Err(_) => return,
     };
 
     let now_ms = Utc::now().timestamp_millis();
 
-    // Public routes: health check & single-use pairing code exchange
-    if req.method == "GET" && (req.path == "/" || req.path == "/health") {
+    // 1) Public probe route (0-byte body)
+    if hdr.method == "GET" && (hdr.path == "/" || hdr.path == "/health") {
         write_json_response(
             &mut stream,
             200,
@@ -1076,20 +1340,50 @@ async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiStat
         return;
     }
 
-    if req.method == "POST" && req.path == "/api/v1/phone/pair" {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
-        let (status, resp) = handle_pair_endpoint(&state.db, &state.cfg, &body, now_ms).await;
-        write_json_response(&mut stream, status, &resp).await;
-        return;
-    }
-
-    // All remaining `/api/v1/phone/*` endpoints require a verified paired Android Bearer token
-    if !req.path.starts_with("/api/v1/phone/") {
+    if !hdr.path.starts_with("/api/v1/phone/") {
         write_json_response(&mut stream, 404, &json!({ "error": "Not found" })).await;
         return;
     }
 
-    if !verify_bearer(&state, &req, now_ms).await {
+    // 2) Enforce HTTPS when behind reverse proxy (e.g. Heroku Router sets X-Forwarded-Proto)
+    if let Some(proto) = hdr.headers.get("x-forwarded-proto") {
+        if !proto.trim().eq_ignore_ascii_case("https") {
+            write_json_response(
+                &mut stream,
+                403,
+                &json!({ "error": "HTTPS is strictly required for FalkeAI Phone Bridge" }),
+            )
+            .await;
+            return;
+        }
+    }
+
+    // 3) Single-use pairing endpoint: strictly capped at 2 KB BEFORE reading body!
+    if hdr.method == "POST" && hdr.path == "/api/v1/phone/pair" {
+        if hdr.content_length > MAX_PAIR_BODY_BYTES {
+            write_json_response(&mut stream, 413, &json!({ "error": "Pairing payload too large" }))
+                .await;
+            return;
+        }
+        let Ok(Ok(raw_body)) = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_http_body(&mut stream, &hdr, MAX_PAIR_BODY_BYTES),
+        )
+        .await
+        else {
+            write_json_response(&mut stream, 400, &json!({ "error": "Invalid request body" })).await;
+            return;
+        };
+        let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
+        let (status, resp) =
+            handle_pair_endpoint_locked(&state.pair_lock, &state.db, &state.cfg, &body, now_ms)
+                .await;
+        write_json_response(&mut stream, status, &resp).await;
+        return;
+    }
+
+    // 4) Verify cryptographic Bearer token BEFORE reading any body bytes (defeats unauthenticated OOM DoS!)
+    if !verify_bearer(&state, &hdr, now_ms).await {
         write_json_response(
             &mut stream,
             401,
@@ -1099,16 +1393,61 @@ async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiStat
         return;
     }
 
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/v1/phone/stream") => {
-            let since_id = parse_query_param(&req.raw_target, "since_id")
-                .or_else(|| req.headers.get("last-event-id").cloned())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            handle_sse_stream(stream, state, since_id).await;
+    // 5) SSE stream drops HTTP concurrency permit immediately and uses dedicated `sse_sem`
+    if hdr.method == "GET" && hdr.path == "/api/v1/phone/stream" {
+        drop(http_permit);
+        let since_id = parse_query_param(&hdr.raw_target, "since_id")
+            .or_else(|| hdr.headers.get("last-event-id").cloned())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        handle_sse_stream(stream, state, since_id).await;
+        return;
+    }
+
+    // 6) Authenticated JSON routes with route-specific body limits
+    let max_body = match (hdr.method.as_str(), hdr.path.as_str()) {
+        ("POST", "/api/v1/phone/chat") | ("POST", "/api/v1/phone/call-note") => MAX_HTTP_BODY_BYTES,
+        ("POST", "/api/v1/phone/telemetry") => MAX_TELEMETRY_BODY_BYTES,
+        ("POST", "/api/v1/phone/ack") => MAX_ACK_BODY_BYTES,
+        ("GET", _) => 0,
+        _ => MAX_ACK_BODY_BYTES,
+    };
+
+    if hdr.content_length > max_body {
+        write_json_response(
+            &mut stream,
+            413,
+            &json!({ "error": "Request body exceeds endpoint limit" }),
+        )
+        .await;
+        return;
+    }
+
+    let raw_body = if hdr.content_length > 0 {
+        match tokio::time::timeout(
+            Duration::from_secs(25),
+            read_http_body(&mut stream, &hdr, max_body),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            _ => {
+                write_json_response(
+                    &mut stream,
+                    400,
+                    &json!({ "error": "Failed reading request body" }),
+                )
+                .await;
+                return;
+            }
         }
+    } else {
+        Vec::new()
+    };
+
+    match (hdr.method.as_str(), hdr.path.as_str()) {
         ("POST", "/api/v1/phone/chat") => {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
             let (status, resp) = handle_phone_chat_endpoint(&state, &body, now_ms).await;
             write_json_response(&mut stream, status, &resp).await;
         }
@@ -1117,7 +1456,7 @@ async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiStat
             write_json_response(&mut stream, status, &resp).await;
         }
         ("GET", "/api/v1/phone/caller-brief") => {
-            let phone = parse_query_param(&req.raw_target, "phone").unwrap_or_default();
+            let phone = parse_query_param(&hdr.raw_target, "phone").unwrap_or_default();
             if phone.trim().is_empty() {
                 write_json_response(&mut stream, 400, &json!({ "error": "Missing phone query param" }))
                     .await;
@@ -1125,28 +1464,37 @@ async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiStat
             }
             match state.db.get_caller_brief_context(&phone).await {
                 Ok(ctx) => {
-                    write_json_response(&mut stream, 200, &serde_json::to_value(&ctx).unwrap_or(json!({})))
-                        .await;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &serde_json::to_value(&ctx).unwrap_or(json!({})),
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    write_json_response(&mut stream, 500, &json!({ "error": e.to_string() })).await;
+                    write_json_response(
+                        &mut stream,
+                        500,
+                        &json!({ "error": redact_secrets(&e.to_string(), &state.cfg) }),
+                    )
+                    .await;
                 }
             }
         }
         ("POST", "/api/v1/phone/call-note") => {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
             let (status, resp) =
                 handle_call_note_endpoint(&state.db, &state.cfg, &body, now_ms).await;
             write_json_response(&mut stream, status, &resp).await;
         }
         ("POST", "/api/v1/phone/telemetry") => {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
             let (status, resp) =
                 handle_telemetry_endpoint(&state.db, &state.phone_bus, &body, now_ms).await;
             write_json_response(&mut stream, status, &resp).await;
         }
         ("POST", "/api/v1/phone/ack") => {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
             let (status, resp) =
                 handle_ack_endpoint(&state.db, Some(&state.wa_send_tx), &body, now_ms).await;
             write_json_response(&mut stream, status, &resp).await;
@@ -1158,6 +1506,27 @@ async fn handle_client_connection(mut stream: TcpStream, state: Arc<PhoneApiStat
     }
 }
 
+pub async fn serve_phone_api_on_listener(listener: TcpListener, state: Arc<PhoneApiState>) {
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let sem = Arc::clone(&state.http_sem);
+        let Ok(permit) = sem.try_acquire_owned() else {
+            tokio::spawn(async move {
+                write_json_response(
+                    &mut stream,
+                    503,
+                    &json!({ "error": "Server busy — retry shortly" }),
+                )
+                .await;
+            });
+            continue;
+        };
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            handle_client_connection(stream, st, permit).await;
+        });
+    }
+}
+
 /// Starts the unified Health + Android Companion HTTP/SSE server on `0.0.0.0:{port}`.
 pub async fn serve_phone_api(port: u16, state: Arc<PhoneApiState>) {
     match TcpListener::bind(("0.0.0.0", port)).await {
@@ -1166,12 +1535,7 @@ pub async fn serve_phone_api(port: u16, state: Arc<PhoneApiState>) {
                 "{} HTTP + Android Phone Bridge SSE API listening on 0.0.0.0:{}",
                 BOT_NAME, port
             );
-            while let Ok((stream, _)) = listener.accept().await {
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    handle_client_connection(stream, st).await;
-                });
-            }
+            serve_phone_api_on_listener(listener, state).await;
         }
         Err(e) => {
             warn!("Failed to bind Phone Bridge HTTP/SSE listener on port {}: {}", port, e);

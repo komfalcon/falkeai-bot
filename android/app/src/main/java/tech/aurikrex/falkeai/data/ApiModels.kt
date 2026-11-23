@@ -16,6 +16,7 @@ data class PairResponse(
     @SerialName("device_id") val deviceId: Long = 0,
     @SerialName("device_name") val deviceName: String = "",
     @SerialName("device_token") val deviceToken: String = "",
+    @SerialName("latest_event_id") val latestEventId: Long = 0,
     @SerialName("server_time_ms") val serverTimeMs: Long = 0,
     val error: String? = null
 )

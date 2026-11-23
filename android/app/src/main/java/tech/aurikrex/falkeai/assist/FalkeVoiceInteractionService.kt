@@ -25,6 +25,7 @@ class FalkeVoiceInteractionSession(context: Context) : VoiceInteractionSession(c
         val intent = Intent(context, FalkeAssistActivity::class.java).apply {
             putExtra(FalkeAssistActivity.EXTRA_AUTO_LISTEN, true)
             putExtra(FalkeAssistActivity.EXTRA_CAPTURE_SCREEN, true)
+            putExtra(FalkeAssistActivity.EXTRA_INTERNAL_TOKEN, tech.aurikrex.falkeai.FalkeApplication.instance.internalLaunchToken)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         runCatching { context.startActivity(intent) }

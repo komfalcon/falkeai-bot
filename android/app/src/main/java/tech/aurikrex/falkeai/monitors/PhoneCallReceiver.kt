@@ -112,6 +112,7 @@ class PhoneCallReceiver : BroadcastReceiver() {
         val noteIntent = Intent(context, FalkeAssistActivity::class.java).apply {
             putExtra(FalkeAssistActivity.EXTRA_CALL_NOTE_PHONE, phone)
             putExtra(FalkeAssistActivity.EXTRA_CALL_NOTE_NAME, name.ifBlank { phone })
+            putExtra(FalkeAssistActivity.EXTRA_INTERNAL_TOKEN, FalkeApplication.instance.internalLaunchToken)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         val pi = PendingIntent.getActivity(

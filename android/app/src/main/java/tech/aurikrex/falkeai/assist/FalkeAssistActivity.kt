@@ -1,5 +1,6 @@
 package tech.aurikrex.falkeai.assist
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -52,12 +53,18 @@ class FalkeAssistActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val controller = FalkeApplication.instance.voiceController
-        val autoListen = intent.getBooleanExtra(EXTRA_AUTO_LISTEN, true)
-        val captureScreen = intent.getBooleanExtra(EXTRA_CAPTURE_SCREEN, false)
-        val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD)
-        val callNotePhone = intent.getStringExtra(EXTRA_CALL_NOTE_PHONE)
-        val callNoteName = intent.getStringExtra(EXTRA_CALL_NOTE_NAME)
+        val app = FalkeApplication.instance
+        val controller = app.voiceController
+        val isTrustedSystemAssist = intent?.action == Intent.ACTION_ASSIST ||
+            intent?.action == Intent.ACTION_VOICE_COMMAND
+        val isTrustedInternal = intent?.getStringExtra(EXTRA_INTERNAL_TOKEN) == app.internalLaunchToken
+        val trustedLaunch = isTrustedSystemAssist || isTrustedInternal
+
+        val autoListen = trustedLaunch && intent.getBooleanExtra(EXTRA_AUTO_LISTEN, true)
+        val captureScreen = trustedLaunch && (isTrustedSystemAssist || intent.getBooleanExtra(EXTRA_CAPTURE_SCREEN, false))
+        val wakeWord = if (trustedLaunch) intent.getStringExtra(EXTRA_WAKE_WORD) else null
+        val callNotePhone = if (isTrustedInternal) intent.getStringExtra(EXTRA_CALL_NOTE_PHONE) else null
+        val callNoteName = if (isTrustedInternal) intent.getStringExtra(EXTRA_CALL_NOTE_NAME) else null
 
         if (autoListen || callNotePhone != null) {
             controller.startVoiceTurn(
@@ -226,5 +233,6 @@ class FalkeAssistActivity : ComponentActivity() {
         const val EXTRA_CAPTURE_SCREEN = "capture_screen"
         const val EXTRA_CALL_NOTE_PHONE = "call_note_phone"
         const val EXTRA_CALL_NOTE_NAME = "call_note_name"
+        const val EXTRA_INTERNAL_TOKEN = "internal_launch_token"
     }
 }

@@ -30,6 +30,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import okhttp3.sse.EventSource
 import tech.aurikrex.falkeai.FalkeApplication
 import tech.aurikrex.falkeai.NotificationChannels
@@ -135,10 +136,10 @@ class FalkeBridgeService : Service() {
         reconnectJob?.cancel()
         eventSource?.cancel()
         eventSource = app.api.openSseStream(
-            onEvent = { _, type, data ->
+            onEvent = { eventId, type, data ->
                 backoffMs = 2_000L
                 updateNotification("Connected • Listening for urgent alarms & commands")
-                handleIncomingServerEvent(type, data)
+                handleIncomingServerEvent(eventId, type, data)
             },
             onDisconnected = {
                 updateNotification("Reconnecting to FalkeAI…")
@@ -159,7 +160,7 @@ class FalkeBridgeService : Service() {
         }
     }
 
-    private fun handleIncomingServerEvent(type: String, rawJson: String) {
+    private fun handleIncomingServerEvent(eventId: Long, type: String, rawJson: String) {
         val obj = runCatching { json.parseToJsonElement(rawJson).jsonObject }.getOrNull() ?: return
         fun field(vararg keys: String): String {
             for (k in keys) {
@@ -168,9 +169,12 @@ class FalkeBridgeService : Service() {
             }
             return ""
         }
+        val eventAtMs = obj["at"]?.jsonPrimitive?.longOrNull ?: 0L
+        val isStale = eventAtMs > 0L && (System.currentTimeMillis() - eventAtMs) > 30 * 60_000L
 
         when (type.lowercase()) {
             "urgent_alarm" -> {
+                if (isStale) return
                 val source = field("source").ifBlank { "whatsapp" }
                 val sender = field("sender", "phone")
                 val who = field("contact_name", "sender").ifBlank { "Urgent Contact" }
@@ -179,15 +183,19 @@ class FalkeBridgeService : Service() {
                 fireFullScreenUrgentAlarm(title, subject, source, sender)
             }
             "find_phone" -> {
+                if (isStale) return
                 PhoneMediaExecutor.triggerFindMyPhoneSiren(this, durationSeconds = 15)
                 FalkeApplication.instance.voiceController.speakQuickAnnouncement(
                     field("message").ifBlank { "I'm right here, boss!" }
                 )
             }
             "send_sms" -> {
+                val prefs = FalkeApplication.instance.prefs
+                if (prefs.hasProcessedSmsEvent(eventId)) return
                 val phone = field("phone", "target")
                 val msg = field("message")
-                if (phone.isNotBlank() && msg.isNotBlank()) {
+                if (phone.isNotBlank() && msg.isNotBlank() && PhoneMediaExecutor.isSafeDialOrSmsNumber(phone)) {
+                    prefs.markSmsEventProcessed(eventId)
                     PhoneMediaExecutor.sendSmsNow(this, phone, msg, confirmUnknownNumbers = false)
                 }
             }

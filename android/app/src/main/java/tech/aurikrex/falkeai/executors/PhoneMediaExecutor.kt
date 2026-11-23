@@ -52,6 +52,12 @@ object PhoneMediaExecutor {
         }
     }
 
+    /** Blocks shortcodes (< 7 digits, e.g. premium billing codes) from automated dialing/SMS. */
+    fun isSafeDialOrSmsNumber(raw: String): Boolean {
+        val digits = raw.count { it.isDigit() }
+        return digits in 7..15
+    }
+
     fun resolveContact(context: Context, queryOrPhone: String): ResolvedContact? {
         val q = queryOrPhone.trim()
         if (q.isEmpty()) return null
@@ -109,6 +115,9 @@ object PhoneMediaExecutor {
     ): String {
         val resolved = resolveContact(context, targetOrPhone)
             ?: return "Couldn't find \"$targetOrPhone\" in your phone contacts."
+        if (!isSafeDialOrSmsNumber(resolved.phoneNumber)) {
+            return "Blocked unsafe / shortcode number: ${resolved.phoneNumber}."
+        }
         val hasCallPerm = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.CALL_PHONE
@@ -133,6 +142,9 @@ object PhoneMediaExecutor {
     ): String {
         val resolved = resolveContact(context, phoneOrTarget)
             ?: return "Couldn't find \"$phoneOrTarget\" to text."
+        if (!isSafeDialOrSmsNumber(resolved.phoneNumber)) {
+            return "Blocked unsafe / shortcode SMS number: ${resolved.phoneNumber}."
+        }
         val hasSmsPerm = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.SEND_SMS
