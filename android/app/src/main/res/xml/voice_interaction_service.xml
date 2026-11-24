@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:recognitionService="tech.aurikrex.falkeai.assist.FalkeRecognitionService"
     android:sessionService="tech.aurikrex.falkeai.assist.FalkeVoiceInteractionSessionService"
+    android:settingsActivity="tech.aurikrex.falkeai.ui.MainActivity"
     android:supportsAssist="true"
     android:supportsLaunchVoiceAssistFromKeyguard="true"
     android:supportsLocalInteraction="true" />
