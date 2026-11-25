@@ -4668,4 +4668,96 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_parser_hardening_gmail_profiles_and_flag_dismiss() {
+        use crate::alerts::build_catch_me_up_summary;
+        use crate::brain::parse_llm_payload;
+        use crate::config::GmailAccountConfig;
+        use crate::db::FlagRecord;
+        use crate::gmail::{resolve_gmail_account_profiles, select_gmail_account_with_cache};
+        use crate::phone_api::handle_ack_endpoint;
+
+        // 1) `<think>` tags + markdown fence + trailing comma JSON must parse cleanly without failing
+        let raw_think = "<think>Check schema { \"reply\": \"draft\" }</think>\n```json\n{\"reply\": \"Got it, Falcon!\", \"flag_human\": false,}\n```";
+        let p1 = parse_llm_payload(raw_think).expect("Should parse think+fence+trailing-comma JSON");
+        assert_eq!(p1.reply.as_deref(), Some("Got it, Falcon!"));
+        assert!(!p1.flag_human);
+
+        // 2) Truncated JSON string still salvages reply cleanly
+        let raw_trunc = "{\"reply\": \"On it right now — checking your calendar";
+        let p2 = parse_llm_payload(raw_trunc).expect("Should salvage truncated reply");
+        assert_eq!(
+            p2.reply.as_deref(),
+            Some("On it right now — checking your calendar")
+        );
+
+        // 3) Cached Gmail profile discovery + selecting account by discovered real email address
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let mut cfg = test_cfg();
+        cfg.gmail_accounts = vec![
+            GmailAccountConfig {
+                label: "Primary Gmail".to_string(),
+                refresh_token: "1//tok_alpha".to_string(),
+            },
+            GmailAccountConfig {
+                label: "Gmail #2".to_string(),
+                refresh_token: "1//tok_beta".to_string(),
+            },
+        ];
+        let now_ms = Utc::now().timestamp_millis();
+        let cache = GmailTokenCache::new();
+        cache.put_cached_profile_for_token(
+            "1//tok_alpha",
+            Some("falcon.personal@gmail.com".to_string()),
+            "connected",
+            None,
+            3_600_000,
+            now_ms,
+        );
+        cache.put_cached_profile_for_token(
+            "1//tok_beta",
+            Some("aurikrexacademy@gmail.com".to_string()),
+            "connected",
+            None,
+            3_600_000,
+            now_ms,
+        );
+
+        let profiles = resolve_gmail_account_profiles(&db, &cfg, &cache, false).await;
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].email.as_deref(), Some("falcon.personal@gmail.com"));
+        assert_eq!(profiles[1].email.as_deref(), Some("aurikrexacademy@gmail.com"));
+        assert_eq!(
+            select_gmail_account_with_cache(&cfg.gmail_accounts, Some(&cache), Some("aurikrexacademy@gmail.com"))
+                .unwrap()
+                .refresh_token,
+            "1//tok_beta"
+        );
+
+        // 4) Stale parse flag displays friendly text in Catch-Up & dismisses cleanly via /api/v1/phone/ack
+        db.insert_flag(&FlagRecord {
+            timestamp: "2026-11-25T20:00:00Z".to_string(),
+            chat: "2348011122233".to_string(),
+            name: Some("Tunde".to_string()),
+            reason: "Agent could not parse AI response - needs Falcon".to_string(),
+            last_message: "Hello".to_string(),
+        })
+        .await
+        .unwrap();
+        let summary = build_catch_me_up_summary(&db, now_ms).await.unwrap();
+        assert!(!summary.to_lowercase().contains("could not parse"));
+        assert!(summary.contains("Needs your quick reply"));
+
+        let (st, resp) = handle_ack_endpoint(
+            &db,
+            None,
+            &json!({"dismiss_flag": "2348011122233"}),
+            now_ms,
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(resp["flags_dismissed"].as_u64(), Some(1));
+        assert_eq!(db.count_flags().await.unwrap(), 0);
+    }
 }

@@ -1124,12 +1124,19 @@ pub async fn build_catch_me_up_summary(db: &Database, now_ms: i64) -> Result<Str
     }
     if !flags.is_empty() {
         parts.push(format!(
-            "WhatsApp chats needing your approval ({}): {}",
+            "WhatsApp chats needing your review ({}): {}",
             flags.len(),
             flags
                 .iter()
                 .take(3)
-                .map(|f| format!("{}: {}", f.name.as_deref().unwrap_or(&f.chat), f.reason))
+                .map(|f| {
+                    let clean_reason = if f.reason.to_lowercase().contains("could not parse") {
+                        "Needs your quick reply"
+                    } else {
+                        f.reason.as_str()
+                    };
+                    format!("{}: {}", f.name.as_deref().unwrap_or(&f.chat), clean_reason)
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         ));

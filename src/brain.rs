@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 use crate::alerts::{is_urgent_draft_complete, URGENT_INTAKE_MAX_TURNS};
 use crate::config::{AiAttempt, Config, BOT_NAME, DEFAULT_CF_MODELS, EXAMS, HANDOFF_REPLY, SUBJECTS};
@@ -464,16 +466,46 @@ pub fn validate_booking(b: &BookingDraft, sender: &str, open_hour: u32, close_ho
     }
 }
 
-/// Extracts the outermost `{ ... }` JSON object in case a model (e.g. Mistral on Cloudflare Workers AI)
-/// wraps its output in ```json ... ``` markdown fences or adds leading/trailing notes.
-pub fn extract_json_object(raw: &str) -> &str {
+/// Strips `<think>...</think>` reasoning blocks emitted by reasoning models before JSON extraction.
+fn strip_think_blocks(raw: &str) -> &str {
     let trimmed = raw.trim();
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start <= end {
-            return &trimmed[start..=end];
+    if let Some(end_idx) = trimmed.rfind("</think>") {
+        let after = trimmed[end_idx + "</think>".len()..].trim();
+        if !after.is_empty() {
+            return after;
         }
     }
     trimmed
+}
+
+/// Extracts the outermost `{ ... }` JSON object in case a model (e.g. Mistral on Cloudflare Workers AI
+/// or a reasoning model emitting `<think>...</think>`) wraps its output in markdown fences or extra text.
+pub fn extract_json_object(raw: &str) -> &str {
+    let cleaned = strip_think_blocks(raw);
+    let unfenced = if let Some(fence_start) = cleaned.find("```") {
+        let after_ticks = &cleaned[fence_start + 3..];
+        let after_lang = after_ticks
+            .find('\n')
+            .map(|i| &after_ticks[i + 1..])
+            .unwrap_or(after_ticks);
+        after_lang
+            .rfind("```")
+            .map(|i| after_lang[..i].trim())
+            .unwrap_or(after_lang.trim())
+    } else {
+        cleaned
+    };
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if start <= end {
+            return &unfenced[start..=end];
+        }
+    }
+    if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        if start <= end {
+            return &cleaned[start..=end];
+        }
+    }
+    cleaned
 }
 
 /// Normalizes chat history so that after `system`, turns start with `user` and strictly alternate
@@ -1041,25 +1073,25 @@ pub struct FollowupSuggestionPayload {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct LlmResponsePayload {
-    reply: Option<String>,
-    customer_name: Option<String>,
+pub(crate) struct LlmResponsePayload {
+    pub(crate) reply: Option<String>,
+    pub(crate) customer_name: Option<String>,
     #[serde(default)]
-    save_booking: bool,
-    booking: Option<BookingDraft>,
+    pub(crate) save_booking: bool,
+    pub(crate) booking: Option<BookingDraft>,
     #[serde(default)]
-    flag_human: bool,
-    flag_reason: Option<String>,
-    draft_for_falcon: Option<String>,
+    pub(crate) flag_human: bool,
+    pub(crate) flag_reason: Option<String>,
+    pub(crate) draft_for_falcon: Option<String>,
     #[serde(default)]
-    notify_falcon: bool,
-    note_for_falcon: Option<String>,
-    urgency: Option<String>,
-    urgent_intake: Option<UrgentDraft>,
-    emotion: Option<String>,
-    emotion_intensity: Option<String>,
-    emotion_subtext: Option<String>,
-    followup: Option<FollowupSuggestionPayload>,
+    pub(crate) notify_falcon: bool,
+    pub(crate) note_for_falcon: Option<String>,
+    pub(crate) urgency: Option<String>,
+    pub(crate) urgent_intake: Option<UrgentDraft>,
+    pub(crate) emotion: Option<String>,
+    pub(crate) emotion_intensity: Option<String>,
+    pub(crate) emotion_subtext: Option<String>,
+    pub(crate) followup: Option<FollowupSuggestionPayload>,
     memory_update: Option<MemoryUpdatePayload>,
 }
 
@@ -1094,13 +1126,58 @@ fn json_str_vec(v: &Value, key: &str) -> Vec<String> {
     }
 }
 
-fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
-    let trimmed = raw.trim();
+fn repair_trailing_commas_json(s: &str) -> String {
+    static TRAILING_COMMA_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TRAILING_COMMA_RE
+        .get_or_init(|| Regex::new(r",(\s*[}\]])").expect("Valid trailing comma regex"));
+    re.replace_all(s, "$1").into_owned()
+}
+
+fn extract_loose_json_string_field(candidate: &str, field_name: &str) -> Option<String> {
+    let needle = format!("\"{}\"", field_name);
+    let idx = candidate.find(&needle)?;
+    let after = &candidate[idx + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let stripped = rest.strip_prefix('"')?;
+    let mut extracted = String::new();
+    let mut escaped = false;
+    for ch in stripped.chars() {
+        if escaped {
+            match ch {
+                'n' => extracted.push('\n'),
+                't' => extracted.push('\t'),
+                'r' => {}
+                other => extracted.push(other),
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            break;
+        } else {
+            extracted.push(ch);
+        }
+    }
+    let trimmed = extracted.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+pub(crate) fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
+    let trimmed = strip_think_blocks(raw);
     if trimmed.is_empty() {
         return None;
     }
     let candidate = extract_json_object(trimmed);
-    if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+    let parsed_val = serde_json::from_str::<Value>(candidate)
+        .ok()
+        .or_else(|| serde_json::from_str::<Value>(&repair_trailing_commas_json(candidate)).ok());
+
+    if let Some(v) = parsed_val {
         if v.is_object() {
             let booking = v.get("booking").and_then(|b| {
                 if !b.is_object() {
@@ -1172,7 +1249,9 @@ fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
             });
 
             return Some(LlmResponsePayload {
-                reply: json_str_opt(&v, "reply"),
+                reply: json_str_opt(&v, "reply")
+                    .or_else(|| json_str_opt(&v, "message"))
+                    .or_else(|| json_str_opt(&v, "response")),
                 customer_name: json_str_opt(&v, "customer_name"),
                 save_booking: json_bool(&v, "save_booking"),
                 booking,
@@ -1192,42 +1271,18 @@ fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
         }
     }
 
-    // Fallback if model put unescaped newlines inside `"reply": "..."`
-    if let Some(idx) = candidate.find("\"reply\"") {
-        let after = &candidate[idx + 7..];
-        if let Some(colon) = after.find(':') {
-            let rest = after[colon + 1..].trim_start();
-            if let Some(stripped) = rest.strip_prefix('"') {
-                let mut extracted = String::new();
-                let mut escaped = false;
-                for ch in stripped.chars() {
-                    if escaped {
-                        match ch {
-                            'n' => extracted.push('\n'),
-                            't' => extracted.push('\t'),
-                            other => extracted.push(other),
-                        }
-                        escaped = false;
-                    } else if ch == '\\' {
-                        escaped = true;
-                    } else if ch == '"' {
-                        break;
-                    } else {
-                        extracted.push(ch);
-                    }
-                }
-                if !extracted.trim().is_empty() {
-                    return Some(LlmResponsePayload {
-                        reply: Some(extracted.trim().to_string()),
-                        ..Default::default()
-                    });
-                }
-            }
+    // Fallback if model put unescaped newlines, truncated closing brace, or used alternate reply keys
+    for field in ["reply", "message", "response"] {
+        if let Some(extracted) = extract_loose_json_string_field(candidate, field) {
+            return Some(LlmResponsePayload {
+                reply: Some(extracted),
+                ..Default::default()
+            });
         }
     }
 
     // Plain-text fallback if model replied directly in natural language without JSON braces
-    if !trimmed.starts_with('{') {
+    if !trimmed.starts_with('{') && !trimmed.starts_with("```") {
         return Some(LlmResponsePayload {
             reply: Some(trimmed.to_string()),
             ..Default::default()

@@ -316,29 +316,40 @@ where
     // emails / gmail — live multi-account priority unread Gmail view
     if matches!(lower.as_str(), "emails" | "gmail" | "check emails" | "check gmail") {
         let now_ms = Utc::now().timestamp_millis();
-        let accounts = crate::gmail::resolve_gmail_accounts(db, cfg).await;
-        if !accounts.is_empty() && !cfg.gmail_client_id.trim().is_empty() {
-            let cache = GmailTokenCache::new();
+        let cache = GmailTokenCache::new();
+        let profiles = crate::gmail::resolve_gmail_account_profiles(db, cfg, &cache, false).await;
+        if !profiles.is_empty() && !cfg.gmail_client_id.trim().is_empty() {
             let _ = sync_all_gmail_accounts(db, cfg, &cache, now_ms).await;
         }
         let recent = db.list_recent_priority_emails(10).await?;
+        let acct_summary: String = profiles
+            .iter()
+            .map(|p| {
+                let icon = if p.status == "connected" { "✅" } else { "⚠️" };
+                let addr = p.email.as_deref().unwrap_or(&p.label);
+                format!("{} #{} {}", icon, p.index, addr)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
         if recent.is_empty() {
-            if accounts.is_empty() || cfg.gmail_client_id.trim().is_empty() {
+            if profiles.is_empty() || cfg.gmail_client_id.trim().is_empty() {
                 return Ok(Some(
                     "📧 *Gmail is not connected yet.* Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` (plus `_2`..`_20` for extra accounts) in Heroku Config Vars."
                         .to_string(),
                 ));
             }
             return Ok(Some(format!(
-                "✅ No unread priority emails across your {} connected Gmail account(s).",
-                accounts.len()
+                "✅ No unread priority emails across your {} connected Gmail account(s).\n{}",
+                profiles.len(),
+                acct_summary
             )));
         }
         let lines: Vec<String> = recent.iter().map(format_email_line).collect();
         return Ok(Some(format!(
-            "📧 *Priority Gmail Inbox ({} across {} account(s))*:\n{}",
+            "📧 *Priority Gmail Inbox ({} across {} account(s))*:\n{}\n\n{}",
             recent.len(),
-            accounts.len().max(1),
+            profiles.len().max(1),
+            acct_summary,
             lines.join("\n")
         )));
     }

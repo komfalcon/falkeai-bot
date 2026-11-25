@@ -116,7 +116,18 @@ data class CallNoteRequest(
 @Serializable
 data class AckRequest(
     val target: String? = null,
-    @SerialName("quick_reply") val quickReply: String? = null
+    @SerialName("quick_reply") val quickReply: String? = null,
+    @SerialName("dismiss_flag") val dismissFlag: String? = null,
+    @SerialName("dismiss_all_flags") val dismissAllFlags: Boolean = false
+)
+
+@Serializable
+data class GmailAccountDto(
+    val index: Int = 0,
+    val label: String = "",
+    val email: String? = null,
+    val status: String = "connected",
+    @SerialName("error_hint") val errorHint: String? = null
 )
 
 @Serializable
@@ -204,6 +215,7 @@ data class DashboardResponse(
     val availability: AvailabilityDto = AvailabilityDto(),
     @SerialName("low_battery_cover") val lowBatteryCover: Boolean = false,
     @SerialName("catch_up_summary") val catchUpSummary: String = "",
+    @SerialName("gmail_accounts") val gmailAccounts: List<GmailAccountDto> = emptyList(),
     @SerialName("urgent_alerts") val urgentAlerts: List<UrgentAlertDto> = emptyList(),
     @SerialName("priority_emails") val priorityEmails: List<EmailItemDto> = emptyList(),
     val followups: List<FollowupDto> = emptyList(),

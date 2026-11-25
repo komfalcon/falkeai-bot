@@ -22,6 +22,7 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
         ignoreUnknownKeys = true
         encodeDefaults = true
         isLenient = true
+        coerceInputValues = true
     }
 
     private val mediaJson = "application/json; charset=utf-8".toMediaType()
@@ -148,10 +149,35 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
     suspend fun acknowledgeAlert(target: String?, quickReply: String? = null): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val body = json.encodeToString(AckRequest(target, quickReply)).toRequestBody(mediaJson)
+                val body = json.encodeToString(AckRequest(target = target, quickReply = quickReply))
+                    .toRequestBody(mediaJson)
                 val req = authedBuilder("/api/v1/phone/ack").post(body).build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) error("Ack HTTP ${resp.code}")
+                }
+            }
+        }
+
+    suspend fun dismissFlag(chat: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val body = json.encodeToString(AckRequest(dismissFlag = chat))
+                    .toRequestBody(mediaJson)
+                val req = authedBuilder("/api/v1/phone/ack").post(body).build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("Dismiss flag HTTP ${resp.code}")
+                }
+            }
+        }
+
+    suspend fun dismissAllFlags(): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val body = json.encodeToString(AckRequest(dismissAllFlags = true))
+                    .toRequestBody(mediaJson)
+                val req = authedBuilder("/api/v1/phone/ack").post(body).build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("Dismiss all flags HTTP ${resp.code}")
                 }
             }
         }

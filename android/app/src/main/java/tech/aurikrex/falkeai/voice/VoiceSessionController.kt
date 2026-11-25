@@ -27,6 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import tech.aurikrex.falkeai.data.CallNoteRequest
 import tech.aurikrex.falkeai.data.DeviceContextPayload
 import tech.aurikrex.falkeai.data.FalkeApiClient
@@ -52,12 +53,22 @@ enum class VoiceState {
     FOLLOW_UP_WINDOW
 }
 
+data class ChatMessage(
+    val id: Long = System.nanoTime(),
+    val isUser: Boolean,
+    val text: String,
+    val actions: List<String> = emptyList(),
+    val timestampMs: Long = System.currentTimeMillis(),
+    val isError: Boolean = false
+)
+
 data class VoiceUiState(
     val state: VoiceState = VoiceState.IDLE,
-    val statusLine: String = "Ready — say \"Hey Falke\", \"Jarvis\", or tap the orb",
+    val statusLine: String = "Tap the orb or type below",
     val lastTranscript: String = "",
     val lastReply: String = "",
     val lastActions: List<String> = emptyList(),
+    val chatHistory: List<ChatMessage> = emptyList(),
     val pendingUndo: PendingUndoAction? = null,
     val undoSecondsLeft: Int = 0,
     val screenVisionAttached: Boolean = false
@@ -85,6 +96,7 @@ class VoiceSessionController(
     val uiState: StateFlow<VoiceUiState> = _uiState
 
     private var activeJob: Job? = null
+    private var sessionGen: Long = 0L
     private var undoJob: Job? = null
     private var activePlayer: MediaPlayer? = null
     private var activeFocusRequest: AudioFocusRequest? = null
@@ -111,6 +123,7 @@ class VoiceSessionController(
         postCallName: String? = null
     ) {
         activeJob?.cancel()
+        val myGen = ++sessionGen
         stopAudioPlayback()
         FalkeWakeWordService.setSessionPaused(true)
 
@@ -147,7 +160,12 @@ class VoiceSessionController(
                             lastTranscript = offlineSpoken,
                             lastReply = reply,
                             lastActions = listOf("Offline 0MB Voice"),
-                            statusLine = reply
+                            chatHistory = appendChatMessages(
+                                _uiState.value.chatHistory,
+                                ChatMessage(isUser = true, text = offlineSpoken),
+                                ChatMessage(isUser = false, text = reply, actions = listOf("Offline 0MB Voice"))
+                            ),
+                            statusLine = "Speaking…"
                         )
                         speakWithAndroidTts(reply)
                         _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
@@ -211,18 +229,31 @@ class VoiceSessionController(
                     )
                 )
 
-                handleChatResponse(resp, followUpChain)
+                handleChatResponse(
+                    result = resp,
+                    followUpChain = followUpChain,
+                    speakReply = true,
+                    alreadyAppendedUserText = false
+                )
             } finally {
-                if (_uiState.value.state != VoiceState.FOLLOW_UP_WINDOW) {
+                if (myGen == sessionGen && _uiState.value.state != VoiceState.FOLLOW_UP_WINDOW) {
+                    if (_uiState.value.state != VoiceState.IDLE) {
+                        _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
+                    }
                     FalkeWakeWordService.setSessionPaused(false)
                 }
             }
         }
     }
 
-    fun sendTextCommand(rawText: String, captureScreen: Boolean = false, speakReply: Boolean = true) {
+    fun sendTextCommand(
+        rawText: String,
+        captureScreen: Boolean = false,
+        speakReply: Boolean? = null
+    ) {
         val text = rawText.trim()
         if (text.isEmpty()) return
+        val shouldSpeak = speakReply ?: prefs.speakTypedReplies
 
         // Handle "Cancel" / "Undo" immediately during 6-second Undo window (Feature J)
         if (_uiState.value.pendingUndo != null &&
@@ -233,58 +264,86 @@ class VoiceSessionController(
         }
 
         activeJob?.cancel()
+        val myGen = ++sessionGen
         stopAudioPlayback()
         activeJob = scope.launch {
-            // Feature M: Try instant <80ms LocalCommandRouter first when offline OR for pure local toggles!
-            val localCmd = LocalCommandRouter.route(text)
-            if (localCmd != null && (!isNetworkOnline() || !prefs.isPaired() || isInstantLocalOnly(localCmd))) {
-                val res = actionExecutor.executeLocalCommand(localCmd)
+            try {
+                // Feature M: Try instant <80ms LocalCommandRouter first when offline OR for pure local toggles!
+                val localCmd = LocalCommandRouter.route(text)
+                if (localCmd != null && (!isNetworkOnline() || !prefs.isPaired() || isInstantLocalOnly(localCmd))) {
+                    val res = actionExecutor.executeLocalCommand(localCmd)
+                    _uiState.value = _uiState.value.copy(
+                        state = if (shouldSpeak) VoiceState.SPEAKING else VoiceState.IDLE,
+                        lastTranscript = text,
+                        lastReply = res,
+                        lastActions = listOf("Offline Local Executor"),
+                        chatHistory = appendChatMessages(
+                            _uiState.value.chatHistory,
+                            ChatMessage(isUser = true, text = text),
+                            ChatMessage(isUser = false, text = res, actions = listOf("Offline Local Executor"))
+                        ),
+                        statusLine = if (shouldSpeak) "Speaking…" else "Ready"
+                    )
+                    if (shouldSpeak) speakWithAndroidTts(res)
+                    _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
+                    return@launch
+                }
+
+                if (!prefs.isPaired()) {
+                    val pairMsg = "Pair your phone in Setup first (send `pair android` in WhatsApp self-chat)."
+                    _uiState.value = _uiState.value.copy(
+                        state = VoiceState.IDLE,
+                        lastTranscript = text,
+                        lastReply = pairMsg,
+                        chatHistory = appendChatMessages(
+                            _uiState.value.chatHistory,
+                            ChatMessage(isUser = true, text = text),
+                            ChatMessage(isUser = false, text = pairMsg, isError = true)
+                        ),
+                        statusLine = "Not paired"
+                    )
+                    return@launch
+                }
+
                 _uiState.value = _uiState.value.copy(
-                    state = VoiceState.SPEAKING,
+                    state = VoiceState.THINKING,
                     lastTranscript = text,
-                    lastReply = res,
-                    lastActions = listOf("Offline Local Executor"),
-                    statusLine = res
+                    chatHistory = appendChatMessages(
+                        _uiState.value.chatHistory,
+                        ChatMessage(isUser = true, text = text)
+                    ),
+                    statusLine = "Thinking…"
                 )
-                if (speakReply) speakWithAndroidTts(res)
-                _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
-                return@launch
+
+                val wantsScreen = captureScreen || looksLikeScreenQuestion(text)
+                val screenshotB64 = if (wantsScreen && prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
+                    FalkeAccessibilityService.captureScreenJpegBase64()
+                } else null
+                val screenText = if (prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
+                    FalkeAccessibilityService.readCurrentScreenText()
+                } else null
+
+                val resp = api.chat(
+                    PhoneChatRequest(
+                        text = text,
+                        screenshotBase64 = screenshotB64,
+                        screenshotMime = if (screenshotB64 != null) "image/jpeg" else null,
+                        multilingual = prefs.bilingualMode,
+                        wantTts = shouldSpeak,
+                        deviceContext = buildLiveDeviceContext(screenText)
+                    )
+                )
+                handleChatResponse(
+                    result = resp,
+                    followUpChain = false,
+                    speakReply = shouldSpeak,
+                    alreadyAppendedUserText = true
+                )
+            } finally {
+                if (myGen == sessionGen && _uiState.value.state != VoiceState.IDLE) {
+                    _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
+                }
             }
-
-            if (!prefs.isPaired()) {
-                _uiState.value = _uiState.value.copy(
-                    state = VoiceState.IDLE,
-                    lastTranscript = text,
-                    lastReply = "Pair your Infinix phone in Setup first (send `pair android` in WhatsApp self-chat)."
-                )
-                return@launch
-            }
-
-            _uiState.value = _uiState.value.copy(
-                state = VoiceState.THINKING,
-                lastTranscript = text,
-                statusLine = "Thinking…"
-            )
-
-            val wantsScreen = captureScreen || looksLikeScreenQuestion(text)
-            val screenshotB64 = if (wantsScreen && prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
-                FalkeAccessibilityService.captureScreenJpegBase64()
-            } else null
-            val screenText = if (prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
-                FalkeAccessibilityService.readCurrentScreenText()
-            } else null
-
-            val resp = api.chat(
-                PhoneChatRequest(
-                    text = text,
-                    screenshotBase64 = screenshotB64,
-                    screenshotMime = if (screenshotB64 != null) "image/jpeg" else null,
-                    multilingual = prefs.bilingualMode,
-                    wantTts = speakReply,
-                    deviceContext = buildLiveDeviceContext(screenText)
-                )
-            )
-            handleChatResponse(resp, followUpChain = false)
         }
     }
 
@@ -294,6 +353,38 @@ class VoiceSessionController(
             "Give me my concise spoken interactive morning commute briefing covering urgent alerts, priority Gmail, WhatsApp approvals, ready follow-ups, bank alerts, and today's calendar.",
             captureScreen = false,
             speakReply = true
+        )
+    }
+
+    fun replayMessage(text: String) {
+        if (text.isBlank()) return
+        activeJob?.cancel()
+        val myGen = ++sessionGen
+        stopAudioPlayback()
+        activeJob = scope.launch {
+            try {
+                _uiState.value = _uiState.value.copy(state = VoiceState.SPEAKING, statusLine = "Speaking… tap orb to stop")
+                requestDuckingAudioFocus()
+                try {
+                    speakWithAndroidTts(text)
+                } finally {
+                    abandonDuckingAudioFocus()
+                }
+            } finally {
+                if (myGen == sessionGen) {
+                    _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
+                }
+            }
+        }
+    }
+
+    fun clearHistory() {
+        _uiState.value = _uiState.value.copy(
+            chatHistory = emptyList(),
+            lastTranscript = "",
+            lastReply = "",
+            lastActions = emptyList(),
+            statusLine = "Ready"
         )
     }
 
@@ -317,15 +408,29 @@ class VoiceSessionController(
     }
 
     fun stopSession() {
+        ++sessionGen
         activeJob?.cancel()
         stopAudioPlayback()
         _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
         FalkeWakeWordService.setSessionPaused(false)
     }
 
+    private fun appendChatMessages(
+        existing: List<ChatMessage>,
+        vararg added: ChatMessage
+    ): List<ChatMessage> {
+        val out = existing.toMutableList()
+        for (m in added) {
+            if (m.text.isNotBlank()) out.add(m)
+        }
+        return if (out.size > 40) out.takeLast(40) else out
+    }
+
     private suspend fun handleChatResponse(
         result: Result<tech.aurikrex.falkeai.data.PhoneChatResponse>,
-        followUpChain: Boolean
+        followUpChain: Boolean,
+        speakReply: Boolean,
+        alreadyAppendedUserText: Boolean
     ) {
         result.fold(
             onSuccess = { resp ->
@@ -339,28 +444,54 @@ class VoiceSessionController(
 
                 val deviceNotes = actionExecutor.executeServerActions(resp.deviceActions)
                 val allNotes = resp.cloudActionsDone + deviceNotes
+                val finalTranscript = resp.transcript.ifBlank { _uiState.value.lastTranscript }
 
-                _uiState.value = _uiState.value.copy(
-                    state = VoiceState.SPEAKING,
-                    lastTranscript = resp.transcript.ifBlank { _uiState.value.lastTranscript },
-                    lastReply = resp.replyText,
-                    lastActions = allNotes,
-                    statusLine = "Speaking…"
-                )
+                val updatedHistory = if (!alreadyAppendedUserText && finalTranscript.isNotBlank()) {
+                    appendChatMessages(
+                        _uiState.value.chatHistory,
+                        ChatMessage(isUser = true, text = finalTranscript),
+                        ChatMessage(isUser = false, text = resp.replyText, actions = allNotes)
+                    )
+                } else {
+                    appendChatMessages(
+                        _uiState.value.chatHistory,
+                        ChatMessage(isUser = false, text = resp.replyText, actions = allNotes)
+                    )
+                }
 
-                // Duck background music (e.g. Spotify) smoothly while FalkeAI speaks!
-                requestDuckingAudioFocus()
-                try {
-                    val playedCloudAudio = if (!resp.ttsAudioBase64.isNullOrBlank()) {
-                        playBase64Audio(resp.ttsAudioBase64, resp.ttsMime ?: "audio/wav")
-                    } else {
-                        false
+                if (speakReply) {
+                    _uiState.value = _uiState.value.copy(
+                        state = VoiceState.SPEAKING,
+                        lastTranscript = finalTranscript,
+                        lastReply = resp.replyText,
+                        lastActions = allNotes,
+                        chatHistory = updatedHistory,
+                        statusLine = "Speaking… tap orb to stop"
+                    )
+
+                    // Duck background music (e.g. Spotify) smoothly while FalkeAI speaks!
+                    requestDuckingAudioFocus()
+                    try {
+                        val playedCloudAudio = if (!resp.ttsAudioBase64.isNullOrBlank()) {
+                            playBase64Audio(resp.ttsAudioBase64, resp.ttsMime ?: "audio/wav")
+                        } else {
+                            false
+                        }
+                        if (!playedCloudAudio && resp.replyText.isNotBlank()) {
+                            speakWithAndroidTts(resp.replyText)
+                        }
+                    } finally {
+                        abandonDuckingAudioFocus()
                     }
-                    if (!playedCloudAudio && resp.replyText.isNotBlank()) {
-                        speakWithAndroidTts(resp.replyText)
-                    }
-                } finally {
-                    abandonDuckingAudioFocus()
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        state = VoiceState.IDLE,
+                        lastTranscript = finalTranscript,
+                        lastReply = resp.replyText,
+                        lastActions = allNotes,
+                        chatHistory = updatedHistory,
+                        statusLine = "Ready"
+                    )
                 }
 
                 // Feature #2: 5-second Auto Follow-Up Window (keep listening briefly without wake word!)
@@ -380,10 +511,15 @@ class VoiceSessionController(
             },
             onFailure = { err ->
                 val msg = err.message ?: "Network error"
+                val errText = "Couldn't reach FalkeAI server: $msg"
                 _uiState.value = _uiState.value.copy(
                     state = VoiceState.IDLE,
-                    lastReply = "Couldn't reach FalkeAI server: $msg",
-                    statusLine = "Error: $msg"
+                    lastReply = errText,
+                    chatHistory = appendChatMessages(
+                        _uiState.value.chatHistory,
+                        ChatMessage(isUser = false, text = errText, isError = true)
+                    ),
+                    statusLine = "Connection issue"
                 )
                 FalkeWakeWordService.setSessionPaused(false)
             }
@@ -548,63 +684,82 @@ class VoiceSessionController(
             val tmp = File(context.cacheDir, "falke_tts_${System.currentTimeMillis()}.$ext")
             tmp.writeBytes(bytes)
             try {
-                suspendCancellableCoroutine { cont ->
-                    runCatching {
-                        val mp = MediaPlayer().apply {
-                            setAudioAttributes(
-                                AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                    .build()
-                            )
-                            setDataSource(tmp.absolutePath)
-                            setOnCompletionListener {
-                                release()
-                                if (activePlayer === this) activePlayer = null
-                                if (cont.isActive) cont.resume(true)
+                withTimeoutOrNull(45_000L) {
+                    suspendCancellableCoroutine { cont ->
+                        runCatching {
+                            val mp = MediaPlayer().apply {
+                                setAudioAttributes(
+                                    AudioAttributes.Builder()
+                                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                        .build()
+                                )
+                                setDataSource(tmp.absolutePath)
+                                setOnCompletionListener {
+                                    release()
+                                    if (activePlayer === this) activePlayer = null
+                                    if (cont.isActive) cont.resume(true)
+                                }
+                                setOnErrorListener { _, _, _ ->
+                                    release()
+                                    if (activePlayer === this) activePlayer = null
+                                    if (cont.isActive) cont.resume(false)
+                                    true
+                                }
+                                prepare()
+                                start()
                             }
-                            setOnErrorListener { _, _, _ ->
-                                release()
-                                if (activePlayer === this) activePlayer = null
-                                if (cont.isActive) cont.resume(false)
-                                true
+                            activePlayer = mp
+                            cont.invokeOnCancellation {
+                                runCatching { mp.stop(); mp.release() }
+                                if (activePlayer === mp) activePlayer = null
                             }
-                            prepare()
-                            start()
+                        }.onFailure {
+                            if (cont.isActive) cont.resume(false)
                         }
-                        activePlayer = mp
-                        cont.invokeOnCancellation {
-                            runCatching { mp.stop(); mp.release() }
-                            if (activePlayer === mp) activePlayer = null
-                        }
-                    }.onFailure {
-                        if (cont.isActive) cont.resume(false)
                     }
-                }
+                } ?: false
             } finally {
+                runCatching { activePlayer?.stop(); activePlayer?.release(); activePlayer = null }
                 runCatching { tmp.delete() }
             }
         }
 
     private suspend fun speakWithAndroidTts(raw: String) {
-        if (!ttsReady) return
-        val clean = raw.replace(Regex("[*_`#•]"), " ").trim().take(700)
+        val engine = tts
+        if (!ttsReady || engine == null) return
+        val clean = raw.replace(Regex("[*_`#•]"), " ").replace(Regex("\\s+"), " ").trim().take(700)
         if (clean.isEmpty()) return
-        suspendCancellableCoroutine<Unit> { cont ->
-            val id = "falke_${System.currentTimeMillis()}"
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
-                override fun onDone(utteranceId: String?) {
-                    if (utteranceId == id && cont.isActive) cont.resume(Unit)
+        // Bounded timeout + immediate resume on TextToSpeech.ERROR so the orb can NEVER stick in SPEAKING!
+        withTimeoutOrNull(30_000L) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                val id = "falke_${System.currentTimeMillis()}"
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) = Unit
+                    override fun onDone(utteranceId: String?) {
+                        if (utteranceId == id && cont.isActive) cont.resume(Unit)
+                    }
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                        if (utteranceId == id && cont.isActive) cont.resume(Unit)
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        if (utteranceId == id && cont.isActive) cont.resume(Unit)
+                    }
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        if (utteranceId == id && cont.isActive) cont.resume(Unit)
+                    }
+                })
+                val result = runCatching {
+                    engine.speak(clean, TextToSpeech.QUEUE_FLUSH, null, id)
+                }.getOrDefault(TextToSpeech.ERROR)
+                if (result != TextToSpeech.SUCCESS && cont.isActive) {
+                    cont.resume(Unit)
                 }
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    if (utteranceId == id && cont.isActive) cont.resume(Unit)
-                }
-            })
-            tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, id)
-            cont.invokeOnCancellation { tts?.stop() }
+                cont.invokeOnCancellation { runCatching { engine.stop() } }
+            }
         }
+        runCatching { engine.stop() }
     }
 
     private fun requestDuckingAudioFocus() {

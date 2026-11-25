@@ -35,7 +35,7 @@ use crate::db::{
     memory_token_jaccard, ChatTurn, ContactMemory, ConversationState, Database, PhoneEventRecord,
     PhoneTelemetrySnapshot,
 };
-use crate::gmail::GmailTokenCache;
+use crate::gmail::{resolve_gmail_account_profiles, GmailAccountProfile, GmailTokenCache};
 use crate::media::{
     base64_decode, base64_encode, describe_image_bytes, synthesize_voice_bytes,
     transcribe_audio_bytes, MediaBudget, MAX_AUDIO_BYTES, MAX_IMAGE_BYTES,
@@ -517,6 +517,22 @@ async fn handle_pair_inner(
 
 /// `GET /api/v1/phone/dashboard` — unified live Command Center JSON for Android UI.
 pub async fn handle_dashboard_endpoint(db: &Database, now_ms: i64) -> (u16, Value) {
+    handle_dashboard_endpoint_inner(db, None, None, now_ms).await
+}
+
+pub async fn handle_dashboard_endpoint_with_state(
+    state: &PhoneApiState,
+    now_ms: i64,
+) -> (u16, Value) {
+    handle_dashboard_endpoint_inner(&state.db, Some(&state.cfg), Some(state.gmail_cache.as_ref()), now_ms).await
+}
+
+async fn handle_dashboard_endpoint_inner(
+    db: &Database,
+    cfg: Option<&Config>,
+    gmail_cache: Option<&GmailTokenCache>,
+    now_ms: i64,
+) -> (u16, Value) {
     let _ = db.promote_due_followups(now_ms).await;
     let status = db.get_owner_status(now_ms).await.unwrap_or_default();
     let low_battery_cover = db.is_phone_low_battery_cover(now_ms).await.unwrap_or(false);
@@ -538,6 +554,10 @@ pub async fn handle_dashboard_endpoint(db: &Database, now_ms: i64) -> (u16, Valu
     let catch_up = build_catch_me_up_summary(db, now_ms)
         .await
         .unwrap_or_default();
+    let gmail_accounts: Vec<GmailAccountProfile> = match (cfg, gmail_cache) {
+        (Some(c), Some(cache)) => resolve_gmail_account_profiles(db, c, cache, false).await,
+        _ => Vec::new(),
+    };
 
     (
         200,
@@ -547,6 +567,7 @@ pub async fn handle_dashboard_endpoint(db: &Database, now_ms: i64) -> (u16, Valu
             "low_battery_cover": low_battery_cover,
             "telemetry": telemetry,
             "catch_up_summary": catch_up,
+            "gmail_accounts": gmail_accounts,
             "urgent_alerts": urgent,
             "priority_emails": emails,
             "followups": followups,
@@ -868,12 +889,28 @@ pub async fn handle_ack_endpoint(
     body: &Value,
     now_ms: i64,
 ) -> (u16, Value) {
+    let dismiss_all_flags = body["dismiss_all_flags"].as_bool().unwrap_or(false);
+    let dismiss_flag = body["dismiss_flag"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut flags_dismissed = 0u64;
+    if dismiss_all_flags {
+        flags_dismissed = db.delete_all_flags().await.unwrap_or(0);
+    } else if let Some(chat_id) = dismiss_flag {
+        flags_dismissed = db.delete_flags_for_chat(chat_id).await.unwrap_or(0);
+    }
+
     let target = body["target"]
         .as_str()
         .or_else(|| body["sender"].as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let acked = db.ack_urgent_alerts(target).await.unwrap_or(0);
+    let acked = if dismiss_flag.is_some() && target.is_none() && !dismiss_all_flags {
+        0
+    } else {
+        db.ack_urgent_alerts(target).await.unwrap_or(0)
+    };
 
     let mut reply_sent = false;
     if let (Some(t), Some(reply_msg)) = (
@@ -921,6 +958,7 @@ pub async fn handle_ack_endpoint(
         json!({
             "ok": true,
             "acknowledged": acked,
+            "flags_dismissed": flags_dismissed,
             "quick_reply_sent": reply_sent,
             "at": now_ms
         }),
@@ -1452,7 +1490,7 @@ async fn handle_client_connection(
             write_json_response(&mut stream, status, &resp).await;
         }
         ("GET", "/api/v1/phone/dashboard") => {
-            let (status, resp) = handle_dashboard_endpoint(&state.db, now_ms).await;
+            let (status, resp) = handle_dashboard_endpoint_with_state(&state, now_ms).await;
             write_json_response(&mut stream, status, &resp).await;
         }
         ("GET", "/api/v1/phone/caller-brief") => {

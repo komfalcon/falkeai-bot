@@ -62,6 +62,10 @@ class SecurePrefs(context: Context) {
         get() = prefs.getBoolean(KEY_CONFIRM_UNKNOWN, true)
         set(value) = prefs.edit().putBoolean(KEY_CONFIRM_UNKNOWN, value).apply()
 
+    var speakTypedReplies: Boolean
+        get() = prefs.getBoolean(KEY_SPEAK_TYPED_REPLIES, false)
+        set(value) = prefs.edit().putBoolean(KEY_SPEAK_TYPED_REPLIES, value).apply()
+
     var wakeWords: List<String>
         get() {
             val raw = prefs.getString(KEY_WAKE_WORDS, null) ?: return DEFAULT_WAKE_WORDS
@@ -118,6 +122,7 @@ class SecurePrefs(context: Context) {
 
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_DEVICE_TOKEN = "device_token"
+        private const val KEY_SPEAK_TYPED_REPLIES = "speak_typed_replies"
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_LAST_EVENT_ID = "last_event_id"
         private const val KEY_WAKE_WORD_ENABLED = "wake_word_enabled"

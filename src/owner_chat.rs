@@ -19,8 +19,9 @@ use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, ConversationState, Database, OwnerStatus};
 use crate::gmail::{
     create_gmail_draft, list_gmail_drafts, modify_gmail_labels, reply_gmail_message,
-    resolve_gmail_accounts, search_all_gmail_accounts, send_gmail_draft, send_gmail_message,
-    trash_gmail_message, untrash_gmail_message, update_gmail_draft, GmailTokenCache,
+    resolve_gmail_account_profiles, resolve_gmail_accounts, search_all_gmail_accounts,
+    send_gmail_draft, send_gmail_message, trash_gmail_message, untrash_gmail_message,
+    update_gmail_draft, GmailAccountProfile, GmailTokenCache,
 };
 use crate::safety::{detect_injection, redact_secrets};
 use crate::util::lagos_parts;
@@ -525,16 +526,45 @@ where
         }
     }
 
-    let connected_gmail = resolve_gmail_accounts(db, cfg).await;
-    if !connected_gmail.is_empty() {
-        let acct_labels: Vec<String> = connected_gmail
-            .iter()
+    let gmail_profiles: Vec<GmailAccountProfile> = if let Some(cache) = gmail_cache {
+        resolve_gmail_account_profiles(db, cfg, cache, false).await
+    } else {
+        resolve_gmail_accounts(db, cfg)
+            .await
+            .into_iter()
             .enumerate()
-            .map(|(i, a)| format!("#{} {}", i + 1, a.label))
+            .map(|(i, a)| GmailAccountProfile {
+                index: i + 1,
+                label: a.label,
+                email: None,
+                status: "configured".to_string(),
+                error_hint: None,
+            })
+            .collect()
+    };
+    if !gmail_profiles.is_empty() {
+        let acct_labels: Vec<String> = gmail_profiles
+            .iter()
+            .map(|p| {
+                let em = p
+                    .email
+                    .as_deref()
+                    .map(|e| format!(" <{}>", e))
+                    .unwrap_or_default();
+                let st = if p.status == "auth_error" {
+                    format!(
+                        " [AUTH ERROR: {}]",
+                        p.error_hint.as_deref().unwrap_or("token needs refresh")
+                    )
+                } else {
+                    String::new()
+                };
+                format!("#{} {}{}{}", p.index, p.label, em, st)
+            })
             .collect();
         ctx_blocks.push(format!(
             "Connected Gmail Accounts ({}): {}",
-            connected_gmail.len(),
+            gmail_profiles.len(),
             acct_labels.join(" | ")
         ));
     }
@@ -775,8 +805,8 @@ If Falcon asks to translate or speaks Yoruba, Nigerian Pidgin, or French, act as
    - Send WhatsApp DM right now: `{{"type": "send_dm", "target": "phone or name", "message": "exact text"}}`
    - Schedule a future WhatsApp or SMS message: `{{"type": "schedule_message", "channel": "whatsapp|sms", "target": "phone or name", "schedule": "tomorrow 9am|7pm|30m", "message": "exact text"}}`
    - Follow-ups: `{{"type": "send_followup", "id": 1, "message": "optional override"}}` | `{{"type": "dismiss_followup", "id": 1}}` | `{{"type": "snooze_followup", "id": 1, "hours": 24}}`
-   - Live Multi-Account Gmail (Full Read / Send / Reply / Draft / Organize across all connected accounts — optional `"account"` accepts label or number like `"Personal"` or `"6"`):
-     - Search emails: `{{"type": "search_gmail", "query": "Paystack OR interview OR from:sarah"}}`
+   - Live Multi-Account Gmail (Full Read / Send / Reply / Draft / Organize across all connected accounts — optional `"account"` accepts label, email address, or number like `"Personal"` or `"6"`):
+     - Search emails / List connected accounts: `{{"type": "search_gmail", "query": "Paystack OR interview OR from:sarah"}}` | `{{"type": "list_gmail_accounts"}}`
      - Send new email: `{{"type": "send_gmail", "to": "email@example.com", "subject": "...", "body": "...", "account": null}}`
      - Reply in-thread: `{{"type": "reply_gmail", "msg_id": "id from context or omit", "query": "sender/subject if no msg_id", "body": "...", "account": null}}`
      - Drafts (Create / List / Edit / Send): `{{"type": "create_gmail_draft", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "list_gmail_drafts", "account": null}}` | `{{"type": "edit_gmail_draft", "draft_id": "...", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "send_gmail_draft", "draft_id": "...", "account": null}}`
@@ -1233,6 +1263,32 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                                 .await?;
                             action_notes.push(format!("Scheduled {} #{} for +{}", channel, id, num));
                         }
+                    }
+                }
+                "list_gmail_accounts" | "gmail_accounts" => {
+                    let profiles = resolve_gmail_account_profiles(db, cfg, eff_gmail_cache, true).await;
+                    if profiles.is_empty() {
+                        extra_sections.push("📧 No Gmail accounts are configured yet.".to_string());
+                    } else {
+                        let lines: Vec<String> = profiles
+                            .iter()
+                            .map(|p| {
+                                let badge = if p.status == "connected" { "✅" } else { "⚠️" };
+                                let addr = p.email.as_deref().unwrap_or("(address unavailable)");
+                                let err_part = p
+                                    .error_hint
+                                    .as_deref()
+                                    .map(|e| format!(" — {}", e))
+                                    .unwrap_or_default();
+                                format!("{} #{} {} — {}{}", badge, p.index, p.label, addr, err_part)
+                            })
+                            .collect();
+                        extra_sections.push(format!(
+                            "📧 *Connected Gmail Accounts ({})*:\n{}",
+                            profiles.len(),
+                            lines.join("\n")
+                        ));
+                        action_notes.push(format!("Verified {} Gmail account(s)", profiles.len()));
                     }
                 }
                 "search_gmail" => {

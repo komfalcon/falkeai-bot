@@ -2048,6 +2048,22 @@ impl Database {
         }
     }
 
+    pub async fn delete_all_flags(&self) -> Result<u64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let removed = guard.data.flags.len() as u64;
+                guard.data.flags.clear();
+                guard.flush()?;
+                Ok(removed)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self.execute_remote("DELETE FROM flags", vec![]).await?;
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
     // ---- Blocked, Contacts, Guarded Groups, Safe Domains, Settings ----
     pub async fn is_blocked(&self, ids: &[String]) -> Result<bool> {
         match &self.backend {

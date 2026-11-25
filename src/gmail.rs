@@ -12,7 +12,9 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -23,10 +25,37 @@ use crate::media::{base64url_decode, base64url_encode};
 use crate::safety::{detect_injection, redact_secrets, sanitize_inbound};
 use crate::web_reader::decode_html_entities;
 
-/// In-memory cache of short-lived OAuth2 access tokens keyed by refresh token.
+/// Public-safe identity & health summary for a connected Gmail account (never holds secrets).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmailAccountProfile {
+    pub index: usize,
+    pub label: String,
+    pub email: Option<String>,
+    /// `"connected"` | `"auth_error"` | `"not_configured"`
+    pub status: String,
+    pub error_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedGmailProfile {
+    email: Option<String>,
+    status: String,
+    error_hint: Option<String>,
+    expires_at_ms: i64,
+}
+
+pub(crate) fn refresh_token_fingerprint(refresh_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"falke-gmail-profile-v1:");
+    hasher.update(refresh_token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// In-memory cache of short-lived OAuth2 access tokens and discovered Gmail profile addresses.
 #[derive(Default)]
 pub struct GmailTokenCache {
     tokens: Mutex<HashMap<String, (String, i64)>>,
+    profiles: Mutex<HashMap<String, CachedGmailProfile>>,
 }
 
 impl GmailTokenCache {
@@ -48,6 +77,45 @@ impl GmailTokenCache {
         if let Ok(mut guard) = self.tokens.lock() {
             guard.insert(refresh_token.to_string(), (access_token, expires_at_ms));
         }
+    }
+
+    fn get_cached_profile(&self, token_fp: &str, now_ms: i64) -> Option<CachedGmailProfile> {
+        let guard = self.profiles.lock().ok()?;
+        let item = guard.get(token_fp)?;
+        if item.expires_at_ms > now_ms {
+            Some(item.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn put_cached_profile_for_token(
+        &self,
+        refresh_token: &str,
+        email: Option<String>,
+        status: &str,
+        error_hint: Option<String>,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) {
+        let fp = refresh_token_fingerprint(refresh_token);
+        if let Ok(mut guard) = self.profiles.lock() {
+            guard.insert(
+                fp,
+                CachedGmailProfile {
+                    email,
+                    status: status.to_string(),
+                    error_hint,
+                    expires_at_ms: now_ms + ttl_ms,
+                },
+            );
+        }
+    }
+
+    pub fn get_known_email(&self, refresh_token: &str) -> Option<String> {
+        let fp = refresh_token_fingerprint(refresh_token);
+        let guard = self.profiles.lock().ok()?;
+        guard.get(&fp).and_then(|p| p.email.clone())
     }
 }
 
@@ -104,16 +172,11 @@ pub async fn resolve_gmail_accounts(db: &Database, cfg: &Config) -> Vec<GmailAcc
     out
 }
 
-/// Exchanges a Gmail OAuth2 refresh token for a fresh access token (cached in memory).
-pub async fn get_access_token(
+async fn exchange_refresh_token_raw(
     cfg: &Config,
-    cache: &GmailTokenCache,
     refresh_token: &str,
-) -> Result<String> {
-    let now_ms = Utc::now().timestamp_millis();
-    if let Some(cached) = cache.get_valid(refresh_token, now_ms) {
-        return Ok(cached);
-    }
+    now_ms: i64,
+) -> Result<(String, i64)> {
     if cfg.gmail_client_id.trim().is_empty() || cfg.gmail_client_secret.trim().is_empty() {
         return Err(anyhow!("GMAIL_CLIENT_ID or GMAIL_CLIENT_SECRET is not set"));
     }
@@ -147,8 +210,233 @@ pub async fn get_access_token(
         .ok_or_else(|| anyhow!("Missing access_token in Google OAuth response"))?
         .to_string();
     let expires_in = payload["expires_in"].as_i64().unwrap_or(3500).max(120);
-    cache.put(refresh_token, access_token.clone(), now_ms + expires_in * 1000);
+    Ok((access_token, now_ms + expires_in * 1000))
+}
+
+/// Exchanges a Gmail OAuth2 refresh token for a fresh access token (cached in memory).
+pub async fn get_access_token(
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    refresh_token: &str,
+) -> Result<String> {
+    let now_ms = Utc::now().timestamp_millis();
+    if let Some(cached) = cache.get_valid(refresh_token, now_ms) {
+        return Ok(cached);
+    }
+    let (access_token, expires_at_ms) = exchange_refresh_token_raw(cfg, refresh_token, now_ms).await?;
+    cache.put(refresh_token, access_token.clone(), expires_at_ms);
     Ok(access_token)
+}
+
+/// Discovers and caches the real Gmail email address (`GET /users/me/profile`) and live auth status
+/// for EVERY connected Gmail account concurrently, persisting hashed fingerprints -> email in Turso.
+pub async fn resolve_gmail_account_profiles(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    force_refresh: bool,
+) -> Vec<GmailAccountProfile> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    if accounts.is_empty() {
+        return Vec::new();
+    }
+    if cfg.gmail_client_id.trim().is_empty() || cfg.gmail_client_secret.trim().is_empty() {
+        return accounts
+            .iter()
+            .enumerate()
+            .map(|(idx, acc)| GmailAccountProfile {
+                index: idx + 1,
+                label: acc.label.clone(),
+                email: None,
+                status: "not_configured".to_string(),
+                error_hint: Some("Missing GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET".to_string()),
+            })
+            .collect();
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let mut persisted_map: HashMap<String, String> = db
+        .get_setting("gmail_account_profiles_json")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+        .unwrap_or_default();
+
+    let mut out: Vec<Option<GmailAccountProfile>> = vec![None; accounts.len()];
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (idx, acc) in accounts.iter().enumerate() {
+        let fp = refresh_token_fingerprint(&acc.refresh_token);
+        if !force_refresh {
+            if let Some(cached) = cache.get_cached_profile(&fp, now_ms) {
+                out[idx] = Some(GmailAccountProfile {
+                    index: idx + 1,
+                    label: acc.label.clone(),
+                    email: cached.email.or_else(|| persisted_map.get(&fp).cloned()),
+                    status: cached.status,
+                    error_hint: cached.error_hint,
+                });
+                continue;
+            }
+        }
+        let cfg_c = cfg.clone();
+        let acc_c = acc.clone();
+        let pre_tok = cache.get_valid(&acc.refresh_token, now_ms);
+        let fallback_email = persisted_map.get(&fp).cloned();
+        join_set.spawn(async move {
+            let (token, fresh_exp) = match pre_tok {
+                Some(t) => (t, None),
+                None => match exchange_refresh_token_raw(&cfg_c, &acc_c.refresh_token, now_ms).await {
+                    Ok((t, exp)) => (t, Some(exp)),
+                    Err(e) => {
+                        let short_err = redact_secrets(&e.to_string(), &cfg_c)
+                            .chars()
+                            .take(120)
+                            .collect::<String>();
+                        return (
+                            idx,
+                            acc_c,
+                            None,
+                            None,
+                            fallback_email,
+                            "auth_error".to_string(),
+                            Some(short_err),
+                        );
+                    }
+                },
+            };
+
+            let resp = gmail_http()
+                .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
+                .bearer_auth(&token)
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let email = r
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v["emailAddress"].as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .or(fallback_email);
+                    (
+                        idx,
+                        acc_c,
+                        Some(token),
+                        fresh_exp,
+                        email,
+                        "connected".to_string(),
+                        None,
+                    )
+                }
+                Ok(r) => {
+                    let st = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    let short_err = format!(
+                        "HTTP {}: {}",
+                        st,
+                        redact_secrets(&body, &cfg_c).chars().take(100).collect::<String>()
+                    );
+                    (
+                        idx,
+                        acc_c,
+                        Some(token),
+                        fresh_exp,
+                        fallback_email,
+                        "auth_error".to_string(),
+                        Some(short_err),
+                    )
+                }
+                Err(e) => {
+                    let short_err = redact_secrets(&e.to_string(), &cfg_c)
+                        .chars()
+                        .take(100)
+                        .collect::<String>();
+                    (
+                        idx,
+                        acc_c,
+                        Some(token),
+                        fresh_exp,
+                        fallback_email,
+                        "auth_error".to_string(),
+                        Some(short_err),
+                    )
+                }
+            }
+        });
+    }
+
+    let mut map_dirty = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(6));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                join_set.abort_all();
+                break;
+            }
+            next = join_set.join_next() => {
+                let Some(res) = next else { break; };
+                if let Ok((idx, acc, tok_opt, exp_opt, email, status, err_hint)) = res {
+                    if let (Some(t), Some(exp)) = (tok_opt, exp_opt) {
+                        cache.put(&acc.refresh_token, t, exp);
+                    }
+                    let ttl = if status == "connected" {
+                        6 * 3_600_000
+                    } else {
+                        5 * 60_000
+                    };
+                    cache.put_cached_profile_for_token(
+                        &acc.refresh_token,
+                        email.clone(),
+                        &status,
+                        err_hint.clone(),
+                        ttl,
+                        now_ms,
+                    );
+                    if let Some(ref em) = email {
+                        let fp = refresh_token_fingerprint(&acc.refresh_token);
+                        if persisted_map.get(&fp) != Some(em) {
+                            persisted_map.insert(fp, em.clone());
+                            map_dirty = true;
+                        }
+                    }
+                    out[idx] = Some(GmailAccountProfile {
+                        index: idx + 1,
+                        label: acc.label,
+                        email,
+                        status,
+                        error_hint: err_hint,
+                    });
+                }
+            }
+        }
+    }
+
+    if map_dirty {
+        if let Ok(serialized) = serde_json::to_string(&persisted_map) {
+            let _ = db.set_setting("gmail_account_profiles_json", &serialized).await;
+        }
+    }
+
+    out.into_iter()
+        .enumerate()
+        .map(|(idx, opt)| {
+            opt.unwrap_or_else(|| {
+                let fp = refresh_token_fingerprint(&accounts[idx].refresh_token);
+                GmailAccountProfile {
+                    index: idx + 1,
+                    label: accounts[idx].label.clone(),
+                    email: persisted_map.get(&fp).cloned(),
+                    status: "timeout".to_string(),
+                    error_hint: Some("Profile check timed out".to_string()),
+                }
+            })
+        })
+        .collect()
 }
 
 /// Extracts a header value case-insensitively from a Gmail API message payload.
@@ -574,27 +862,26 @@ pub fn extract_bank_alert_from_email(
     ))
 }
 
-async fn fetch_account_messages(
+async fn fetch_account_messages_with_token(
     cfg: &Config,
-    cache: &GmailTokenCache,
-    account: &GmailAccountConfig,
+    token: &str,
+    account_label: &str,
     query: &str,
     max_results: usize,
 ) -> Result<Vec<Value>> {
-    let token = get_access_token(cfg, cache, &account.refresh_token).await?;
     let client = gmail_http();
     let list_url = format!(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages?q={}&maxResults={}",
         url_encode_query(query),
         max_results.clamp(1, 25)
     );
-    let list_resp = client.get(&list_url).bearer_auth(&token).send().await?;
+    let list_resp = client.get(&list_url).bearer_auth(token).send().await?;
     if !list_resp.status().is_success() {
         let st = list_resp.status();
         let err_txt = list_resp.text().await.unwrap_or_default();
         return Err(anyhow!(
             "Gmail list failed for {} ({}): {}",
-            account.label,
+            account_label,
             st,
             redact_secrets(&err_txt, cfg)
         ));
@@ -613,7 +900,7 @@ async fn fetch_account_messages(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
             url_encode_query(id)
         );
-        if let Ok(resp) = client.get(&get_url).bearer_auth(&token).send().await {
+        if let Ok(resp) = client.get(&get_url).bearer_auth(token).send().await {
             if resp.status().is_success() {
                 if let Ok(full_msg) = resp.json::<Value>().await {
                     out.push(full_msg);
@@ -709,8 +996,8 @@ pub async fn sync_all_gmail_accounts(
     Ok(newly_found)
 }
 
-/// Searches across ALL connected Gmail accounts for an arbitrary query (e.g. "Paystack", "interview",
-/// "from:sarah", or "is:unread") for live J.A.R.V.I.S. answers.
+/// Searches across ALL connected Gmail accounts **concurrently** for an arbitrary query
+/// (e.g. "Paystack", "interview", "from:sarah", or "is:unread") for fast live J.A.R.V.I.S. answers.
 pub async fn search_all_gmail_accounts(
     db: &Database,
     cfg: &Config,
@@ -725,37 +1012,78 @@ pub async fn search_all_gmail_accounts(
         ));
     }
     let clean_q = if query.trim().is_empty() {
-        "is:unread newer_than:7d"
+        "is:unread newer_than:7d".to_string()
     } else {
-        query.trim()
+        query.trim().to_string()
     };
     let now_ms = Utc::now().timestamp_millis();
-    let mut results = Vec::new();
-    for acc in &accounts {
-        match fetch_account_messages(cfg, cache, acc, clean_q, max_per_account).await {
-            Ok(raw_msgs) => {
-                for m in raw_msgs {
-                    if let Some(mut rec) = parse_gmail_message_to_record(&acc.label, &m, now_ms) {
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for acc in accounts {
+        let cfg_c = cfg.clone();
+        let q_c = clean_q.clone();
+        let pre_tok = cache.get_valid(&acc.refresh_token, now_ms);
+        join_set.spawn(async move {
+            let (tok, fresh_exp) = match pre_tok {
+                Some(t) => (t, None),
+                None => match exchange_refresh_token_raw(&cfg_c, &acc.refresh_token, now_ms).await {
+                    Ok((t, exp)) => (t, Some(exp)),
+                    Err(e) => {
+                        tracing::warn!("Gmail search skipped {} (auth): {}", acc.label, e);
+                        return (acc, None, None, Vec::new());
+                    }
+                },
+            };
+            let recs = match fetch_account_messages_with_token(&cfg_c, &tok, &acc.label, &q_c, max_per_account).await {
+                Ok(raw_msgs) => raw_msgs
+                    .into_iter()
+                    .filter_map(|m| {
+                        let mut rec = parse_gmail_message_to_record(&acc.label, &m, now_ms)?;
                         if !rec.msg_id.contains(':') {
                             rec.msg_id = format!("{}:{}", acc.label, rec.msg_id);
                         }
-                        results.push(rec);
-                    }
+                        Some(rec)
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("Gmail search skipped {}: {}", acc.label, e);
+                    Vec::new()
                 }
+            };
+            (acc, Some(tok), fresh_exp, recs)
+        });
+    }
+
+    let mut results = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(12));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                join_set.abort_all();
+                break;
             }
-            Err(e) => {
-                tracing::warn!("Gmail search skipped {}: {}", acc.label, e);
+            next = join_set.join_next() => {
+                let Some(res) = next else { break; };
+                if let Ok((acc, tok_opt, exp_opt, recs)) = res {
+                    if let (Some(t), Some(exp)) = (tok_opt, exp_opt) {
+                        cache.put(&acc.refresh_token, t, exp);
+                    }
+                    results.extend(recs);
+                }
             }
         }
     }
+
     results.sort_by(|a, b| b.received_at.cmp(&a.received_at));
     Ok(results)
 }
 
-/// Selects a configured Gmail account by friendly label, partial label, or 1-based index
-/// (e.g. `"2"`, `"#2"`, `"gmail 6"`, `"Aurikrex"`), defaulting to the primary account.
-pub fn select_gmail_account<'a>(
+/// Selects a configured Gmail account by friendly label, partial label, discovered email address
+/// (via `cache`), or 1-based index (e.g. `"2"`, `"#2"`, `"gmail 6"`, `"Aurikrex"`), defaulting to primary.
+pub fn select_gmail_account_with_cache<'a>(
     accounts: &'a [GmailAccountConfig],
+    cache: Option<&GmailTokenCache>,
     hint: Option<&str>,
 ) -> Option<&'a GmailAccountConfig> {
     if accounts.is_empty() {
@@ -766,8 +1094,26 @@ pub fn select_gmail_account<'a>(
         if let Some(found) = accounts.iter().find(|a| a.label.to_lowercase() == hl) {
             return Some(found);
         }
+        if let Some(c) = cache {
+            if let Some(found) = accounts.iter().find(|a| {
+                c.get_known_email(&a.refresh_token)
+                    .map(|em| em.to_lowercase() == hl)
+                    .unwrap_or(false)
+            }) {
+                return Some(found);
+            }
+        }
         if let Some(found) = accounts.iter().find(|a| a.label.to_lowercase().contains(&hl)) {
             return Some(found);
+        }
+        if let Some(c) = cache {
+            if let Some(found) = accounts.iter().find(|a| {
+                c.get_known_email(&a.refresh_token)
+                    .map(|em| em.to_lowercase().contains(&hl))
+                    .unwrap_or(false)
+            }) {
+                return Some(found);
+            }
         }
         let digits_only: String = hl.chars().filter(|c| c.is_ascii_digit()).collect();
         if let Ok(idx1) = digits_only.parse::<usize>() {
@@ -777,6 +1123,14 @@ pub fn select_gmail_account<'a>(
         }
     }
     accounts.first()
+}
+
+/// Selects a configured Gmail account by friendly label, partial label, or 1-based index.
+pub fn select_gmail_account<'a>(
+    accounts: &'a [GmailAccountConfig],
+    hint: Option<&str>,
+) -> Option<&'a GmailAccountConfig> {
+    select_gmail_account_with_cache(accounts, None, hint)
 }
 
 /// Splits a Turso composite Gmail ID (`"Gmail #2:18f123abc"`) into `(Some("Gmail #2"), "18f123abc")`.
@@ -888,7 +1242,7 @@ async fn resolve_target_gmail_message(
     let (parsed_acct, clean_part) = split_composite_msg_id(msg_id_or_query);
     let eff_hint = parsed_acct.as_deref().or(account_hint);
     if looks_like_raw_gmail_id(&clean_part) {
-        let acc = select_gmail_account(&accounts, eff_hint)
+        let acc = select_gmail_account_with_cache(&accounts, Some(cache), eff_hint)
             .cloned()
             .ok_or_else(|| anyhow!("No Gmail account configured"))?;
         return Ok((acc, clean_part));
@@ -896,7 +1250,7 @@ async fn resolve_target_gmail_message(
 
     // Search across targeted account (if hint given) or all connected Gmail accounts
     let search_accounts: Vec<&GmailAccountConfig> = if let Some(h) = eff_hint {
-        if let Some(a) = select_gmail_account(&accounts, Some(h)) {
+        if let Some(a) = select_gmail_account_with_cache(&accounts, Some(cache), Some(h)) {
             vec![a]
         } else {
             accounts.iter().collect()
@@ -947,7 +1301,7 @@ pub async fn create_gmail_draft(
     body: &str,
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
-    let acc = select_gmail_account(&accounts, account_hint)
+    let acc = select_gmail_account_with_cache(&accounts, Some(cache), account_hint)
         .ok_or_else(|| anyhow!("No Gmail account configured"))?;
 
     let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
@@ -983,7 +1337,9 @@ pub async fn list_gmail_drafts(
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
     let target_accounts: Vec<&GmailAccountConfig> = if let Some(h) = account_hint {
-        select_gmail_account(&accounts, Some(h)).into_iter().collect()
+        select_gmail_account_with_cache(&accounts, Some(cache), Some(h))
+            .into_iter()
+            .collect()
     } else {
         accounts.iter().collect()
     };
@@ -1062,7 +1418,7 @@ pub async fn update_gmail_draft(
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
     let (parsed_acct, clean_id) = split_composite_msg_id(draft_id);
-    let acc = select_gmail_account(&accounts, parsed_acct.as_deref().or(account_hint))
+    let acc = select_gmail_account_with_cache(&accounts, Some(cache), parsed_acct.as_deref().or(account_hint))
         .ok_or_else(|| anyhow!("No Gmail account configured"))?;
     if clean_id.is_empty() {
         return Err(anyhow!("Missing draft_id"));
@@ -1103,7 +1459,7 @@ pub async fn send_gmail_draft(
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
     let (parsed_acct, clean_id) = split_composite_msg_id(draft_id);
-    let acc = select_gmail_account(&accounts, parsed_acct.as_deref().or(account_hint))
+    let acc = select_gmail_account_with_cache(&accounts, Some(cache), parsed_acct.as_deref().or(account_hint))
         .ok_or_else(|| anyhow!("No Gmail account configured"))?;
     if clean_id.is_empty() {
         return Err(anyhow!("Missing draft_id"));
@@ -1139,7 +1495,7 @@ pub async fn send_gmail_message(
     body: &str,
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
-    let acc = select_gmail_account(&accounts, account_hint)
+    let acc = select_gmail_account_with_cache(&accounts, Some(cache), account_hint)
         .ok_or_else(|| anyhow!("No Gmail account configured"))?;
 
     let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
