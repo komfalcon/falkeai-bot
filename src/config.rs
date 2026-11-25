@@ -82,6 +82,79 @@ fn push_unique_keys(out: &mut Vec<String>, raw: &str) {
     }
 }
 
+/// Loads up to 20 indexed Gmail accounts (`GMAIL_REFRESH_TOKEN`, `GMAIL_REFRESH_TOKEN_1`..`_20`
+/// with optional `GMAIL_LABEL`..`_20`) plus unlimited JSON entries in `GMAIL_ACCOUNTS_JSON`.
+pub fn load_gmail_accounts_from_env_fn<F>(get_env: F) -> Vec<GmailAccountConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut gmail_accounts: Vec<GmailAccountConfig> = Vec::new();
+    let mut slots: Vec<(String, String, usize)> = vec![(
+        "GMAIL_REFRESH_TOKEN".to_string(),
+        "GMAIL_LABEL".to_string(),
+        1,
+    )];
+    for n in 1..=20 {
+        slots.push((
+            format!("GMAIL_REFRESH_TOKEN_{}", n),
+            format!("GMAIL_LABEL_{}", n),
+            n,
+        ));
+    }
+
+    for (tok_var, lbl_var, num) in slots {
+        if let Some(tok) = get_env(&tok_var) {
+            let clean_tok = tok.trim().to_string();
+            if !clean_tok.is_empty() && !gmail_accounts.iter().any(|a| a.refresh_token == clean_tok)
+            {
+                let label = get_env(&lbl_var)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if num == 1 && gmail_accounts.is_empty() {
+                            "Primary Gmail".to_string()
+                        } else {
+                            format!("Gmail #{}", num)
+                        }
+                    });
+                gmail_accounts.push(GmailAccountConfig {
+                    label,
+                    refresh_token: clean_tok,
+                });
+            }
+        }
+    }
+
+    if let Some(raw_json) = get_env("GMAIL_ACCOUNTS_JSON") {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw_json) {
+            for (i, item) in arr.iter().enumerate() {
+                if let Some(rt) = item["refresh_token"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if !gmail_accounts.iter().any(|a| a.refresh_token == rt) {
+                        let lbl = item["label"]
+                            .as_str()
+                            .or_else(|| item["email"].as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                format!("Gmail #{}", gmail_accounts.len() + i + 1)
+                            });
+                        gmail_accounts.push(GmailAccountConfig {
+                            label: lbl,
+                            refresh_token: rt.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    gmail_accounts
+}
+
 pub fn normalize_ntfy_url(raw: &str) -> String {
     let trimmed = raw
         .trim()
@@ -442,66 +515,7 @@ impl Config {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let mut gmail_accounts: Vec<GmailAccountConfig> = Vec::new();
-        for (idx, (tok_var, lbl_var)) in [
-            ("GMAIL_REFRESH_TOKEN", "GMAIL_LABEL"),
-            ("GMAIL_REFRESH_TOKEN_2", "GMAIL_LABEL_2"),
-            ("GMAIL_REFRESH_TOKEN_3", "GMAIL_LABEL_3"),
-            ("GMAIL_REFRESH_TOKEN_4", "GMAIL_LABEL_4"),
-            ("GMAIL_REFRESH_TOKEN_5", "GMAIL_LABEL_5"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            if let Ok(tok) = env::var(tok_var) {
-                let clean_tok = tok.trim().to_string();
-                if !clean_tok.is_empty()
-                    && !gmail_accounts.iter().any(|a| a.refresh_token == clean_tok)
-                {
-                    let label = env::var(lbl_var)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| {
-                            if idx == 0 {
-                                "Primary Gmail".to_string()
-                            } else {
-                                format!("Gmail #{}", idx + 1)
-                            }
-                        });
-                    gmail_accounts.push(GmailAccountConfig {
-                        label,
-                        refresh_token: clean_tok,
-                    });
-                }
-            }
-        }
-        // Also support JSON array in GMAIL_ACCOUNTS_JSON: [{"label":"Work","refresh_token":"1//..."}]
-        if let Ok(raw_json) = env::var("GMAIL_ACCOUNTS_JSON") {
-            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw_json) {
-                for (i, item) in arr.iter().enumerate() {
-                    if let Some(rt) = item["refresh_token"]
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        if !gmail_accounts.iter().any(|a| a.refresh_token == rt) {
-                            let lbl = item["label"]
-                                .as_str()
-                                .or_else(|| item["email"].as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("Gmail #{}", gmail_accounts.len() + i + 1));
-                            gmail_accounts.push(GmailAccountConfig {
-                                label: lbl,
-                                refresh_token: rt.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        let gmail_accounts = load_gmail_accounts_from_env_fn(|k| env::var(k).ok());
 
         let github_token = env::var("GITHUB_TOKEN")
             .ok()

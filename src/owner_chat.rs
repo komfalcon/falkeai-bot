@@ -17,7 +17,11 @@ use crate::brain::{extract_json_object, HISTORY_MAX};
 use crate::commands::{resolve_contact_target, user_explicitly_requested_voice};
 use crate::config::{Config, BOT_NAME};
 use crate::db::{ChatTurn, ConversationState, Database, OwnerStatus};
-use crate::gmail::{create_gmail_draft, search_all_gmail_accounts, GmailTokenCache};
+use crate::gmail::{
+    create_gmail_draft, list_gmail_drafts, modify_gmail_labels, reply_gmail_message,
+    resolve_gmail_accounts, search_all_gmail_accounts, send_gmail_draft, send_gmail_message,
+    trash_gmail_message, untrash_gmail_message, update_gmail_draft, GmailTokenCache,
+};
 use crate::safety::{detect_injection, redact_secrets};
 use crate::util::lagos_parts;
 use crate::web_search::{search_github_account, search_web_and_summarize};
@@ -220,18 +224,23 @@ pub fn parse_owner_chat_response(raw: &str) -> (String, Vec<Value>) {
     )
 }
 
-/// Deterministic intent firewall against Indirect Prompt Injection:
-/// Inspects ONLY Falcon's own raw utterance (stripping any appended `[Web/Social Link Context...]`
-/// or `[Image attached...]` blocks) to verify Falcon genuinely asked to contact/message/call/draft
-/// someone before executing external communication actions.
-pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
-    let owner_only = raw_text
+/// Strips any appended untrusted external context blocks so intent firewalls inspect ONLY Falcon's own words.
+fn strip_untrusted_owner_suffix(raw_text: &str) -> &str {
+    raw_text
         .split("\n\n[Web/Social Link Context")
         .next()
         .unwrap_or(raw_text)
         .split("\n[Image attached")
         .next()
-        .unwrap_or(raw_text);
+        .unwrap_or(raw_text)
+}
+
+/// Deterministic intent firewall against Indirect Prompt Injection:
+/// Inspects ONLY Falcon's own raw utterance (stripping any appended `[Web/Social Link Context...]`
+/// or `[Image attached...]` blocks) to verify Falcon genuinely asked to contact/message/call/email/draft
+/// someone before executing external communication actions.
+pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
+    let owner_only = strip_untrusted_owner_suffix(raw_text);
     let lower = format!(" {} ", owner_only.to_lowercase());
     const INTENT_VERBS: &[&str] = &[
         " send ",
@@ -253,8 +262,15 @@ pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
         " draft",
         " compose",
         " write ",
+        " forward",
         " email to",
         " mail to",
+        " email him",
+        " email her",
+        " email them",
+        " mail him",
+        " mail her",
+        " mail them",
         " schedule",
         " approve",
         " followup",
@@ -269,6 +285,73 @@ pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
         " ping ",
     ];
     INTENT_VERBS.iter().any(|kw| lower.contains(kw))
+}
+
+/// Deterministic mailbox-mutation intent firewall against Indirect Prompt Injection:
+/// Inspects ONLY Falcon's own raw utterance to verify he explicitly asked to edit, mark,
+/// archive, star, trash, or restore Gmail messages/drafts before executing mailbox-modifying actions.
+pub fn owner_intent_allows_email_modify(raw_text: &str) -> bool {
+    let owner_only = strip_untrusted_owner_suffix(raw_text);
+    let trimmed = owner_only.trim().to_lowercase();
+    let lower = format!(" {} ", trimmed);
+    if trimmed.starts_with("trash ")
+        || trimmed.starts_with("archive ")
+        || trimmed.starts_with("star ")
+        || trimmed.starts_with("edit ")
+        || trimmed.starts_with("update ")
+    {
+        return true;
+    }
+    const MODIFY_VERBS: &[&str] = &[
+        " delete",
+        " remove",
+        " untrash",
+        " restore",
+        " unstar",
+        " mark ",
+        " set as read",
+        " set as unread",
+        " archive it",
+        " archive that",
+        " archive this",
+        " archive the",
+        " archive my",
+        " archive all",
+        " archive email",
+        " archive mail",
+        " trash it",
+        " trash that",
+        " trash this",
+        " trash the",
+        " trash my",
+        " trash all",
+        " trash email",
+        " trash mail",
+        " to trash",
+        " in trash",
+        " star it",
+        " star that",
+        " star this",
+        " star the",
+        " star email",
+        " star mail",
+        " add star",
+        " clear inbox",
+        " clean inbox",
+        " clean up",
+        " edit draft",
+        " edit the draft",
+        " edit my draft",
+        " update draft",
+        " update the draft",
+        " update my draft",
+        " change draft",
+        " rewrite draft",
+        " edit email",
+        " edit the email",
+        " update email",
+    ];
+    MODIFY_VERBS.iter().any(|kw| lower.contains(kw))
 }
 
 /// Blocks shortcodes (< 7 digits, e.g. premium SMS billing codes or emergency numbers) from automated dialing/SMS.
@@ -442,13 +525,28 @@ where
         }
     }
 
+    let connected_gmail = resolve_gmail_accounts(db, cfg).await;
+    if !connected_gmail.is_empty() {
+        let acct_labels: Vec<String> = connected_gmail
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("#{} {}", i + 1, a.label))
+            .collect();
+        ctx_blocks.push(format!(
+            "Connected Gmail Accounts ({}): {}",
+            connected_gmail.len(),
+            acct_labels.join(" | ")
+        ));
+    }
+
     if !priority_emails.is_empty() {
         let lines: Vec<String> = priority_emails
             .iter()
             .take(8)
             .map(|e| {
                 format!(
-                    "  * [{} | {} | {}] {} — {}: {}",
+                    "  * [id: {} | {} | {} | {}] {} — {}: {}",
+                    sanitize_preview_for_owner_prompt(&e.msg_id, 64),
                     e.account_label,
                     e.priority,
                     e.category,
@@ -677,8 +775,12 @@ If Falcon asks to translate or speaks Yoruba, Nigerian Pidgin, or French, act as
    - Send WhatsApp DM right now: `{{"type": "send_dm", "target": "phone or name", "message": "exact text"}}`
    - Schedule a future WhatsApp or SMS message: `{{"type": "schedule_message", "channel": "whatsapp|sms", "target": "phone or name", "schedule": "tomorrow 9am|7pm|30m", "message": "exact text"}}`
    - Follow-ups: `{{"type": "send_followup", "id": 1, "message": "optional override"}}` | `{{"type": "dismiss_followup", "id": 1}}` | `{{"type": "snooze_followup", "id": 1, "hours": 24}}`
-   - Live Multi-Account Gmail Search: `{{"type": "search_gmail", "query": "Paystack OR interview OR from:sarah"}}`
-   - Save Gmail Reply Draft (draft-only, NEVER auto-sends): `{{"type": "create_gmail_draft", "to": "email@example.com", "subject": "Re: ...", "body": "...", "account": null}}`
+   - Live Multi-Account Gmail (Full Read / Send / Reply / Draft / Organize across all connected accounts — optional `"account"` accepts label or number like `"Personal"` or `"6"`):
+     - Search emails: `{{"type": "search_gmail", "query": "Paystack OR interview OR from:sarah"}}`
+     - Send new email: `{{"type": "send_gmail", "to": "email@example.com", "subject": "...", "body": "...", "account": null}}`
+     - Reply in-thread: `{{"type": "reply_gmail", "msg_id": "id from context or omit", "query": "sender/subject if no msg_id", "body": "...", "account": null}}`
+     - Drafts (Create / List / Edit / Send): `{{"type": "create_gmail_draft", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "list_gmail_drafts", "account": null}}` | `{{"type": "edit_gmail_draft", "draft_id": "...", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "send_gmail_draft", "draft_id": "...", "account": null}}`
+     - Organize / Clean Inbox: `{{"type": "mark_gmail_read", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "mark_gmail_unread", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "archive_gmail", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "star_gmail", "msg_id": "...", "query": "...", "starred": true, "account": null}}` | `{{"type": "trash_gmail", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "untrash_gmail", "msg_id": "...", "query": "...", "account": null}}`
    - Live Online Web Search: `{{"type": "search_web", "query": "search query"}}`
    - GitHub Search / Notifications: `{{"type": "search_github", "query": "notifications|repo query"}}`
    - Bank/Paystack/Stripe Ledger Summary: `{{"type": "query_bank_ledger", "days": 7}}`
@@ -769,6 +871,7 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
     let eff_gmail_cache = gmail_cache.unwrap_or(&local_gmail_cache);
 
     let comms_allowed = owner_intent_allows_outbound_comms(text);
+    let email_mod_allowed = owner_intent_allows_email_modify(text);
 
     for act in actions.iter().take(8) {
         let kind = act["type"].as_str().unwrap_or("").trim().to_lowercase();
@@ -1156,7 +1259,53 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                         }
                     }
                 }
-                "create_gmail_draft" => {
+                "send_gmail" | "send_email" => {
+                    if !comms_allowed {
+                        action_notes.push("Blocked unrequested send_gmail".to_string());
+                        continue;
+                    }
+                    let to = act["to"].as_str().unwrap_or("").trim();
+                    let subject = act["subject"].as_str().unwrap_or("Quick note").trim();
+                    let body = act["body"].as_str().unwrap_or("").trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !to.is_empty() && !body.is_empty() {
+                        match send_gmail_message(db, cfg, eff_gmail_cache, acc_hint, to, subject, body).await {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Email send failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "reply_gmail" | "reply_email" => {
+                    if !comms_allowed {
+                        action_notes.push("Blocked unrequested reply_gmail".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let body = act["body"]
+                        .as_str()
+                        .or_else(|| act["message"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() && !body.is_empty() {
+                        match reply_gmail_message(db, cfg, eff_gmail_cache, acc_hint, target, body).await {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Email reply failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "create_gmail_draft" | "draft_gmail" => {
                     if !comms_allowed {
                         action_notes.push("Blocked unrequested create_gmail_draft".to_string());
                         continue;
@@ -1170,6 +1319,261 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                             Ok(info) => action_notes.push(info),
                             Err(e) => action_notes.push(format!(
                                 "Draft failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "list_gmail_drafts" | "gmail_drafts" => {
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    match list_gmail_drafts(db, cfg, eff_gmail_cache, acc_hint, 10).await {
+                        Ok(summary) => {
+                            extra_sections.push(summary);
+                            action_notes.push("Listed Gmail drafts".to_string());
+                        }
+                        Err(e) => action_notes.push(format!(
+                            "Draft list failed: {}",
+                            redact_secrets(&e.to_string(), cfg)
+                        )),
+                    }
+                }
+                "edit_gmail_draft" | "update_gmail_draft" => {
+                    if !(comms_allowed || email_mod_allowed) {
+                        action_notes.push("Blocked unrequested edit_gmail_draft".to_string());
+                        continue;
+                    }
+                    let draft_id = act["draft_id"]
+                        .as_str()
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let to = act["to"].as_str().unwrap_or("").trim();
+                    let subject = act["subject"].as_str().unwrap_or("Re: Follow-up").trim();
+                    let body = act["body"].as_str().unwrap_or("").trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !draft_id.is_empty() && !to.is_empty() && !body.is_empty() {
+                        match update_gmail_draft(
+                            db,
+                            cfg,
+                            eff_gmail_cache,
+                            acc_hint,
+                            draft_id,
+                            to,
+                            subject,
+                            body,
+                        )
+                        .await
+                        {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Draft edit failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "send_gmail_draft" => {
+                    if !comms_allowed {
+                        action_notes.push("Blocked unrequested send_gmail_draft".to_string());
+                        continue;
+                    }
+                    let draft_id = act["draft_id"]
+                        .as_str()
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !draft_id.is_empty() {
+                        match send_gmail_draft(db, cfg, eff_gmail_cache, acc_hint, draft_id).await {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Draft send failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "mark_gmail_read" => {
+                    if !email_mod_allowed {
+                        action_notes.push("Blocked unrequested mark_gmail_read".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() {
+                        match modify_gmail_labels(
+                            db,
+                            cfg,
+                            eff_gmail_cache,
+                            acc_hint,
+                            target,
+                            &[],
+                            &["UNREAD"],
+                            "Marked read",
+                        )
+                        .await
+                        {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Mark read failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "mark_gmail_unread" => {
+                    if !email_mod_allowed {
+                        action_notes.push("Blocked unrequested mark_gmail_unread".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() {
+                        match modify_gmail_labels(
+                            db,
+                            cfg,
+                            eff_gmail_cache,
+                            acc_hint,
+                            target,
+                            &["UNREAD"],
+                            &[],
+                            "Marked unread",
+                        )
+                        .await
+                        {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Mark unread failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "archive_gmail" => {
+                    if !email_mod_allowed {
+                        action_notes.push("Blocked unrequested archive_gmail".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() {
+                        match modify_gmail_labels(
+                            db,
+                            cfg,
+                            eff_gmail_cache,
+                            acc_hint,
+                            target,
+                            &[],
+                            &["INBOX"],
+                            "Archived",
+                        )
+                        .await
+                        {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Archive failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "star_gmail" | "unstar_gmail" => {
+                    if !email_mod_allowed {
+                        action_notes.push(format!("Blocked unrequested {}", kind));
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    let starred = if kind == "unstar_gmail" {
+                        false
+                    } else {
+                        act["starred"].as_bool().unwrap_or(true)
+                    };
+                    if !target.is_empty() {
+                        let (add, rem, lbl): (&[&str], &[&str], &str) = if starred {
+                            (&["STARRED"], &[], "Starred")
+                        } else {
+                            (&[], &["STARRED"], "Unstarred")
+                        };
+                        match modify_gmail_labels(
+                            db,
+                            cfg,
+                            eff_gmail_cache,
+                            acc_hint,
+                            target,
+                            add,
+                            rem,
+                            lbl,
+                        )
+                        .await
+                        {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Star update failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "trash_gmail" | "delete_gmail" | "delete_email" => {
+                    if !email_mod_allowed {
+                        action_notes.push("Blocked unrequested trash_gmail".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() {
+                        match trash_gmail_message(db, cfg, eff_gmail_cache, acc_hint, target).await {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Trash email failed: {}",
+                                redact_secrets(&e.to_string(), cfg)
+                            )),
+                        }
+                    }
+                }
+                "untrash_gmail" | "restore_gmail" => {
+                    if !email_mod_allowed {
+                        action_notes.push("Blocked unrequested untrash_gmail".to_string());
+                        continue;
+                    }
+                    let target = act["msg_id"]
+                        .as_str()
+                        .or_else(|| act["query"].as_str())
+                        .or_else(|| act["id"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let acc_hint = act["account"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if !target.is_empty() {
+                        match untrash_gmail_message(db, cfg, eff_gmail_cache, acc_hint, target).await {
+                            Ok(info) => action_notes.push(info),
+                            Err(e) => action_notes.push(format!(
+                                "Restore email failed: {}",
                                 redact_secrets(&e.to_string(), cfg)
                             )),
                         }

@@ -316,24 +316,29 @@ where
     // emails / gmail — live multi-account priority unread Gmail view
     if matches!(lower.as_str(), "emails" | "gmail" | "check emails" | "check gmail") {
         let now_ms = Utc::now().timestamp_millis();
-        if cfg.has_gmail() {
+        let accounts = crate::gmail::resolve_gmail_accounts(db, cfg).await;
+        if !accounts.is_empty() && !cfg.gmail_client_id.trim().is_empty() {
             let cache = GmailTokenCache::new();
             let _ = sync_all_gmail_accounts(db, cfg, &cache, now_ms).await;
         }
         let recent = db.list_recent_priority_emails(10).await?;
         if recent.is_empty() {
-            if !cfg.has_gmail() {
+            if accounts.is_empty() || cfg.gmail_client_id.trim().is_empty() {
                 return Ok(Some(
-                    "📧 *Gmail is not connected yet.* Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` (plus `_2`, `_3` for extra accounts) in Heroku Config Vars."
+                    "📧 *Gmail is not connected yet.* Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` (plus `_2`..`_20` for extra accounts) in Heroku Config Vars."
                         .to_string(),
                 ));
             }
-            return Ok(Some("✅ No unread priority emails across your connected Gmail accounts.".to_string()));
+            return Ok(Some(format!(
+                "✅ No unread priority emails across your {} connected Gmail account(s).",
+                accounts.len()
+            )));
         }
         let lines: Vec<String> = recent.iter().map(format_email_line).collect();
         return Ok(Some(format!(
-            "📧 *Priority Gmail Inbox ({})*:\n{}",
+            "📧 *Priority Gmail Inbox ({} across {} account(s))*:\n{}",
             recent.len(),
+            accounts.len().max(1),
             lines.join("\n")
         )));
     }

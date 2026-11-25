@@ -1,11 +1,12 @@
 //! Multi-account official Gmail REST API integration (`gmail.googleapis.com`).
 //!
 //! - Zero extra Cargo crates (pure `reqwest` + `serde_json` + zero-dep `base64url_decode`/`encode`).
-//! - Supports unlimited Gmail accounts (`GMAIL_REFRESH_TOKEN`, `GMAIL_REFRESH_TOKEN_2..5`,
+//! - Supports unlimited Gmail accounts (`GMAIL_REFRESH_TOKEN`, `GMAIL_REFRESH_TOKEN_2..20`,
 //!   `GMAIL_ACCOUNTS_JSON`, plus dynamic accounts stored in Turso).
 //! - Separates real-time urgent alerts (interviews, Paystack/Stripe failures, Heroku/GitHub crashes)
 //!   from 7:00 AM briefing priority emails while dropping newsletters & promos.
-//! - Draft-only `create_gmail_draft` (never auto-sends emails behind Falcon's back).
+//! - Full `gmail.modify` capabilities (search, send, threaded reply, create/list/edit/send drafts,
+//!   mark read/unread, archive, star/unstar, safe 30-day trash & restore), guarded by owner intent firewalls.
 //! - Strict prompt-injection firewall on all untrusted external email headers & bodies.
 
 use anyhow::{anyhow, Result};
@@ -734,7 +735,10 @@ pub async fn search_all_gmail_accounts(
         match fetch_account_messages(cfg, cache, acc, clean_q, max_per_account).await {
             Ok(raw_msgs) => {
                 for m in raw_msgs {
-                    if let Some(rec) = parse_gmail_message_to_record(&acc.label, &m, now_ms) {
+                    if let Some(mut rec) = parse_gmail_message_to_record(&acc.label, &m, now_ms) {
+                        if !rec.msg_id.contains(':') {
+                            rec.msg_id = format!("{}:{}", acc.label, rec.msg_id);
+                        }
                         results.push(rec);
                     }
                 }
@@ -748,7 +752,191 @@ pub async fn search_all_gmail_accounts(
     Ok(results)
 }
 
-/// Safely creates a Gmail **draft** (NEVER auto-sends an email) using `gmail.compose` scope.
+/// Selects a configured Gmail account by friendly label, partial label, or 1-based index
+/// (e.g. `"2"`, `"#2"`, `"gmail 6"`, `"Aurikrex"`), defaulting to the primary account.
+pub fn select_gmail_account<'a>(
+    accounts: &'a [GmailAccountConfig],
+    hint: Option<&str>,
+) -> Option<&'a GmailAccountConfig> {
+    if accounts.is_empty() {
+        return None;
+    }
+    if let Some(raw_hint) = hint.map(str::trim).filter(|s| !s.is_empty()) {
+        let hl = raw_hint.to_lowercase();
+        if let Some(found) = accounts.iter().find(|a| a.label.to_lowercase() == hl) {
+            return Some(found);
+        }
+        if let Some(found) = accounts.iter().find(|a| a.label.to_lowercase().contains(&hl)) {
+            return Some(found);
+        }
+        let digits_only: String = hl.chars().filter(|c| c.is_ascii_digit()).collect();
+        if let Ok(idx1) = digits_only.parse::<usize>() {
+            if idx1 >= 1 && idx1 <= accounts.len() {
+                return Some(&accounts[idx1 - 1]);
+            }
+        }
+    }
+    accounts.first()
+}
+
+/// Splits a Turso composite Gmail ID (`"Gmail #2:18f123abc"`) into `(Some("Gmail #2"), "18f123abc")`.
+pub fn split_composite_msg_id(raw: &str) -> (Option<String>, String) {
+    let trimmed = raw.trim();
+    if let Some((acct, id)) = trimmed.rsplit_once(':') {
+        let id_clean = id.trim();
+        let acct_clean = acct.trim();
+        if !acct_clean.is_empty()
+            && !id_clean.is_empty()
+            && id_clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return (Some(acct_clean.to_string()), id_clean.to_string());
+        }
+    }
+    (None, trimmed.to_string())
+}
+
+/// Extracts a clean email address from a header like `"Paystack Support <support@paystack.com>"`.
+pub fn extract_reply_address(header_val: &str) -> Option<String> {
+    let clean = header_val.replace(['\r', '\n'], " ");
+    if let (Some(lt), Some(gt)) = (clean.find('<'), clean.rfind('>')) {
+        if gt > lt + 1 {
+            let inner = clean[lt + 1..gt].trim();
+            if inner.contains('@') && !inner.chars().any(char::is_whitespace) {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    for tok in clean.split_whitespace() {
+        let t = tok.trim_matches(|c: char| matches!(c, '<' | '>' | ',' | ';' | '"' | '\''));
+        if t.contains('@') && t.contains('.') && !t.chars().any(char::is_control) {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// Builds a CRLF-injection-safe RFC 2822 UTF-8 email payload for Gmail send / reply / draft APIs.
+pub fn build_rfc2822_email(
+    to: &str,
+    subject: &str,
+    body: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> Result<String> {
+    let clean_to = to.replace(['\r', '\n'], " ").trim().to_string();
+    if !clean_to.contains('@') || clean_to.len() < 5 {
+        return Err(anyhow!("Invalid recipient email address: {}", clean_to));
+    }
+    let clean_subj = subject
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .chars()
+        .take(240)
+        .collect::<String>();
+    let clean_body = body.trim();
+    if clean_body.is_empty() {
+        return Err(anyhow!("Email body cannot be empty"));
+    }
+
+    let mut headers = vec![
+        format!("To: {}", clean_to),
+        format!(
+            "Subject: {}",
+            if clean_subj.is_empty() {
+                "(No subject)".to_string()
+            } else {
+                clean_subj
+            }
+        ),
+        "MIME-Version: 1.0".to_string(),
+        "Content-Type: text/plain; charset=\"UTF-8\"".to_string(),
+    ];
+    if let Some(irt) = in_reply_to
+        .map(|s| s.replace(['\r', '\n'], "").trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        headers.push(format!("In-Reply-To: {}", irt));
+    }
+    if let Some(refs) = references
+        .map(|s| s.replace(['\r', '\n'], " ").trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        headers.push(format!("References: {}", refs));
+    }
+    Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), clean_body))
+}
+
+fn looks_like_raw_gmail_id(s: &str) -> bool {
+    let t = s.trim();
+    t.len() >= 10
+        && t.len() <= 32
+        && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+async fn resolve_target_gmail_message(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    msg_id_or_query: &str,
+) -> Result<(GmailAccountConfig, String)> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    if accounts.is_empty() || cfg.gmail_client_id.trim().is_empty() {
+        return Err(anyhow!("No Gmail account configured"));
+    }
+
+    let (parsed_acct, clean_part) = split_composite_msg_id(msg_id_or_query);
+    let eff_hint = parsed_acct.as_deref().or(account_hint);
+    if looks_like_raw_gmail_id(&clean_part) {
+        let acc = select_gmail_account(&accounts, eff_hint)
+            .cloned()
+            .ok_or_else(|| anyhow!("No Gmail account configured"))?;
+        return Ok((acc, clean_part));
+    }
+
+    // Search across targeted account (if hint given) or all connected Gmail accounts
+    let search_accounts: Vec<&GmailAccountConfig> = if let Some(h) = eff_hint {
+        if let Some(a) = select_gmail_account(&accounts, Some(h)) {
+            vec![a]
+        } else {
+            accounts.iter().collect()
+        }
+    } else {
+        accounts.iter().collect()
+    };
+
+    let q = msg_id_or_query.trim();
+    if q.is_empty() {
+        return Err(anyhow!("Provide an email ID or search query (e.g. sender/subject)"));
+    }
+    let client = gmail_http();
+    for acc in search_accounts {
+        let Ok(token) = get_access_token(cfg, cache, &acc.refresh_token).await else {
+            continue;
+        };
+        let list_url = format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages?q={}&maxResults=1",
+            url_encode_query(q)
+        );
+        let Ok(resp) = client.get(&list_url).bearer_auth(&token).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let val: Value = resp.json().await.unwrap_or_default();
+        if let Some(raw_id) = val["messages"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|m| m["id"].as_str())
+        {
+            return Ok((acc.clone(), raw_id.to_string()));
+        }
+    }
+    Err(anyhow!("No Gmail message found matching \"{}\"", q))
+}
+
+/// Creates a Gmail **draft** (`POST /users/me/drafts`) using `gmail.modify` / `gmail.compose`.
 pub async fn create_gmail_draft(
     db: &Database,
     cfg: &Config,
@@ -759,41 +947,23 @@ pub async fn create_gmail_draft(
     body: &str,
 ) -> Result<String> {
     let accounts = resolve_gmail_accounts(db, cfg).await;
-    let acc = account_hint
-        .and_then(|h| {
-            let hl = h.to_lowercase();
-            accounts
-                .iter()
-                .find(|a| a.label.to_lowercase().contains(&hl))
-        })
-        .or_else(|| accounts.first())
+    let acc = select_gmail_account(&accounts, account_hint)
         .ok_or_else(|| anyhow!("No Gmail account configured"))?;
 
     let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
-    let clean_to = to.replace(['\r', '\n'], " ");
-    let clean_subj = subject.replace(['\r', '\n'], " ");
-    let raw_rfc2822 = format!(
-        "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{}",
-        clean_to.trim(),
-        clean_subj.trim(),
-        body.trim()
-    );
+    let raw_rfc2822 = build_rfc2822_email(to, subject, body, None, None)?;
     let encoded = base64url_encode(raw_rfc2822.as_bytes());
     let resp = gmail_http()
         .post("https://gmail.googleapis.com/gmail/v1/users/me/drafts")
         .bearer_auth(&token)
-        .json(&json!({
-            "message": {
-                "raw": encoded
-            }
-        }))
+        .json(&json!({ "message": { "raw": encoded } }))
         .send()
         .await?;
     if !resp.status().is_success() {
         let st = resp.status();
         let err_txt = resp.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "Gmail draft creation failed ({} — ensure gmail.compose scope is enabled): {}",
+            "Gmail draft creation failed ({}): {}",
             st,
             redact_secrets(&err_txt, cfg)
         ));
@@ -801,4 +971,384 @@ pub async fn create_gmail_draft(
     let val: Value = resp.json().await?;
     let draft_id = val["id"].as_str().unwrap_or("saved").to_string();
     Ok(format!("Draft #{} saved in {}", draft_id, acc.label))
+}
+
+/// Lists recent drafts in a Gmail account (`GET /users/me/drafts`) so Falcon can edit or send them.
+pub async fn list_gmail_drafts(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    max_results: usize,
+) -> Result<String> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    let target_accounts: Vec<&GmailAccountConfig> = if let Some(h) = account_hint {
+        select_gmail_account(&accounts, Some(h)).into_iter().collect()
+    } else {
+        accounts.iter().collect()
+    };
+    if target_accounts.is_empty() {
+        return Err(anyhow!("No Gmail account configured"));
+    }
+
+    let client = gmail_http();
+    let mut lines: Vec<String> = Vec::new();
+    for acc in target_accounts {
+        let Ok(token) = get_access_token(cfg, cache, &acc.refresh_token).await else {
+            continue;
+        };
+        let list_url = format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults={}",
+            max_results.clamp(1, 10)
+        );
+        let Ok(resp) = client.get(&list_url).bearer_auth(&token).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let val: Value = resp.json().await.unwrap_or_default();
+        let Some(drafts) = val["drafts"].as_array() else {
+            continue;
+        };
+        for d in drafts.iter().take(5) {
+            let Some(did) = d["id"].as_str() else {
+                continue;
+            };
+            let get_url = format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/drafts/{}?format=metadata",
+                url_encode_query(did)
+            );
+            let mut to_s = String::new();
+            let mut subj_s = "(No subject)".to_string();
+            if let Ok(dresp) = client.get(&get_url).bearer_auth(&token).send().await {
+                if dresp.status().is_success() {
+                    if let Ok(dv) = dresp.json::<Value>().await {
+                        let p = &dv["message"]["payload"];
+                        to_s = extract_gmail_header(p, "To");
+                        let s = extract_gmail_header(p, "Subject");
+                        if !s.is_empty() {
+                            subj_s = s;
+                        }
+                    }
+                }
+            }
+            lines.push(format!(
+                "• [{}] Draft `{}` -> To: {} | {}",
+                acc.label,
+                did,
+                if to_s.is_empty() { "(unspecified)" } else { &to_s },
+                subj_s
+            ));
+        }
+    }
+    if lines.is_empty() {
+        Ok("No Gmail drafts found.".to_string())
+    } else {
+        Ok(format!("📝 *Gmail Drafts ({})*:\n{}", lines.len(), lines.join("\n")))
+    }
+}
+
+/// Edits an existing Gmail draft (`PUT /users/me/drafts/{draft_id}`).
+pub async fn update_gmail_draft(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    draft_id: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    let (parsed_acct, clean_id) = split_composite_msg_id(draft_id);
+    let acc = select_gmail_account(&accounts, parsed_acct.as_deref().or(account_hint))
+        .ok_or_else(|| anyhow!("No Gmail account configured"))?;
+    if clean_id.is_empty() {
+        return Err(anyhow!("Missing draft_id"));
+    }
+
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let raw_rfc2822 = build_rfc2822_email(to, subject, body, None, None)?;
+    let encoded = base64url_encode(raw_rfc2822.as_bytes());
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/drafts/{}",
+        url_encode_query(&clean_id)
+    );
+    let resp = gmail_http()
+        .put(&url)
+        .bearer_auth(&token)
+        .json(&json!({ "id": clean_id, "message": { "raw": encoded } }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail draft update failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Updated draft #{} in {}", clean_id, acc.label))
+}
+
+/// Sends an existing Gmail draft (`POST /users/me/drafts/send`).
+pub async fn send_gmail_draft(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    draft_id: &str,
+) -> Result<String> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    let (parsed_acct, clean_id) = split_composite_msg_id(draft_id);
+    let acc = select_gmail_account(&accounts, parsed_acct.as_deref().or(account_hint))
+        .ok_or_else(|| anyhow!("No Gmail account configured"))?;
+    if clean_id.is_empty() {
+        return Err(anyhow!("Missing draft_id"));
+    }
+
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let resp = gmail_http()
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/drafts/send")
+        .bearer_auth(&token)
+        .json(&json!({ "id": clean_id }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail draft send failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Sent draft #{} from {}", clean_id, acc.label))
+}
+
+/// Sends a brand-new email (`POST /users/me/messages/send`) using `gmail.modify`.
+pub async fn send_gmail_message(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String> {
+    let accounts = resolve_gmail_accounts(db, cfg).await;
+    let acc = select_gmail_account(&accounts, account_hint)
+        .ok_or_else(|| anyhow!("No Gmail account configured"))?;
+
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let raw_rfc2822 = build_rfc2822_email(to, subject, body, None, None)?;
+    let encoded = base64url_encode(raw_rfc2822.as_bytes());
+    let resp = gmail_http()
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(&token)
+        .json(&json!({ "raw": encoded }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail send failed ({} — ensure gmail.modify scope is enabled): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Sent email to {} from {}", to.trim(), acc.label))
+}
+
+/// Replies cleanly inside an existing Gmail thread (`In-Reply-To`, `References`, `threadId`).
+pub async fn reply_gmail_message(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    msg_id_or_query: &str,
+    body: &str,
+) -> Result<String> {
+    let (acc, raw_id) =
+        resolve_target_gmail_message(db, cfg, cache, account_hint, msg_id_or_query).await?;
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let client = gmail_http();
+
+    let meta_url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Message-ID&metadataHeaders=References",
+        url_encode_query(&raw_id)
+    );
+    let meta_resp = client.get(&meta_url).bearer_auth(&token).send().await?;
+    if !meta_resp.status().is_success() {
+        return Err(anyhow!(
+            "Failed to read target email metadata ({})",
+            meta_resp.status()
+        ));
+    }
+    let meta: Value = meta_resp.json().await?;
+    let payload = &meta["payload"];
+    let thread_id = meta["threadId"].as_str().unwrap_or("").trim().to_string();
+    let reply_to_hdr = extract_gmail_header(payload, "Reply-To");
+    let from_hdr = extract_gmail_header(payload, "From");
+    let recipient = extract_reply_address(&reply_to_hdr)
+        .or_else(|| extract_reply_address(&from_hdr))
+        .ok_or_else(|| anyhow!("Could not determine reply address from email"))?;
+    let orig_subj = extract_gmail_header(payload, "Subject");
+    let reply_subj = if orig_subj.to_lowercase().starts_with("re:") {
+        orig_subj
+    } else if orig_subj.is_empty() {
+        "Re: Your email".to_string()
+    } else {
+        format!("Re: {}", orig_subj)
+    };
+    let orig_msg_id = extract_gmail_header(payload, "Message-ID");
+    let orig_refs = extract_gmail_header(payload, "References");
+    let combined_refs = match (orig_refs.is_empty(), orig_msg_id.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(orig_msg_id.clone()),
+        (false, true) => Some(orig_refs),
+        (false, false) => Some(format!("{} {}", orig_refs, orig_msg_id)),
+    };
+
+    let raw_rfc2822 = build_rfc2822_email(
+        &recipient,
+        &reply_subj,
+        body,
+        if orig_msg_id.is_empty() {
+            None
+        } else {
+            Some(orig_msg_id.as_str())
+        },
+        combined_refs.as_deref(),
+    )?;
+    let encoded = base64url_encode(raw_rfc2822.as_bytes());
+    let mut send_body = json!({ "raw": encoded });
+    if !thread_id.is_empty() {
+        send_body["threadId"] = json!(thread_id);
+    }
+
+    let send_resp = client
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(&token)
+        .json(&send_body)
+        .send()
+        .await?;
+    if !send_resp.status().is_success() {
+        let st = send_resp.status();
+        let err_txt = send_resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail reply failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Replied to {} ({}) via {}", recipient, reply_subj, acc.label))
+}
+
+/// Modifies Gmail labels (`POST /users/me/messages/{id}/modify`) to Mark Read/Unread, Archive, or Star/Unstar.
+pub async fn modify_gmail_labels(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    msg_id_or_query: &str,
+    add_labels: &[&str],
+    remove_labels: &[&str],
+    action_label: &str,
+) -> Result<String> {
+    let (acc, raw_id) =
+        resolve_target_gmail_message(db, cfg, cache, account_hint, msg_id_or_query).await?;
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
+        url_encode_query(&raw_id)
+    );
+    let resp = gmail_http()
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({
+            "addLabelIds": add_labels,
+            "removeLabelIds": remove_labels
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail modify failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("{} email {} in {}", action_label, raw_id, acc.label))
+}
+
+/// Moves a Gmail message safely to **Trash** (`POST /users/me/messages/{id}/trash`, 30-day undo safety net).
+pub async fn trash_gmail_message(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    msg_id_or_query: &str,
+) -> Result<String> {
+    let (acc, raw_id) =
+        resolve_target_gmail_message(db, cfg, cache, account_hint, msg_id_or_query).await?;
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/trash",
+        url_encode_query(&raw_id)
+    );
+    let resp = gmail_http()
+        .post(&url)
+        .bearer_auth(&token)
+        .body("")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail trash failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Moved email {} to Trash in {}", raw_id, acc.label))
+}
+
+/// Restores a Gmail message out of Trash (`POST /users/me/messages/{id}/untrash`).
+pub async fn untrash_gmail_message(
+    db: &Database,
+    cfg: &Config,
+    cache: &GmailTokenCache,
+    account_hint: Option<&str>,
+    msg_id_or_query: &str,
+) -> Result<String> {
+    let (acc, raw_id) =
+        resolve_target_gmail_message(db, cfg, cache, account_hint, msg_id_or_query).await?;
+    let token = get_access_token(cfg, cache, &acc.refresh_token).await?;
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/untrash",
+        url_encode_query(&raw_id)
+    );
+    let resp = gmail_http()
+        .post(&url)
+        .bearer_auth(&token)
+        .body("")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Gmail restore failed ({}): {}",
+            st,
+            redact_secrets(&err_txt, cfg)
+        ));
+    }
+    Ok(format!("Restored email {} from Trash in {}", raw_id, acc.label))
 }
