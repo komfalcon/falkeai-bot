@@ -38,7 +38,7 @@ data class TakeQualityReport(
  * In-App Voice Cloning Studio & Dataset Builder ($0).
  * Guides Falcon through a phonetically balanced 120-sentence script (split into 8 bite-sized chapters,
  * rich in "Fall-K", Aurikrex, Lagos, numbers, questions, and conversational tone).
- * Exports an LJSpeech-compatible `falke_voice_dataset.zip` (`wavs/*.wav` + `metadata.csv`) ready for
+ * Exports an LJSpeech-compatible `falke_voice_dataset.zip` (`wavs/utt_NNN.wav` + `metadata.csv`) ready for
  * 1-click free GPU fine-tuning on Kaggle / Google Colab (`voice-training/train_falcon_voice_colab_kaggle.ipynb`).
  */
 class DatasetRecorderManager(private val context: Context) {

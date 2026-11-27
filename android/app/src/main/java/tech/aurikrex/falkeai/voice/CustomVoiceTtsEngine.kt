@@ -58,6 +58,7 @@ class CustomVoiceTtsEngine(
             val canonicalRoot = voiceDir.canonicalPath + File.separator
             var foundOnnx: File? = null
             var foundTokens: File? = null
+            var foundLexicon: File? = null
 
             val input = context.contentResolver.openInputStream(uri)
                 ?: error("Could not open selected voice package.")
@@ -84,6 +85,8 @@ class CustomVoiceTtsEngine(
                                     foundOnnx = outFile
                                 } else if (lower == "tokens.txt" || lower.endsWith("tokens.txt")) {
                                     foundTokens = outFile
+                                } else if (lower.contains("lexicon") && lower.endsWith(".txt")) {
+                                    foundLexicon = outFile
                                 }
                             }
                         }
@@ -93,9 +96,10 @@ class CustomVoiceTtsEngine(
                 }
             }
 
-            // Normalize top-level filenames (`model.onnx` + `tokens.txt`) if nested inside a subfolder
+            // Normalize top-level filenames (`model.onnx`, `tokens.txt`, `lexicon.txt`) if nested inside a subfolder
             val targetModel = File(voiceDir, "model.onnx")
             val targetTokens = File(voiceDir, "tokens.txt")
+            val targetLexicon = File(voiceDir, "lexicon.txt")
             foundOnnx?.let { src ->
                 if (src.canonicalPath != targetModel.canonicalPath) {
                     src.copyTo(targetModel, overwrite = true)
@@ -104,6 +108,11 @@ class CustomVoiceTtsEngine(
             foundTokens?.let { src ->
                 if (src.canonicalPath != targetTokens.canonicalPath) {
                     src.copyTo(targetTokens, overwrite = true)
+                }
+            }
+            foundLexicon?.let { src ->
+                if (src.canonicalPath != targetLexicon.canonicalPath) {
+                    src.copyTo(targetLexicon, overwrite = true)
                 }
             }
 
@@ -140,6 +149,13 @@ class CustomVoiceTtsEngine(
             val modelPath = File(voiceDir, "model.onnx").absolutePath
             val tokensPath = File(voiceDir, "tokens.txt").absolutePath
             val lexiconFile = File(voiceDir, "lexicon.txt")
+            if (!lexiconFile.exists()) {
+                runCatching {
+                    context.assets.open("tts/lexicon-en-us.txt").use { input ->
+                        lexiconFile.outputStream().use { out -> input.copyTo(out) }
+                    }
+                }
+            }
             val espeakDir = File(voiceDir, "espeak-ng-data")
 
             val vits = OfflineTtsVitsModelConfig(

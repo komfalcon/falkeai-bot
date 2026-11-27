@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -79,6 +79,22 @@ jobs:
           || curl -fL --retry 3 -o android/app/src/main/assets/speaker/campplus.onnx \
             "https://huggingface.co/FunAudioLLM/CosyVoice-300M/resolve/main/campplus.onnx"
           ls -lh android/app/src/main/assets/speaker/campplus.onnx
+
+      - name: Download GPL-Free English IPA Lexicon for Custom Own-Voice VITS TTS (~6 MB)
+        run: |
+          mkdir -p android/app/src/main/assets/tts
+          curl -fL --retry 3 -o android/app/src/main/assets/tts/lexicon-en-us.txt \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/lexicon-en-us.txt"
+          {
+            echo ""
+            echo "# FalkeAI Custom Pronunciations (Fall-K)"
+            echo "falke || f ˈ ɔː l k e ɪ"
+            echo "fall-kay || f ˈ ɔː l k e ɪ"
+            echo "fall-k || f ˈ ɔː l k e ɪ"
+            echo "falkeai || f ˈ ɔː l k e ɪ ˈ e ɪ ˈ a ɪ"
+            echo "aurikrex || ˈ ɔː ɹ ɪ k ɹ ɛ k s"
+          } >> android/app/src/main/assets/tts/lexicon-en-us.txt
+          ls -lh android/app/src/main/assets/tts/lexicon-en-us.txt
 
       - name: Run Kotlin Unit Tests & Assemble Debug APK
         working-directory: android

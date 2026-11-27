@@ -14,4 +14,6 @@ android/app/build/
 android/local.properties
 android/app/libs/*.aar
 android/app/src/main/assets/kws/
+android/app/src/main/assets/speaker/
+android/app/src/main/assets/tts/
 *.apk

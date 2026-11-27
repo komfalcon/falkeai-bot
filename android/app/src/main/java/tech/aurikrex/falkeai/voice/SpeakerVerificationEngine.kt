@@ -4,6 +4,7 @@ import android.content.Context
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import tech.aurikrex.falkeai.data.SecurePrefs
+import java.io.File
 import kotlin.math.sqrt
 
 /**
@@ -109,21 +110,33 @@ class SpeakerVerificationEngine(
     private val lock = Any()
 
     fun isModelAvailable(): Boolean = runCatching {
+        val cached = File(context.filesDir, "speaker/$SPEAKER_MODEL_NAME")
+        if (cached.exists() && cached.length() > 100_000L) return@runCatching true
         val list = context.assets.list(SPEAKER_ASSET_DIR)?.toSet().orEmpty()
         list.contains(SPEAKER_MODEL_NAME)
     }.getOrDefault(false)
 
+    private fun materializeModelFile(): File? = runCatching {
+        val outDir = File(context.filesDir, "speaker").apply { mkdirs() }
+        val outFile = File(outDir, SPEAKER_MODEL_NAME)
+        if (outFile.exists() && outFile.length() > 100_000L) return@runCatching outFile
+        context.assets.open("$SPEAKER_ASSET_DIR/$SPEAKER_MODEL_NAME").use { input ->
+            outFile.outputStream().use { output -> input.copyTo(output) }
+        }
+        outFile.takeIf { it.exists() && it.length() > 100_000L }
+    }.getOrNull()
+
     private fun ensureExtractor(): SpeakerEmbeddingExtractor? = synchronized(lock) {
         extractor?.let { return it }
-        if (!isModelAvailable()) return null
+        val modelFile = materializeModelFile() ?: return null
         return runCatching {
             val cfg = SpeakerEmbeddingExtractorConfig(
-                model = "$SPEAKER_ASSET_DIR/$SPEAKER_MODEL_NAME",
+                model = modelFile.absolutePath,
                 numThreads = 2,
                 debug = false,
                 provider = "cpu"
             )
-            SpeakerEmbeddingExtractor(assetManager = context.assets, config = cfg).also {
+            SpeakerEmbeddingExtractor(assetManager = null, config = cfg).also {
                 extractor = it
             }
         }.getOrNull()
