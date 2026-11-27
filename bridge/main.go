@@ -348,12 +348,9 @@ func main() {
 			mediaKind := ""
 			mediaPath := ""
 			mediaMime := ""
-			isSelfDM := !v.Info.IsGroup && v.Info.IsFromMe && (v.Info.Chat.User == v.Info.Sender.User ||
-				(!v.Info.RecipientAlt.IsEmpty() && v.Info.RecipientAlt.User == v.Info.Sender.User) ||
-				(!v.Info.SenderAlt.IsEmpty() && v.Info.Chat.User == v.Info.SenderAlt.User) ||
-				(client.Store.ID != nil && (v.Info.Chat.User == client.Store.ID.User || v.Info.RecipientAlt.User == client.Store.ID.User)) ||
-				(!client.Store.LID.IsEmpty() && (v.Info.Chat.User == client.Store.LID.User || v.Info.RecipientAlt.User == client.Store.LID.User)))
-			if !v.Info.IsGroup && (!v.Info.IsFromMe || isSelfDM) && unwrapped != nil {
+			// Download DM voice notes and images for both incoming chats and Falcon's own manual DM replies
+			// (bot-sent messages were already filtered out via wasSentByBot above) so FalkeAI learns from Falcon's voice/media too.
+			if !v.Info.IsGroup && unwrapped != nil {
 				if aud := unwrapped.GetAudioMessage(); aud != nil && aud.GetFileLength() <= 5*1024*1024 {
 					if data, err := client.Download(ctx, aud); err == nil && len(data) > 0 && len(data) <= 5*1024*1024 {
 						if p := saveTempMedia(data); p != "" {

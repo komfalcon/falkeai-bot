@@ -13,10 +13,13 @@ use crate::alerts::{
     build_catch_me_up_summary, format_bank_amount, format_digest_message_full, format_email_line,
     format_recurrence_badge, parse_reminder_schedule, send_ntfy_http,
 };
-use crate::brain::{extract_json_object, HISTORY_MAX};
+use crate::brain::{
+    extract_json_object, observe_per_person_chat_pattern, rank_relevant_learning_episodes,
+    rank_relevant_owner_memories, HISTORY_MAX,
+};
 use crate::commands::{resolve_contact_target, user_explicitly_requested_voice};
 use crate::config::{Config, BOT_NAME};
-use crate::db::{ChatTurn, ConversationState, Database, OwnerStatus};
+use crate::db::{ChatTurn, ContactMemory, ConversationState, Database, OwnerStatus};
 use crate::gmail::{
     create_gmail_draft, list_gmail_drafts, modify_gmail_labels, reply_gmail_message,
     resolve_gmail_account_profiles, resolve_gmail_accounts, search_all_gmail_accounts,
@@ -25,6 +28,7 @@ use crate::gmail::{
 };
 use crate::safety::{detect_injection, redact_secrets};
 use crate::util::lagos_parts;
+use crate::web_reader::fetch_and_summarize_link;
 use crate::web_search::{search_github_account, search_web_and_summarize};
 
 pub const OWNER_SELF_CHAT_KEY: &str = "__owner_self_chat__";
@@ -46,6 +50,7 @@ pub struct OwnerPhoneContext {
 pub struct OwnerChatOutcome {
     pub reply: String,
     pub outbounds: Vec<(String, String)>,
+    pub voice_outbounds: Vec<(String, String)>,
     pub device_actions: Vec<Value>,
     pub cloud_actions_done: Vec<String>,
     pub voice_reply: bool,
@@ -231,13 +236,47 @@ fn strip_untrusted_owner_suffix(raw_text: &str) -> &str {
         .split("\n\n[Web/Social Link Context")
         .next()
         .unwrap_or(raw_text)
+        .split("\n\n[Web Link Summary")
+        .next()
+        .unwrap_or(raw_text)
         .split("\n[Image attached")
         .next()
         .unwrap_or(raw_text)
 }
 
+/// Detects explicit behavioral rules or corrections from Falcon in owner chat (e.g. "stop saying...",
+/// "don't say...", "from now on...") so FalkeAI reliably persists feedback even if the LLM forgets
+/// to emit a `teach_lesson` action.
+pub fn detect_owner_correction_feedback(raw_text: &str) -> Option<String> {
+    let owner_only = strip_untrusted_owner_suffix(raw_text).trim();
+    if owner_only.len() < 12 || owner_only.len() > 260 {
+        return None;
+    }
+    let lower = owner_only.to_lowercase();
+    let prefixes = [
+        "stop saying ",
+        "never say ",
+        "don't say ",
+        "dont say ",
+        "do not say ",
+        "from now on ",
+        "next time ",
+        "always pronounce ",
+        "always call ",
+        "always greet ",
+        "always reply ",
+        "whenever you talk to ",
+        "when talking to ",
+    ];
+    if prefixes.iter().any(|p| lower.contains(p)) {
+        Some(owner_only.chars().take(220).collect())
+    } else {
+        None
+    }
+}
+
 /// Deterministic intent firewall against Indirect Prompt Injection:
-/// Inspects ONLY Falcon's own raw utterance (stripping any appended `[Web/Social Link Context...]`
+/// Inspects ONLY Falcon's own raw utterance (stripping any appended `[Web Link Summary...]`
 /// or `[Image attached...]` blocks) to verify Falcon genuinely asked to contact/message/call/email/draft
 /// someone before executing external communication actions.
 pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
@@ -251,6 +290,9 @@ pub fn owner_intent_allows_outbound_comms(raw_text: &str) -> bool {
         " message",
         " msg ",
         " text ",
+        " voice note",
+        " voicenote",
+        " vn ",
         " sms",
         " dm ",
         " whatsapp",
@@ -437,7 +479,10 @@ where
     let bookings = db.list_bookings(8).await.unwrap_or_default();
     let contacts = db.find_contact_memories("").await?;
     let recent_convos = db.list_recent_conversations(8).await?;
-    let owner_mem = db.list_owner_memory(30).await?;
+    let raw_owner_mem = db.list_owner_memory(100).await?;
+    let raw_lessons = db.list_learning_episodes(60).await?;
+    let owner_mem = rank_relevant_owner_memories(&raw_owner_mem, text, 30);
+    let ranked_lessons = rank_relevant_learning_episodes(&raw_lessons, None, text, 18);
     let saved_telemetry = db.get_phone_telemetry().await.ok().flatten();
 
     let mut ctx_blocks: Vec<String> = Vec::new();
@@ -769,8 +814,12 @@ where
                         )
                     })
                     .collect();
+                let style_tag = cm
+                    .and_then(|m| m.owner_style_pattern.as_deref())
+                    .map(|p| format!(" | style: {}", sanitize_preview_for_owner_prompt(p, 70)))
+                    .unwrap_or_default();
                 format!(
-                    "  * {} (+{}) [tier: {} | state: {} | mood: {}] -> {}",
+                    "  * {} (+{}) [tier: {} | state: {} | mood: {}{}] -> {}",
                     c.name
                         .as_deref()
                         .or_else(|| cm.and_then(|m| m.display_name.as_deref()))
@@ -779,6 +828,7 @@ where
                     tier,
                     state_tag,
                     mood,
+                    style_tag,
                     last_turns.join(" | ")
                 )
             })
@@ -789,20 +839,41 @@ where
     if !owner_mem.is_empty() {
         let lines: Vec<String> = owner_mem
             .iter()
-            .take(25)
+            .take(30)
             .map(|m| format!("  * [#{} | {} | {}] {}", m.id, m.category, m.visibility, m.content))
             .collect();
         ctx_blocks.push(format!("What you already know about Falcon:\n{}", lines.join("\n")));
     }
 
+    if !ranked_lessons.is_empty() {
+        let lines: Vec<String> = ranked_lessons
+            .iter()
+            .take(18)
+            .map(|ep| {
+                let scope = ep
+                    .sender
+                    .as_deref()
+                    .map(|s| format!("+{}", s))
+                    .unwrap_or_else(|| "global".to_string());
+                format!("  * [#{} | {} | {}] {}", ep.id, ep.kind, scope, ep.lesson)
+            })
+            .collect();
+        ctx_blocks.push(format!(
+            "Rules, Corrections & Learned Lessons (ALWAYS OBEY THESE):\n{}",
+            lines.join("\n")
+        ));
+    }
+
     let sys_prompt = format!(
         r#"You are {BOT_NAME}, speaking directly and privately with your owner, Falcon, across his WhatsApp "Message yourself" and Native Android Companion App.
-Think J.A.R.V.I.S.: sharp, concise, witty when natural, completely loyal, zero fluff, zero robotic filler.
+Persona: warm, composed, sharp **J.A.R.V.I.S. poise** delivered in a refined, natural voice — calm, articulate, loyal, subtly witty when natural, zero fluff, zero robotic filler, and zero stiff corporate clichés.
+When your reply may be spoken aloud (voice notes or Android app), favor crisp, smooth, natural sentences over stiff markdown walls.
+If Falcon corrects you, sets a preference, or describes how you should talk to a specific person, ALWAYS emit `teach_lesson` or `update_contact_style` (or `save_owner_memory`) so it sticks permanently.
 If Falcon asks to translate or speaks Yoruba, Nigerian Pidgin, or French, act as a fluent live bilingual interpreter (English <-> Yoruba / Pidgin / French) cleanly.
 
 ## What You Can Execute via `"actions"`
 1. **WhatsApp, Gmail, Web & Social Cloud Actions**:
-   - Send WhatsApp DM right now: `{{"type": "send_dm", "target": "phone or name", "message": "exact text"}}`
+   - Send WhatsApp DM right now (set `"voice": true` ONLY when Falcon asks to send a voice note!): `{{"type": "send_dm", "target": "phone or name", "message": "exact text", "voice": false}}`
    - Schedule a future WhatsApp or SMS message: `{{"type": "schedule_message", "channel": "whatsapp|sms", "target": "phone or name", "schedule": "tomorrow 9am|7pm|30m", "message": "exact text"}}`
    - Follow-ups: `{{"type": "send_followup", "id": 1, "message": "optional override"}}` | `{{"type": "dismiss_followup", "id": 1}}` | `{{"type": "snooze_followup", "id": 1, "hours": 24}}`
    - Live Multi-Account Gmail (Full Read / Send / Reply / Draft / Organize across all connected accounts — optional `"account"` accepts label, email address, or number like `"Personal"` or `"6"`):
@@ -811,20 +882,22 @@ If Falcon asks to translate or speaks Yoruba, Nigerian Pidgin, or French, act as
      - Reply in-thread: `{{"type": "reply_gmail", "msg_id": "id from context or omit", "query": "sender/subject if no msg_id", "body": "...", "account": null}}`
      - Drafts (Create / List / Edit / Send): `{{"type": "create_gmail_draft", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "list_gmail_drafts", "account": null}}` | `{{"type": "edit_gmail_draft", "draft_id": "...", "to": "...", "subject": "...", "body": "...", "account": null}}` | `{{"type": "send_gmail_draft", "draft_id": "...", "account": null}}`
      - Organize / Clean Inbox: `{{"type": "mark_gmail_read", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "mark_gmail_unread", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "archive_gmail", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "star_gmail", "msg_id": "...", "query": "...", "starred": true, "account": null}}` | `{{"type": "trash_gmail", "msg_id": "...", "query": "...", "account": null}}` | `{{"type": "untrash_gmail", "msg_id": "...", "query": "...", "account": null}}`
-   - Live Online Web Search: `{{"type": "search_web", "query": "search query"}}`
+   - Live Online Web Search & Deep Link Reader: `{{"type": "search_web", "query": "search query"}}` | `{{"type": "read_link", "url": "https://..."}}`
    - GitHub Search / Notifications: `{{"type": "search_github", "query": "notifications|repo query"}}`
    - Bank/Paystack/Stripe Ledger Summary: `{{"type": "query_bank_ledger", "days": 7}}`
    - Aurikrex Tutoring Schedule & Approval-First Class Reminders: `{{"type": "list_class_schedule"}}` | `{{"type": "prepare_class_reminders", "slot_filter": "optional day"}}`
    - One-Phrase Routines: `{{"type": "run_routine", "routine": "goodnight|lock_in|catch_me_up"}}`
    - Find My Phone Siren + Strobe: `{{"type": "ring_phone"}}`
-   - Chat / Status / Memory / Reminders / Alerts:
+   - Learning, Per-Contact Chat Style, Status, Memory, Reminders & Voice Modes:
+     - Teach a permanent rule or correction: `{{"type": "teach_lesson", "lesson": "concise rule to obey", "target": "optional contact name/phone or null"}}`
+     - Set how FalkeAI chats with a specific person: `{{"type": "update_contact_style", "target": "name or phone", "style": "exact texting style, slang, warmth, rhythm", "tone": "casual|warm|playful|neutral|formal", "relationship": "optional"}}`
      - `{{"type": "resume_chat", "target": "..."}}`
      - `{{"type": "set_availability", "mode": "available|busy|deep_work|sleeping", "duration_minutes": 120, "note": "optional"}}`
      - `{{"type": "set_contact_tier", "target": "...", "tier": "vip|normal|silent"}}`
      - `{{"type": "save_owner_memory", "category": "bio|projects|aurikrex|schedule|relationships|style|preferences", "visibility": "public|close|private_internal", "content": "...", "replaces_ids": []}}`
      - `{{"type": "delete_owner_memory", "id": 12}}` | `{{"type": "tidy_memories"}}`
      - `{{"type": "add_reminder", "schedule": "30m|7pm|tomorrow 8am|daily 8am|weekdays 7am|every monday 9am", "in_minutes": 60, "text": "..."}}` | `{{"type": "delete_reminder", "id": 3}}`
-     - `{{"type": "set_voice_mode", "mode": "auto|on|off"}}` | `{{"type": "ack_alerts", "target": null}}` | `{{"type": "test_ntfy"}}` | `{{"type": "briefing"}}`
+     - `{{"type": "set_voice_mode", "mode": "auto|on|off"}}` | `{{"type": "set_dm_voice_mode", "mode": "auto|explicit|off"}}` | `{{"type": "ack_alerts", "target": null}}` | `{{"type": "test_ntfy"}}` | `{{"type": "briefing"}}`
 2. **Native Android Phone Actions (include inside `"actions"` whenever Falcon asks to control his phone!)**:
    - Make phone call: `{{"type": "call_contact", "target": "name or phone", "speakerphone": false}}`
    - Send SMS: `{{"type": "send_sms", "target": "name or phone", "message": "exact text"}}`
@@ -883,6 +956,7 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
             return Ok(OwnerChatOutcome {
                 reply: "Hit a quick snag reaching the AI right now — fast commands like `status`, `briefing`, `emails`, `followups`, `ack`, `flagged`, and `help` still work immediately.".to_string(),
                 outbounds: Vec::new(),
+                voice_outbounds: Vec::new(),
                 device_actions: Vec::new(),
                 cloud_actions_done: Vec::new(),
                 voice_reply: false,
@@ -894,9 +968,11 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
     let (mut reply_text, actions) = parse_owner_chat_response(&raw);
 
     let mut outbounds: Vec<(String, String)> = Vec::new();
+    let mut voice_outbounds: Vec<(String, String)> = Vec::new();
     let mut device_actions: Vec<Value> = Vec::new();
     let mut action_notes: Vec<String> = Vec::new();
     let mut extra_sections: Vec<String> = Vec::new();
+    let mut saved_learning_or_memory = false;
     let local_gmail_cache = GmailTokenCache::new();
     let eff_gmail_cache = gmail_cache.unwrap_or(&local_gmail_cache);
 
@@ -939,11 +1015,15 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
             continue;
         }
         match kind.as_str() {
-            "send_dm" | "send_message" | "dm" | "message" | "reply" => {
+            "send_dm" | "send_message" | "send_voice_note" | "dm" | "message" | "reply" => {
                 if !comms_allowed {
                     action_notes.push("Blocked unrequested send_dm".to_string());
                     continue;
                 }
+                let want_dm_voice = kind == "send_voice_note"
+                    || act["voice"].as_bool().unwrap_or(false)
+                    || act["as_voice"].as_bool().unwrap_or(false)
+                    || act["reply_voice"].as_bool().unwrap_or(false);
                 let target = act["target"]
                     .as_str()
                     .or_else(|| act["to"].as_str())
@@ -977,7 +1057,11 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                         }
                         st.history.push(ChatTurn {
                             role: "assistant".to_string(),
-                            content: msg.to_string(),
+                            content: if want_dm_voice {
+                                format!("[Voice note]: {}", msg)
+                            } else {
+                                msg.to_string()
+                            },
                         });
                         if st.history.len() > HISTORY_MAX {
                             let excess = st.history.len() - HISTORY_MAX;
@@ -993,8 +1077,14 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                         let _ = db.delete_flags_for_chat(&num).await;
                         let _ = db.ack_urgent_alerts(Some(&num)).await;
                         let _ = db.resolve_followups_for_sender(&num).await;
-                        outbounds.push((format!("{}@s.whatsapp.net", num), msg.to_string()));
-                        action_notes.push(format!("Sent to +{}", num));
+                        let target_jid = format!("{}@s.whatsapp.net", num);
+                        if want_dm_voice {
+                            voice_outbounds.push((target_jid, msg.to_string()));
+                            action_notes.push(format!("Voice note sent to +{}", num));
+                        } else {
+                            outbounds.push((target_jid, msg.to_string()));
+                            action_notes.push(format!("Sent to +{}", num));
+                        }
                     } else {
                         action_notes.push(format!("Couldn't resolve contact \"{}\"", target));
                     }
@@ -1133,7 +1223,107 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
                                 &replaces_ids,
                             )
                             .await?;
+                        saved_learning_or_memory = true;
+                        action_notes.push("Saved memory".to_string());
                     }
+                }
+                "teach_lesson" | "learn_rule" | "teach" => {
+                    let lesson = act["lesson"]
+                        .as_str()
+                        .or_else(|| act["rule"].as_str())
+                        .or_else(|| act["content"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let target = act["target"]
+                        .as_str()
+                        .or_else(|| act["contact"].as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"));
+                    if !lesson.is_empty() {
+                        let scoped_sender = if let Some(t) = target {
+                            resolve_contact_target(db, t).await?
+                        } else {
+                            None
+                        };
+                        let short: String = lesson.chars().take(240).collect();
+                        let id = db
+                            .add_learning_episode(scoped_sender.as_deref(), "owner_rule", &short)
+                            .await?;
+                        saved_learning_or_memory = true;
+                        action_notes.push(format!("Learned rule #{}", id));
+                    }
+                }
+                "update_contact_style" | "set_contact_style" => {
+                    let target = act["target"]
+                        .as_str()
+                        .or_else(|| act["contact"].as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let style = act["style"]
+                        .as_str()
+                        .or_else(|| act["pattern"].as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"));
+                    let tone = act["tone"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"));
+                    let relationship = act["relationship"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"));
+                    if !target.is_empty() && (style.is_some() || tone.is_some() || relationship.is_some()) {
+                        if let Some(num) = resolve_contact_target(db, target).await? {
+                            let mut cm = db
+                                .get_contact_memory(&num)
+                                .await?
+                                .unwrap_or_else(|| ContactMemory::new(&num));
+                            if let Some(st) = style {
+                                cm.owner_style_pattern = observe_per_person_chat_pattern(
+                                    &cm.sample_owner_replies,
+                                    Some(st),
+                                );
+                            }
+                            if let Some(t) = tone {
+                                cm.tone = Some(t.chars().take(40).collect());
+                            }
+                            if let Some(r) = relationship {
+                                cm.relationship = Some(r.chars().take(40).collect());
+                            }
+                            cm.updated_at = now_ms;
+                            db.save_contact_memory(&cm).await?;
+                            saved_learning_or_memory = true;
+                            action_notes.push(format!("Updated chat style for +{}", num));
+                        } else {
+                            action_notes.push(format!("Couldn't resolve contact \"{}\"", target));
+                        }
+                    }
+                }
+                "read_link" | "fetch_url" | "open_link" => {
+                    let url = act["url"].as_str().unwrap_or("").trim();
+                    if !url.is_empty() {
+                        match fetch_and_summarize_link(url).await {
+                            Ok(summary) => {
+                                extra_sections.push(summary);
+                                action_notes.push("Read link".to_string());
+                            }
+                            Err(e) => {
+                                action_notes.push(format!(
+                                    "Could not read link: {}",
+                                    redact_secrets(&e.to_string(), cfg)
+                                ));
+                            }
+                        }
+                    }
+                }
+                "set_dm_voice_mode" => {
+                    let mode = match act["mode"].as_str().unwrap_or("auto").trim().to_lowercase().as_str() {
+                        "off" | "never" | "text" => "off",
+                        "explicit" | "manual" | "ask" => "explicit",
+                        _ => "auto",
+                    };
+                    db.set_setting("dm_voice_mode", mode).await?;
+                    action_notes.push(format!("DM voice mode: {}", mode));
                 }
                 "delete_owner_memory" | "forget_owner_memory" => {
                     if let Some(mid) = act["id"].as_i64() {
@@ -1812,6 +2002,20 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
             }
     }
 
+    // Deterministic learning backstop: if Falcon gave a clear standing rule or correction
+    // ("stop saying...", "never say...", "from now on...") and the LLM didn't emit a memory/lesson
+    // action, save it automatically so FalkeAI genuinely remembers every correction.
+    if !saved_learning_or_memory {
+        if let Some(auto_rule) = detect_owner_correction_feedback(text) {
+            if let Ok(id) = db
+                .add_learning_episode(None, "owner_rule", &auto_rule)
+                .await
+            {
+                action_notes.push(format!("Learned rule #{}", id));
+            }
+        }
+    }
+
     if !extra_sections.is_empty() {
         reply_text = format!("{}\n\n{}", reply_text, extra_sections.join("\n\n"));
     }
@@ -1840,6 +2044,7 @@ Reply with ONE valid, compact JSON object only (no markdown fences):
     Ok(OwnerChatOutcome {
         reply: reply_text,
         outbounds,
+        voice_outbounds,
         device_actions,
         cloud_actions_done: action_notes,
         voice_reply,

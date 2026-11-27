@@ -905,6 +905,13 @@ pub async fn handle_get_settings_endpoint(db: &Database, cfg: &Config) -> (u16, 
         .flatten()
         .filter(|s| matches!(s.as_str(), "auto" | "on" | "off"))
         .unwrap_or_else(|| "auto".to_string());
+    let dm_voice_mode = db
+        .get_setting("dm_voice_mode")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| matches!(s.as_str(), "auto" | "explicit" | "off"))
+        .unwrap_or_else(|| "auto".to_string());
     let active_devices = db
         .list_active_phone_devices()
         .await
@@ -921,6 +928,8 @@ pub async fn handle_get_settings_endpoint(db: &Database, cfg: &Config) -> (u16, 
             "digest_hour_lagos": digest_hour,
             "reply_mode": reply_mode,
             "self_voice_mode": self_voice_mode,
+            "dm_voice_mode": dm_voice_mode,
+            "tts_voice": cfg.tts_voice,
             "ntfy_configured": ntfy_configured,
             "gmail_count": gmail_count,
             "paired_devices_count": active_devices
@@ -941,7 +950,12 @@ pub async fn handle_update_settings_endpoint(
         return (400, json!({ "error": "Empty settings update" }));
     }
 
-    const ALLOWED_KEYS: &[&str] = &["digest_hour_lagos", "reply_mode", "self_voice_mode"];
+    const ALLOWED_KEYS: &[&str] = &[
+        "digest_hour_lagos",
+        "reply_mode",
+        "self_voice_mode",
+        "dm_voice_mode",
+    ];
     for k in obj.keys() {
         if !ALLOWED_KEYS.contains(&k.as_str()) {
             return (
@@ -1000,6 +1014,25 @@ pub async fn handle_update_settings_endpoint(
             );
         };
         if let Err(e) = db.set_setting("self_voice_mode", &mode).await {
+            return (
+                500,
+                json!({ "error": redact_secrets(&e.to_string(), cfg) }),
+            );
+        }
+    }
+
+    if let Some(v) = obj.get("dm_voice_mode") {
+        let Some(mode) = v
+            .as_str()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|m| matches!(m.as_str(), "auto" | "explicit" | "off"))
+        else {
+            return (
+                400,
+                json!({ "error": "dm_voice_mode must be 'auto', 'explicit', or 'off'" }),
+            );
+        };
+        if let Err(e) = db.set_setting("dm_voice_mode", &mode).await {
             return (
                 500,
                 json!({ "error": redact_secrets(&e.to_string(), cfg) }),
@@ -1331,6 +1364,11 @@ pub async fn handle_phone_chat_endpoint(
             .wa_send_tx
             .send((target_jid.clone(), msg_text.clone()));
     }
+    for (target_jid, msg_text) in &outcome.voice_outbounds {
+        let _ = state
+            .wa_send_tx
+            .send((format!("voice:{}", target_jid), msg_text.clone()));
+    }
 
     // If any cloud action triggered find_phone_siren, push SSE too so all paired devices react
     for da in &outcome.device_actions {
@@ -1379,7 +1417,7 @@ pub async fn handle_phone_chat_endpoint(
             "reply_text": outcome.reply,
             "cloud_actions_done": outcome.cloud_actions_done,
             "device_actions": outcome.device_actions,
-            "whatsapp_outbounds_sent": outcome.outbounds.len(),
+            "whatsapp_outbounds_sent": outcome.outbounds.len() + outcome.voice_outbounds.len(),
             "tts_audio_base64": tts_audio_base64,
             "tts_mime": tts_mime,
             "tts_seconds": tts_seconds

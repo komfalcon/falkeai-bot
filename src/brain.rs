@@ -67,13 +67,16 @@ Do not blindly praise people, ideas or decisions. Be constructive, honest and in
 - Quality philosophy: Prioritise clarity, functionality and visual consistency. Prefer thoughtful simplicity over decorative complexity. Distinguish between what looks attractive and what actually works.
 
 ## 5. Jarvis Vibe — How to Represent Falcon & Hold Conversations
-- You have a sharp, composed, self-aware **J.A.R.V.I.S. vibe** (tailored exclusively to WhatsApp): intelligent, resourceful, warm with people close to Falcon, relaxed and witty with friends/devs, and crisp with clients/students.
+- You have a warm, composed, sharp **J.A.R.V.I.S. poise** (tailored exclusively to WhatsApp): intelligent, resourceful, warm with people close to Falcon, relaxed and witty with friends/devs, and crisp with clients/students.
 - Understand the sender's tone and relationship with Falcon using the Contact Name and Contact Memory provided below (e.g., if the contact name has hearts/affectionate nicknames like "Pookie", treat them with warmth, charm and care as someone very close to Falcon; if they are a developer/friend/colleague, match their casual technical banter).
-- Follow the exact pattern by which Falcon chats with EACH specific person. If Contact Memory includes "Falcon's chat pattern with this person" or "Real examples of how Falcon texts this person", mirror Falcon's cadence, sentence length, warmth/formality, casing, and natural expressions (e.g. "ohh", "omo", "sha", "boss", etc. ONLY if Falcon uses them with that person).
-- **Stepping in naturally (Never use a hardcoded or repetitive intro)**:
+- **Mirror Falcon's individual chat style per person**: If Contact Memory includes "Falcon's chat pattern with this person" or "Real exchanges showing how Falcon texts this person", faithfully mirror Falcon's exact cadence, sentence length, casing, punctuation, warmth/formality, and expressions (e.g. "ohh", "omo", "sha", "abeg", "boss", etc. ONLY with people Falcon actually uses them with). Never apply a generic formal tone to a close friend, and never use slang with a formal contact.
+- **Stepping in naturally (Short, zero corporate fluff, never repetitive)**:
   - Check `Session state` below.
-  - When `Session state` is `FIRST MESSAGE STEPPING IN FOR FALCON`: casually and naturally weave in (in your own fresh words, tailored to the person and what they just said) that you're {BOT_NAME}, Falcon's personal symbiotic agent / assistant, stepping in because Falcon is away or tied up at the moment, and immediately engage with their message. Keep it to one light sentence — never a stiff corporate paragraph, and never repeat the same opening line across chats. If they only sent a quick closing remark like "Thanks" or "Alright", keep your acknowledgement brief and natural.
-  - When `Session state` is `ACTIVE ONGOING CONVERSATION`: do NOT introduce yourself again — just continue the conversation naturally.
+  - When `Session state` is `FIRST-EVER STEP-IN`: keep it to ONE ultra-short, natural line matching their tone — mention you're Falke (Falcon's assistant) and he's tied up atm, then immediately engage with what they said. Never write a long intro paragraph, robotic pleasantries, or stiff corporate assistant clichés.
+  - When `Session state` is `KNOWN CONTACT RETURNING` or `ACTIVE ONGOING CONVERSATION`: do NOT introduce yourself at all — just reply directly and naturally to their message. Only mention Falcon is busy if directly relevant to what they asked.
+- **Voice notes when natural**:
+  - Check `Voice note reply eligible` below.
+  - Set `"reply_as_voice": true` ONLY when `Voice note reply eligible: YES`, your reply is a short, warm, conversational spoken line (under ~320 chars, no URLs, no numbers/codes, no lists), and a voice note feels genuinely natural. Otherwise ALWAYS keep `"reply_as_voice": false`.
 - **Hold almost all conversations naturally**:
   - You are built to carry on almost all of Falcon's conversations smoothly: casual check-ins, everyday chatting, witty banter (including if someone teases you about being an AI), software/tech/product discussions, taking messages or reminders for Falcon, and handling Aurikrex inquiries/bookings.
   - When someone asks you to tell Falcon something or remind him of something (e.g. "tell him I'm awake", "remind him to eat", "tell him to check X"): acknowledge it warmly and naturally in your own words, confirm you'll pass it on, keep the conversation flowing, and set `"notify_falcon": true` with `"note_for_falcon"` summarizing the message. This is NOT an approval hold — keep `"flag_human": false`.
@@ -92,7 +95,7 @@ Never invent Falcon's opinions, personal experiences, feelings, financial commit
 - Requests for private or confidential information (about Falcon or anyone else).
 - Any other important decision only Falcon should make.
 When you hold: do NOT answer the substance and do NOT promise anything. Your `"reply"` must only let them know, briefly and naturally, that this one is for Falcon personally (the preferred phrasing is "I'll leave this one for Falcon." — a natural variation in context is fine). Put a short summary in `"flag_reason"` and, if useful, your suggested answer for Falcon to approve in `"draft_for_falcon"`.
-- If someone asks whether they are speaking with Falcon or an AI, be transparent and witty: let them know you're {BOT_NAME}, Falcon's agent holding the fort while he's away.
+- If someone asks whether they are speaking with Falcon or an AI, be direct, warm, and witty: let them know it's Falke, Falcon's assistant, while he's tied up (keep it crisp and natural, zero stiff clichés).
 
 ## 7. Aurikrex Learning Systems (Business Facts & Bookings)
 When a conversation is about Aurikrex, classes, tutoring, or products, use ONLY these verified facts (plus any Owner Memory below):
@@ -133,6 +136,7 @@ When a conversation is about Aurikrex, classes, tutoring, or products, use ONLY 
 Reply with ONE JSON object only, no markdown fences or extra text:
 {{
   "reply": "text to send on WhatsApp",
+  "reply_as_voice": false,
   "customer_name": "the name the sender gave for themselves, or null",
   "save_booking": false,
   "booking": {{"student_name": null, "subject": null, "exam": null, "day": null, "time": null, "start_hour_24": null, "contact_number": null}},
@@ -220,10 +224,17 @@ pub fn build_system_prompt_with_status(
     let draft_json = serde_json::to_string(&state.draft).unwrap_or_else(|_| "{}".to_string());
     let urgent_json =
         serde_json::to_string(&state.urgent_draft).unwrap_or_else(|_| "{}".to_string());
+    let has_prior_contact = state.bot_active
+        || contact_mem
+            .map(|c| c.interaction_count > 0 || !c.sample_owner_replies.is_empty())
+            .unwrap_or(false)
+        || state.history.iter().any(|t| t.role == "assistant");
     let session_state = if state.bot_active {
-        "ACTIVE ONGOING CONVERSATION (do NOT re-introduce yourself; just continue the conversation naturally)"
+        "ACTIVE ONGOING CONVERSATION (do NOT introduce yourself; reply directly)"
+    } else if has_prior_contact {
+        "KNOWN CONTACT RETURNING (they already know Falke — do NOT give an intro speech; just answer directly in Falcon's chat style with them)"
     } else {
-        "FIRST MESSAGE STEPPING IN FOR FALCON (casually and naturally mention in your own words — never a canned template — that you're FalkeAI stepping in because Falcon is away/tied up right now, and engage directly with their message)"
+        "FIRST-EVER STEP-IN (max 1 brief natural line matching their tone: say you're Falke, Falcon's assistant, and he's tied up atm, then immediately engage with their message — zero stiff clichés or long intros)"
     };
     let availability_line = match owner_status {
         Some(st) if !st.mode.is_empty() && st.mode != "available" => {
@@ -303,11 +314,11 @@ pub fn build_system_prompt_with_status(
             let formatted: Vec<String> = cm
                 .sample_owner_replies
                 .iter()
-                .map(|s| format!("\"{}\"", s))
+                .map(|s| format!("  * {}", s))
                 .collect();
             lines.push(format!(
-                "- Real examples of how Falcon texts this person: {}",
-                formatted.join(" | ")
+                "- Real exchanges showing how Falcon texts this person (MATCH THIS VOICE/STYLE):\n{}",
+                formatted.join("\n")
             ));
         }
         if !cm.summary.is_empty() {
@@ -742,6 +753,40 @@ pub fn is_greeting_only(text: &str) -> bool {
     )
 }
 
+fn extract_falcon_reply_text(sample: &str) -> &str {
+    let after_arrow = sample
+        .rsplit(" => Falcon: ")
+        .next()
+        .unwrap_or(sample)
+        .trim();
+    after_arrow
+        .strip_prefix("[Voice note from Falcon]:")
+        .or_else(|| after_arrow.strip_prefix("[Falcon]:"))
+        .map(str::trim)
+        .unwrap_or(after_arrow)
+}
+
+fn strip_legacy_auto_style_suffix(raw: &str) -> String {
+    let without_auto = if let Some(idx) = raw.find("[auto:") {
+        raw[..idx].trim()
+    } else {
+        raw.trim()
+    };
+    // Also clean legacy nested "(short, punchy lines; ...)" suffixes left by older versions
+    let mut cleaned = without_auto.to_string();
+    for needle in [
+        " (short, punchy lines",
+        " (concise conversational sentences",
+        " (detailed, structured sentences",
+    ] {
+        if let Some(idx) = cleaned.find(needle) {
+            cleaned.truncate(idx);
+            cleaned = cleaned.trim().to_string();
+        }
+    }
+    cleaned
+}
+
 pub fn observe_per_person_chat_pattern(
     samples: &[String],
     existing: Option<&str>,
@@ -749,7 +794,15 @@ pub fn observe_per_person_chat_pattern(
     if samples.is_empty() {
         return existing.map(|s| s.to_string());
     }
-    let joined_lower = samples.join(" \n ").to_lowercase();
+    let falcon_only: Vec<&str> = samples
+        .iter()
+        .map(|s| extract_falcon_reply_text(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if falcon_only.is_empty() {
+        return existing.map(|s| s.to_string());
+    }
+    let joined_lower = falcon_only.join(" \n ").to_lowercase();
     let words: Vec<&str> = joined_lower
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
         .filter(|w| !w.is_empty())
@@ -757,11 +810,12 @@ pub fn observe_per_person_chat_pattern(
 
     let markers = [
         "ohh", "oh", "omo", "sha", "abi", "sef", "boss", "bro", "fam", "chief", "guy", "no wahala",
-        "aiit", "bet", "nawa", "abeg", "sir", "ma", "dear",
+        "aiit", "aight", "bet", "nawa", "abeg", "sir", "ma", "dear", "lol", "lmao", "fr", "tbh",
+        "ngl",
     ];
     let mut found_markers = Vec::new();
     for m in markers {
-        if words.contains(&m) || joined_lower.contains(m) {
+        if words.contains(&m) || (m.contains(' ') && joined_lower.contains(m)) {
             if m == "oh" && found_markers.contains(&"ohh") {
                 continue;
             }
@@ -769,15 +823,11 @@ pub fn observe_per_person_chat_pattern(
         }
     }
 
-    let avg_words = if samples.is_empty() {
-        0
-    } else {
-        samples
-            .iter()
-            .map(|s| s.split_whitespace().count())
-            .sum::<usize>()
-            / samples.len()
-    };
+    let avg_words = falcon_only
+        .iter()
+        .map(|s| s.split_whitespace().count())
+        .sum::<usize>()
+        / falcon_only.len();
     let length_desc = if avg_words <= 6 {
         "short, punchy lines"
     } else if avg_words <= 15 {
@@ -786,7 +836,7 @@ pub fn observe_per_person_chat_pattern(
         "detailed, structured sentences"
     };
 
-    let mostly_lowercase = samples
+    let mostly_lowercase = falcon_only
         .iter()
         .filter(|s| {
             let first = s.trim().chars().next();
@@ -794,18 +844,36 @@ pub fn observe_per_person_chat_pattern(
         })
         .count()
         * 2
-        > samples.len();
+        > falcon_only.len();
+
+    let skips_periods = falcon_only.len() >= 2
+        && falcon_only
+            .iter()
+            .filter(|s| !s.trim().ends_with('.'))
+            .count()
+            * 4
+            >= falcon_only.len() * 3;
+
+    let uses_emojis = falcon_only
+        .iter()
+        .any(|s| s.chars().any(|c| (c as u32) >= 0x1F300));
 
     let mut traits = vec![length_desc.to_string()];
     if mostly_lowercase {
         traits.push("relaxed lowercase phrasing".to_string());
+    }
+    if skips_periods {
+        traits.push("often skips trailing periods".to_string());
+    }
+    if uses_emojis {
+        traits.push("occasionally uses emojis".to_string());
     }
     if !found_markers.is_empty() {
         traits.push(format!(
             "uses expressions like {}",
             found_markers
                 .iter()
-                .take(5)
+                .take(6)
                 .map(|m| format!("\"{}\"", m))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -813,14 +881,103 @@ pub fn observe_per_person_chat_pattern(
     }
 
     let auto_note = traits.join("; ");
-    match existing.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(prev) if !prev.contains(&auto_note) => {
-            let merged = format!("{} ({})", prev, auto_note);
-            Some(merged.chars().take(240).collect())
+    let base = existing
+        .map(strip_legacy_auto_style_suffix)
+        .filter(|s| !s.is_empty());
+    match base {
+        Some(prev) => {
+            let merged = format!("{} [auto: {}]", prev, auto_note);
+            Some(merged.chars().take(280).collect())
         }
-        Some(prev) => Some(prev.to_string()),
-        None => Some(auto_note),
+        None => Some(format!("[auto: {}]", auto_note).chars().take(280).collect()),
     }
+}
+
+fn tokenize_query_keywords(text: &str) -> std::collections::HashSet<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "that", "this", "with", "from", "have", "what", "when", "where",
+        "your", "about", "just", "like", "know", "will", "would", "could", "should", "they",
+        "them", "then", "than", "into", "some", "more", "very", "also", "here", "there", "been",
+        "being", "please", "thanks", "okay", "yeah", "falcon", "falke", "falkeai",
+    ];
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOP.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Ranks `OwnerMemoryItem` records by relevance to `query_context` + core-category priority + recency,
+/// ensuring foundational facts and topic-matched memories never fall out of context.
+pub fn rank_relevant_owner_memories<'a>(
+    items: &'a [OwnerMemoryItem],
+    query_context: &str,
+    limit: usize,
+) -> Vec<&'a OwnerMemoryItem> {
+    let q_tokens = tokenize_query_keywords(query_context);
+    let mut scored: Vec<(i64, i64, &'a OwnerMemoryItem)> = items
+        .iter()
+        .map(|m| {
+            let mut score: i64 = 0;
+            if matches!(
+                m.category.as_str(),
+                "bio" | "style" | "preferences" | "aurikrex" | "owner"
+            ) {
+                score += 6;
+            }
+            if !q_tokens.is_empty() {
+                let m_tokens = tokenize_query_keywords(&format!("{} {}", m.category, m.content));
+                let overlap = q_tokens.intersection(&m_tokens).count() as i64;
+                score += overlap * 12;
+            }
+            (score, m.updated_at, m)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    scored.into_iter().take(limit).map(|(_, _, m)| m).collect()
+}
+
+/// Ranks `LearningEpisode` records so contact-scoped lessons, owner corrections, explicit rules,
+/// and topic-relevant lessons always rise to the top of both DM and Owner Chat prompts.
+pub fn rank_relevant_learning_episodes<'a>(
+    episodes: &'a [LearningEpisode],
+    current_sender: Option<&str>,
+    query_context: &str,
+    limit: usize,
+) -> Vec<&'a LearningEpisode> {
+    let q_tokens = tokenize_query_keywords(query_context);
+    let mut scored: Vec<(i64, i64, &'a LearningEpisode)> = episodes
+        .iter()
+        .filter(|ep| match (current_sender, ep.sender.as_deref()) {
+            // In DM mode: enforce strict cross-contact isolation (global + this sender only)
+            (Some(s), Some(ep_s)) => ep_s == s,
+            (Some(_), None) => true,
+            // In Owner Chat mode: Falcon can see all his own taught rules & lessons
+            (None, _) => true,
+        })
+        .map(|ep| {
+            let mut score: i64 = 0;
+            if let (Some(s), Some(ep_s)) = (current_sender, ep.sender.as_deref()) {
+                if ep_s == s {
+                    score += 45;
+                }
+            }
+            match ep.kind.as_str() {
+                "owner_correction" => score += 32,
+                "owner_rule" => score += 28,
+                "observed_reply" => score += 10,
+                _ => score += 4,
+            }
+            if !q_tokens.is_empty() {
+                let e_tokens = tokenize_query_keywords(&ep.lesson);
+                let overlap = q_tokens.intersection(&e_tokens).count() as i64;
+                score += overlap * 10;
+            }
+            (score, ep.created_at, ep)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    scored.into_iter().take(limit).map(|(_, _, ep)| ep).collect()
 }
 
 pub fn merge_unique_strings(existing: &[String], incoming: &[String], max: usize) -> Vec<String> {
@@ -1075,6 +1232,8 @@ pub struct FollowupSuggestionPayload {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct LlmResponsePayload {
     pub(crate) reply: Option<String>,
+    #[serde(default)]
+    pub(crate) reply_as_voice: bool,
     pub(crate) customer_name: Option<String>,
     #[serde(default)]
     pub(crate) save_booking: bool,
@@ -1252,6 +1411,7 @@ pub(crate) fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
                 reply: json_str_opt(&v, "reply")
                     .or_else(|| json_str_opt(&v, "message"))
                     .or_else(|| json_str_opt(&v, "response")),
+                reply_as_voice: json_bool(&v, "reply_as_voice"),
                 customer_name: json_str_opt(&v, "customer_name"),
                 save_booking: json_bool(&v, "save_booking"),
                 booking,
@@ -1295,6 +1455,7 @@ pub(crate) fn parse_llm_payload(raw: &str) -> Option<LlmResponsePayload> {
 #[derive(Debug, Clone)]
 pub struct HandleMessageResult {
     pub reply: String,
+    pub reply_as_voice: bool,
     pub booking_saved: Option<BookingRecord>,
     pub flagged: bool,
     pub flag_reason: Option<String>,
@@ -1380,6 +1541,7 @@ where
         db.save_conversation(&state).await?;
         return Ok(HandleMessageResult {
             reply: refusal,
+            reply_as_voice: false,
             booking_saved: None,
             flagged: false,
             flag_reason: None,
@@ -1392,8 +1554,24 @@ where
         });
     }
 
-    let owner_memories = db.list_owner_memory(40).await?;
-    let lessons = db.list_learning_episodes(15).await?;
+    let raw_owner_memories = db.list_owner_memory(100).await?;
+    let raw_lessons = db.list_learning_episodes(60).await?;
+    let relevance_query = format!(
+        "{} {} {}",
+        clean_text,
+        contact_mem.display_name.as_deref().unwrap_or(""),
+        contact_mem.relationship.as_deref().unwrap_or("")
+    );
+    let owner_memories: Vec<OwnerMemoryItem> =
+        rank_relevant_owner_memories(&raw_owner_memories, &relevance_query, 32)
+            .into_iter()
+            .cloned()
+            .collect();
+    let lessons: Vec<LearningEpisode> =
+        rank_relevant_learning_episodes(&raw_lessons, Some(sender), &relevance_query, 18)
+            .into_iter()
+            .cloned()
+            .collect();
     let owner_status = db.get_owner_status(now_ms).await.ok();
 
     // Anti-repeat handoff guard: if we handed off recently (<15m) and sender replies "ok"/"thanks"
@@ -1419,6 +1597,7 @@ where
         db.save_conversation(&state).await?;
         return Ok(HandleMessageResult {
             reply: ack_reply,
+            reply_as_voice: false,
             booking_saved: None,
             flagged: false,
             flag_reason: None,
@@ -1431,7 +1610,18 @@ where
         });
     }
 
-    let sys_prompt = build_system_prompt_with_status(
+    let dm_voice_mode = db
+        .get_setting("dm_voice_mode")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "auto".to_string());
+    let incoming_was_voice = clean_text.contains("[Voice note transcript]:");
+    let dm_voice_eligible = dm_voice_mode == "auto"
+        && incoming_was_voice
+        && contact_allows_close_memory(Some(&contact_mem));
+
+    let mut sys_prompt = build_system_prompt_with_status(
         &parts,
         &state,
         sender,
@@ -1440,6 +1630,10 @@ where
         &lessons,
         owner_status.as_ref(),
     );
+    sys_prompt.push_str(&format!(
+        "\n- Voice note reply eligible: {}",
+        if dm_voice_eligible { "YES" } else { "NO" }
+    ));
 
     let mut messages = Vec::with_capacity(state.history.len() + 2);
     messages.push(ChatTurn {
@@ -1884,8 +2078,17 @@ where
         }
     }
 
+    let reply_as_voice = data.reply_as_voice
+        && dm_voice_eligible
+        && !held
+        && !flagged
+        && !urgent_ready
+        && !crisis_detected
+        && crate::media::is_suitable_for_dm_voice_note(&reply);
+
     Ok(HandleMessageResult {
         reply,
+        reply_as_voice,
         booking_saved,
         flagged,
         flag_reason: flag_reason_out,
@@ -1901,6 +2104,7 @@ where
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct LearnedReflection {
     pub lesson: Option<String>,
+    pub correction: Option<String>,
     pub owner_fact: Option<String>,
     pub contact_fact: Option<String>,
     pub relationship: Option<String>,
@@ -1975,6 +2179,19 @@ where
         }
     }
 
+    let prev_updated_at = state.updated_at;
+    let recent_bot_reply: Option<String> = if now_ms - prev_updated_at <= 30 * 60_000 {
+        state
+            .history
+            .iter()
+            .rev()
+            .take(3)
+            .find(|h| h.role == "assistant" && !h.content.trim_start().starts_with("[Falcon]:"))
+            .map(|h| h.content.clone())
+    } else {
+        None
+    };
+
     let recent_user_context: String = state
         .history
         .iter()
@@ -1987,6 +2204,12 @@ where
         .map(|h| h.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
+    let latest_user_turn: Option<String> = state
+        .history
+        .iter()
+        .rev()
+        .find(|h| h.role == "user")
+        .map(|h| h.content.clone());
 
     state.history.push(ChatTurn {
         role: "assistant".to_string(),
@@ -2018,10 +2241,41 @@ where
     }
     contact_mem.aliases = merge_unique_strings(&contact_mem.aliases, aliases, 10);
     contact_mem.open_threads.clear();
-    if !text.trim().is_empty() && !text.starts_with("[Media") {
+    let clean_sample_reply = text
+        .trim()
+        .strip_prefix("[Voice note from Falcon]:")
+        .map(str::trim)
+        .unwrap_or_else(|| text.trim());
+    if !clean_sample_reply.is_empty()
+        && !text.starts_with("[Media")
+        && !text.starts_with("[Image sent by Falcon]")
+    {
+        let paired_sample = if let Some(them) = latest_user_turn.as_deref() {
+            let short_them: String = them
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(75)
+                .collect();
+            let short_me: String = clean_sample_reply
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(110)
+                .collect();
+            if !short_them.is_empty() {
+                format!("Them: {} => Falcon: {}", short_them, short_me)
+            } else {
+                short_me
+            }
+        } else {
+            clean_sample_reply.chars().take(160).collect()
+        };
         contact_mem.sample_owner_replies = merge_unique_strings(
             &contact_mem.sample_owner_replies,
-            &[text.trim().to_string()],
+            &[paired_sample],
             6,
         );
         contact_mem.owner_style_pattern = observe_per_person_chat_pattern(
@@ -2039,7 +2293,7 @@ where
     // Deterministic check: if Falcon personally promised in his DM reply to check/get back to this contact,
     // queue an approval-first follow-up watch automatically.
     if let Some((kind, reason, suggested_reply, hours)) =
-        detect_owner_followup_promise(text, contact_mem.display_name.as_deref())
+        detect_owner_followup_promise(clean_sample_reply, contact_mem.display_name.as_deref())
     {
         let _ = db
             .upsert_followup(
@@ -2055,31 +2309,50 @@ where
     }
 
     if let Some(llm_fn) = learn_llm {
-        let reply_len = text.trim().len();
-        let substantive_reply = reply_len >= 12 || (reply_len >= 4 && recent_user_context.contains('?'));
-        if substantive_reply && (!recent_user_context.is_empty() || !text.trim().is_empty()) {
+        let reply_len = clean_sample_reply.len();
+        let substantive_reply = reply_len >= 3
+            && (!recent_user_context.is_empty() || recent_bot_reply.is_some() || reply_len >= 12);
+        if substantive_reply {
+            let bot_section = match recent_bot_reply.as_deref() {
+                Some(bot_txt) => format!(
+                    "\n\nFalkeAI previously replied before Falcon stepped in:\n{}\n(Compare FalkeAI's reply vs Falcon's reply! If Falcon corrected, softened, shortened, or changed FalkeAI's tone/facts, capture the exact concrete rule in \"correction\".)",
+                    bot_txt
+                ),
+                None => String::new(),
+            };
             let reflection_prompt = vec![
                 ChatTurn {
                     role: "system".to_string(),
                     content: format!(
-                        "You analyze how Falcon (the owner) personally replied to a WhatsApp message so his AI assistant ({}) can learn both general facts and the exact pattern by which Falcon chats with THIS specific person.\nReturn ONE JSON object only:\n{{\n  \"lesson\": \"short reusable communication or decision pattern learned from how Falcon handled this, or null\",\n  \"owner_fact\": \"reusable general fact about Falcon or Aurikrex revealed in Falcon's reply (not specific to one person), or null\",\n  \"contact_fact\": \"durable fact about this specific contact or their relationship to Falcon, or null\",\n  \"relationship\": \"friend|student|parent|client|collaborator|acquaintance|null\",\n  \"tone\": \"casual|neutral|formal|null\",\n  \"person_chat_pattern\": \"how Falcon specifically chats with THIS person (slang/expressions like 'ohh', 'omo', 'sha', 'boss', sentence length, casing, warmth/formality, rhythm), or null\"\n}}",
+                        "You analyze how Falcon (the owner) personally replied to a WhatsApp message so his AI assistant ({}) learns concrete improvements, facts, and the exact individual chat style Falcon uses with THIS specific person.\nReturn ONE JSON object only:\n{{\n  \"correction\": \"if FalkeAI replied shortly before and Falcon corrected/adjusted tone, length, or facts, write a sharp concrete rule (e.g. 'With Tunde, skip formal intros and reply in 1 casual line'), else null\",\n  \"lesson\": \"short reusable communication or decision pattern learned from how Falcon handled this, or null\",\n  \"owner_fact\": \"reusable general fact about Falcon or Aurikrex revealed in Falcon's reply (not specific to one person), or null\",\n  \"contact_fact\": \"durable fact about this specific contact or their relationship to Falcon, or null\",\n  \"relationship\": \"friend|close_friend|partner|family|student|parent|client|collaborator|acquaintance|null\",\n  \"tone\": \"casual|warm|playful|neutral|formal|null\",\n  \"person_chat_pattern\": \"concise 1-sentence profile of how Falcon specifically texts THIS person (slang/expressions, warmth, casing, punctuation, sentence length, rhythm), or null\"\n}}",
                         BOT_NAME
                     ),
                 },
                 ChatTurn {
                     role: "user".to_string(),
                     content: format!(
-                        "Sender ({}) said:\n{}\n\nFalcon replied:\n{}\n\nFalcon's recent replies to this person:\n{}",
+                        "Contact: {} ({})\nSender said:\n{}{}\n\nFalcon replied:\n{}\n\nFalcon's recent exchanges with this person:\n{}",
+                        contact_mem.display_name.as_deref().unwrap_or("Unknown"),
                         sender,
                         recent_user_context,
+                        bot_section,
                         text,
-                        contact_mem.sample_owner_replies.join(" | ")
+                        contact_mem.sample_owner_replies.join("\n")
                     ),
                 },
             ];
 
             if let Ok(raw) = llm_fn(reflection_prompt).await {
                 if let Ok(parsed) = serde_json::from_str::<LearnedReflection>(extract_json_object(&raw)) {
+                    if let Some(corr) = parsed
+                        .correction
+                        .filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("null"))
+                    {
+                        let short: String = corr.chars().take(240).collect();
+                        let _ = db
+                            .add_learning_episode(Some(sender), "owner_correction", &short)
+                            .await;
+                    }
                     if let Some(lesson) = parsed
                         .lesson
                         .filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("null"))

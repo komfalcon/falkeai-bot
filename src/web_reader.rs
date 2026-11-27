@@ -19,7 +19,7 @@ use crate::media::MediaBudget;
 use crate::safety::{detect_injection, redact_secrets, sanitize_inbound};
 
 pub const MAX_WEB_BYTES: usize = 512 * 1024; // 512 KB cap per page
-pub const MAX_SUMMARY_CHARS: usize = 1400;
+pub const MAX_SUMMARY_CHARS: usize = 2200;
 pub const MAX_REDIRECTS: usize = 3;
 
 const SKIP_EXTENSIONS: &[&str] = &[
@@ -292,8 +292,8 @@ fn build_no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (compatible; FalkeAIBot/1.0; +https://aurikrex.tech)")
+        .timeout(Duration::from_secs(12))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -500,7 +500,7 @@ pub fn summarize_html_document(url: &str, html: &str) -> String {
         &["og:description", "twitter:description", "description"],
     );
     let json_ld = extract_json_ld_summary(html);
-    let body_text = strip_html_to_text(html, 900);
+    let body_text = strip_html_to_text(html, 1800);
 
     let mut parts: Vec<String> = Vec::new();
     if let Some(s) = site.filter(|s| !s.is_empty()) {
@@ -621,6 +621,34 @@ pub fn format_fxtwitter_json(url: &str, v: &Value) -> Option<String> {
 
 /// Parses a GitHub repository URL into `(owner, repo)`.
 pub fn parse_github_repo_url(url: &str) -> Option<(String, String)> {
+    match parse_github_target(url)? {
+        GitHubTarget::Repo { owner, repo }
+        | GitHubTarget::IssueOrPr { owner, repo, .. }
+        | GitHubTarget::Blob { owner, repo, .. } => Some((owner, repo)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubTarget {
+    Repo {
+        owner: String,
+        repo: String,
+    },
+    IssueOrPr {
+        owner: String,
+        repo: String,
+        number: String,
+        is_pr: bool,
+    },
+    Blob {
+        owner: String,
+        repo: String,
+        git_ref: String,
+        file_path: String,
+    },
+}
+
+pub fn parse_github_target(url: &str) -> Option<GitHubTarget> {
     let parsed = parse_and_validate_url_syntax(url).ok()?;
     if parsed.host.trim_start_matches("www.") != "github.com" {
         return None;
@@ -633,20 +661,161 @@ pub fn parse_github_repo_url(url: &str) -> Option<(String, String)> {
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
-    if segs.len() >= 2 {
-        let owner = segs[0];
-        let repo = segs[1].trim_end_matches(".git");
-        if !owner.is_empty()
-            && !repo.is_empty()
-            && !matches!(
-                owner,
-                "settings" | "orgs" | "topics" | "trending" | "explore" | "marketplace" | "login"
-            )
-        {
-            return Some((owner.to_string(), repo.to_string()));
+    if segs.len() < 2 {
+        return None;
+    }
+    let owner = segs[0];
+    let repo = segs[1].trim_end_matches(".git");
+    if owner.is_empty()
+        || repo.is_empty()
+        || matches!(
+            owner,
+            "settings" | "orgs" | "topics" | "trending" | "explore" | "marketplace" | "login"
+        )
+    {
+        return None;
+    }
+    if segs.len() >= 4 && matches!(segs[2], "issues" | "pull") {
+        let num: String = segs[3].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            return Some(GitHubTarget::IssueOrPr {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number: num,
+                is_pr: segs[2] == "pull",
+            });
         }
     }
-    None
+    if segs.len() >= 5 && segs[2] == "blob" {
+        let git_ref = segs[3].to_string();
+        let file_path = segs[4..].join("/");
+        if !git_ref.is_empty() && !file_path.is_empty() {
+            return Some(GitHubTarget::Blob {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                git_ref,
+                file_path,
+            });
+        }
+    }
+    Some(GitHubTarget::Repo {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+/// Parses a `*.wikipedia.org/wiki/<Article>` URL into `(lang, title)`.
+pub fn parse_wikipedia_url(url: &str) -> Option<(String, String)> {
+    let parsed = parse_and_validate_url_syntax(url).ok()?;
+    let host = parsed.host.trim_start_matches("www.");
+    let lang = host
+        .strip_suffix(".m.wikipedia.org")
+        .or_else(|| host.strip_suffix(".wikipedia.org"))?;
+    if lang.is_empty() || lang.contains('.') {
+        return None;
+    }
+    let path = parsed.path_and_query.split('?').next().unwrap_or("");
+    let title = path.strip_prefix("/wiki/")?.trim_matches('/');
+    if title.is_empty() || title.contains(':') {
+        return None;
+    }
+    Some((lang.to_string(), title.to_string()))
+}
+
+/// Extracts the best YouTube TimedText caption track `baseUrl` directly from watch HTML (`ytInitialPlayerResponse`).
+/// Prefers manual English (`en`) captions, then auto-generated English (`asr`), then the first available track.
+pub fn extract_youtube_caption_url(html: &str) -> Option<String> {
+    let marker = "\"captionTracks\":";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let bracket_start = rest.find('[')?;
+    let slice = &rest[bracket_start..];
+
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end_idx = None;
+    for (idx, b) in slice.bytes().enumerate() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if idx > 64_000 {
+            break;
+        }
+    }
+    let tracks_json = &slice[..=end_idx?];
+    let tracks = serde_json::from_str::<Vec<Value>>(tracks_json).ok()?;
+    if tracks.is_empty() {
+        return None;
+    }
+
+    let pick = tracks
+        .iter()
+        .find(|t| {
+            let lang = t["languageCode"].as_str().unwrap_or("");
+            let kind = t["kind"].as_str().unwrap_or("");
+            (lang == "en" || lang.starts_with("en-")) && kind != "asr"
+        })
+        .or_else(|| {
+            tracks.iter().find(|t| {
+                let lang = t["languageCode"].as_str().unwrap_or("");
+                lang == "en" || lang.starts_with("en-")
+            })
+        })
+        .or_else(|| tracks.first())?;
+
+    let raw_url = pick["baseUrl"].as_str()?.trim();
+    if raw_url.starts_with("https://") || raw_url.starts_with("http://") {
+        Some(raw_url.replace("\\u0026", "&"))
+    } else {
+        None
+    }
+}
+
+/// Converts YouTube TimedText XML (`<text>` / `<p>` / `<s>` nodes) into clean spoken transcript text.
+pub fn parse_timedtext_xml_to_text(xml: &str, max_chars: usize) -> String {
+    static SEG_RE: OnceLock<Regex> = OnceLock::new();
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let seg_re = SEG_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:text|p)\b[^>]*>(.*?)</(?:text|p)>").expect("Valid timedtext regex")
+    });
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("Valid tag regex"));
+
+    let mut chunks = Vec::new();
+    for caps in seg_re.captures_iter(xml) {
+        if let Some(m) = caps.get(1) {
+            let no_tags = tag_re.replace_all(m.as_str(), " ");
+            // Decode twice because YouTube often double-encodes entities like `&amp;#39;`
+            let decoded = decode_html_entities(&decode_html_entities(&no_tags));
+            let clean = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !clean.is_empty() {
+                chunks.push(clean);
+            }
+        }
+        if chunks.len() >= 180 {
+            break;
+        }
+    }
+    chunks.join(" ").chars().take(max_chars).collect()
 }
 
 fn is_youtube_url(url: &str) -> bool {
@@ -736,7 +905,7 @@ pub async fn fetch_and_summarize_link(url: &str) -> Result<String> {
         }
     }
 
-    // 2) YouTube video/shorts link -> official YouTube oEmbed + HTML metadata
+    // 2) YouTube video/shorts link -> official YouTube oEmbed + HTML metadata + TimedText spoken transcript
     if is_youtube_url(&clean_url) {
         let oembed_url = format!(
             "https://www.youtube.com/oembed?url={}&format=json",
@@ -750,7 +919,18 @@ pub async fn fetch_and_summarize_link(url: &str) -> Result<String> {
                     let mut info = format!("YouTube Video: \"{}\" by {}", title, author);
                     if let Ok((html, _)) = fetch_url_safely(&clean_url, false).await {
                         if let Some(desc) = extract_meta_tag(&html, &["og:description", "description"]) {
-                            info.push_str(&format!(" | Description: {}", desc));
+                            info.push_str(&format!(
+                                " | Description: {}",
+                                desc.chars().take(320).collect::<String>()
+                            ));
+                        }
+                        if let Some(cap_url) = extract_youtube_caption_url(&html) {
+                            if let Ok((xml, _)) = fetch_url_safely(&cap_url, false).await {
+                                let transcript = parse_timedtext_xml_to_text(&xml, 1400);
+                                if transcript.len() >= 25 {
+                                    info.push_str(&format!(" | Spoken Transcript: {}", transcript));
+                                }
+                            }
                         }
                     }
                     return Ok(sanitize_link_summary(&clean_url, &info));
@@ -774,13 +954,120 @@ pub async fn fetch_and_summarize_link(url: &str) -> Result<String> {
         }
     }
 
-    // 4) GitHub repository link -> GitHub REST API
-    if let Some((owner, repo)) = parse_github_repo_url(&clean_url) {
-        let api_url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+    // 4) GitHub repo / issue / PR / raw file reader
+    if let Some(target) = parse_github_target(&clean_url) {
+        match target {
+            GitHubTarget::IssueOrPr {
+                owner,
+                repo,
+                number,
+                is_pr,
+            } => {
+                let api_url = format!(
+                    "https://api.github.com/repos/{}/{}/issues/{}",
+                    owner, repo, number
+                );
+                if let Ok((body, _)) = fetch_url_safely(&api_url, true).await {
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        let title = v["title"].as_str().unwrap_or("").trim();
+                        if !title.is_empty() {
+                            let state = v["state"].as_str().unwrap_or("open");
+                            let author = v["user"]["login"].as_str().unwrap_or("unknown");
+                            let desc: String = v["body"]
+                                .as_str()
+                                .unwrap_or("")
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(1100)
+                                .collect();
+                            let kind = if is_pr { "PR" } else { "Issue" };
+                            let info = format!(
+                                "GitHub {} {}/{} #{} [{} by @{}]: {} — {}",
+                                kind, owner, repo, number, state, author, title, desc
+                            );
+                            return Ok(sanitize_link_summary(&clean_url, &info));
+                        }
+                    }
+                }
+            }
+            GitHubTarget::Blob {
+                owner,
+                repo,
+                git_ref,
+                file_path,
+            } => {
+                let raw_url = format!(
+                    "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                    owner, repo, git_ref, file_path
+                );
+                if let Ok((raw_body, _)) = fetch_url_safely(&raw_url, false).await {
+                    let preview: String = raw_body.chars().take(1600).collect();
+                    if !preview.trim().is_empty() {
+                        let info = format!(
+                            "GitHub File {}/{} ({}): {}",
+                            owner, repo, file_path, preview
+                        );
+                        return Ok(sanitize_link_summary(&clean_url, &info));
+                    }
+                }
+            }
+            GitHubTarget::Repo { owner, repo } => {
+                let api_url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+                if let Ok((body, _)) = fetch_url_safely(&api_url, true).await {
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        if let Some(mut summary) = format_github_repo_json(&clean_url, &v) {
+                            let branch = v["default_branch"].as_str().unwrap_or("main");
+                            let readme_url = format!(
+                                "https://raw.githubusercontent.com/{}/{}/{}/README.md",
+                                owner, repo, branch
+                            );
+                            if let Ok((rm, _)) = fetch_url_safely(&readme_url, false).await {
+                                let clean_rm: String = rm
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                                    .chars()
+                                    .take(900)
+                                    .collect();
+                                if clean_rm.len() > 30 {
+                                    let combined = format!(
+                                        "{} | README Excerpt: {}",
+                                        summary
+                                            .split("]: ")
+                                            .nth(1)
+                                            .unwrap_or(&summary),
+                                        clean_rm
+                                    );
+                                    summary = sanitize_link_summary(&clean_url, &combined);
+                                }
+                            }
+                            return Ok(summary);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4b) Wikipedia REST API clean summary
+    if let Some((lang, title)) = parse_wikipedia_url(&clean_url) {
+        let api_url = format!(
+            "https://{}.wikipedia.org/api/rest_v1/page/summary/{}",
+            lang, title
+        );
         if let Ok((body, _)) = fetch_url_safely(&api_url, true).await {
             if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                if let Some(summary) = format_github_repo_json(&clean_url, &v) {
-                    return Ok(summary);
+                let page_title = v["title"].as_str().unwrap_or("").trim();
+                let extract = v["extract"].as_str().unwrap_or("").trim();
+                if !page_title.is_empty() && !extract.is_empty() {
+                    let info = format!(
+                        "Wikipedia ({}): {}",
+                        page_title,
+                        extract.chars().take(1500).collect::<String>()
+                    );
+                    return Ok(sanitize_link_summary(&clean_url, &info));
                 }
             }
         }

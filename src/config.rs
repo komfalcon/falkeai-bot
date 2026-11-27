@@ -1,7 +1,7 @@
 use std::env;
 
 pub const BOT_NAME: &str = "FalkeAI";
-pub const INTRO_MESSAGE: &str = "Hey! I'm Falcon's Personal Symbiotic Agent. I work alongside him, keeping conversations moving and handling things in his absence. He's unavailable at the moment, but I'm here. What's up?";
+pub const INTRO_MESSAGE: &str = "Hey, this is Falke — Falcon's assistant. He's tied up atm, what's up?";
 pub const HANDOFF_REPLY: &str = "I'll leave this one for Falcon.";
 pub const SUBJECTS: [&str; 3] = ["Physics", "Chemistry", "Maths"];
 pub const EXAMS: [&str; 5] = ["JAMB", "WAEC", "NECO", "JUPEB", "A-level"];
@@ -544,7 +544,7 @@ impl Config {
         let tts_voice = env::var("TTS_VOICE")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "troy".to_string());
+            .unwrap_or_else(|| "diana".to_string());
         let max_tts_per_day: usize = env::var("MAX_TTS_PER_DAY")
             .ok()
             .and_then(|v| v.parse().ok())

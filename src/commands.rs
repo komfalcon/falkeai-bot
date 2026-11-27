@@ -604,6 +604,36 @@ where
         )));
     }
 
+    // dmvoice [auto|explicit|off] — outbound DM WhatsApp voice-note mode
+    if lower == "dmvoice" || lower.starts_with("dmvoice ") {
+        let arg = raw.get(7..).unwrap_or("").trim().to_lowercase();
+        if arg.is_empty() {
+            let cur = db
+                .get_setting("dm_voice_mode")
+                .await?
+                .unwrap_or_else(|| "auto".to_string());
+            return Ok(Some(format!(
+                "🎙 *WhatsApp DM Voice Note Mode*: `{}`\n• `dmvoice auto` — reply with a voice note in close/VIP chats when they send a voice note and it fits naturally\n• `dmvoice explicit` — only send DM voice notes when you explicitly ask (e.g. \"send a voice note to David...\")\n• `dmvoice off` — text replies only in DMs",
+                cur
+            )));
+        }
+        let mode = match arg.as_str() {
+            "auto" => "auto",
+            "explicit" | "manual" | "ask" => "explicit",
+            "off" | "mute" | "text" => "off",
+            _ => {
+                return Ok(Some(
+                    "⚠️ Usage: `dmvoice auto`, `dmvoice explicit`, or `dmvoice off`".to_string(),
+                ));
+            }
+        };
+        db.set_setting("dm_voice_mode", mode).await?;
+        return Ok(Some(format!(
+            "🎙 WhatsApp DM voice note mode set to *{}*.",
+            mode
+        )));
+    }
+
     // voice [auto|on|off] — self-chat TTS voice note mode
     if lower == "voice" || lower.starts_with("voice ") {
         let arg = raw.get(5..).unwrap_or("").trim().to_lowercase();
@@ -1161,21 +1191,39 @@ where
         )));
     }
 
-    // learn <rule> / teach <rule>
+    // learn <rule> / teach [<contact>:] <rule>
     if lower == "learn" || lower == "teach" {
         return Ok(Some(
-            "⚠️ Usage: `teach <rule>` or `learn <rule>` (e.g. `teach Always greet Dr. Ade formally`)"
+            "⚠️ Usage: `teach <rule>` or `teach <contact>: <rule>` (e.g. `teach Tunde: keep replies short and casual`)"
                 .to_string(),
         ));
     }
     if lower.starts_with("learn ") || lower.starts_with("teach ") {
         let idx = raw.find(' ').unwrap_or(0);
-        let lesson = raw[idx + 1..].trim();
-        if !lesson.is_empty() {
-            let id = db.add_learning_episode(None, "owner_rule", lesson).await?;
+        let body = raw[idx + 1..].trim();
+        if !body.is_empty() {
+            let mut scoped_sender: Option<String> = None;
+            let mut lesson_text = body;
+            if let Some((left, right)) = body.split_once(':') {
+                let target = left.trim();
+                let rule = right.trim();
+                if !target.is_empty() && !rule.is_empty() && target.len() <= 40 {
+                    if let Ok(Some(num)) = resolve_contact_target(db, target).await {
+                        scoped_sender = Some(num);
+                        lesson_text = rule;
+                    }
+                }
+            }
+            let id = db
+                .add_learning_episode(scoped_sender.as_deref(), "owner_rule", lesson_text)
+                .await?;
+            let scope_label = scoped_sender
+                .as_deref()
+                .map(|s| format!(" for +{}", s))
+                .unwrap_or_default();
             return Ok(Some(format!(
-                "✅ {} learned (#{}): \"{}\"",
-                BOT_NAME, id, lesson
+                "✅ {} learned (#{}{}): \"{}\"",
+                BOT_NAME, id, scope_label, lesson_text
             )));
         }
     }
@@ -1424,6 +1472,10 @@ where
         let saved = db.count_saved_contacts().await?;
         let mode = get_reply_mode(db, &cfg.default_reply_mode).await?;
         let voice_mode = get_self_voice_mode(db).await?;
+        let dm_voice_mode = db
+            .get_setting("dm_voice_mode")
+            .await?
+            .unwrap_or_else(|| "auto".to_string());
         let bookings = db.count_bookings().await?;
         let flags = db.count_flags().await?;
         let owner_mem = db.list_owner_memory(100).await?.len();
@@ -1447,12 +1499,14 @@ where
             "ready"
         };
         return Ok(Some(format!(
-            "✅ {} online (Rust Core + Turso). Availability: {}{}. Reply mode: {}. Self-chat voice: {}. Gmail: {}. Android paired: {}. ntfy urgent push: {}. Urgent alerts: {}. Digest (7am): {}. Follow-ups: {}. Scheduled msgs: {}. Reminders: {}. Contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
+            "✅ {} online (Rust Core + Turso). Availability: {}{}. Reply mode: {}. Self-chat voice: {}. DM voice: {} ({}). Gmail: {}. Android paired: {}. ntfy urgent push: {}. Urgent alerts: {}. Digest (7am): {}. Follow-ups: {}. Scheduled msgs: {}. Reminders: {}. Contacts: {}. Bookings: {}. Flagged: {}. Memories: {} facts, {} lessons.",
             BOT_NAME,
             avail.mode,
             if low_bat { " (Low-Battery Auto-Cover ON)" } else { "" },
             mode,
             voice_mode,
+            dm_voice_mode,
+            cfg.tts_voice,
             gmail_state,
             android_devices,
             ntfy_state,
@@ -1471,7 +1525,7 @@ where
 
     if lower == "help" || lower == "commands" {
         return Ok(Some(format!(
-            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] | test ntfy — stop or test urgent ring alerts\n• briefing | read me my briefing | catch me up | emails — WhatsApp + Gmail digests\n• pair android | revoke android | ring my phone — Android Companion bridge\n• schedule [sms] <when> -> <no/name>: <msg> | scheduled | unschedule <id>\n• bank | classes — 7-day bank/payout ledger & Aurikrex schedule\n• voice [auto|on|off] — self-chat voice note reply mode\n• followups | send followup <id> [: msg] | snooze followup <id> | skip followup <id>\n• remind <30m|7pm|daily 8am|every mon 9am>: <text> | reminders | unremind <id>\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• approve/say <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact> | tidy memories\n• teach <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
+            "✅ *{} Commands* (or just chat naturally like J.A.R.V.I.S.!):\n• ack [no/name] | test ntfy — stop or test urgent ring alerts\n• briefing | read me my briefing | catch me up | emails — WhatsApp + Gmail digests\n• pair android | revoke android | ring my phone — Android Companion bridge\n• schedule [sms] <when> -> <no/name>: <msg> | scheduled | unschedule <id>\n• bank | classes — 7-day bank/payout ledger & Aurikrex schedule\n• voice [auto|on|off] | dmvoice [auto|explicit|off] — self-chat & DM voice note modes\n• followups | send followup <id> [: msg] | snooze followup <id> | skip followup <id>\n• remind <30m|7pm|daily 8am|every mon 9am>: <text> | reminders | unremind <id>\n• busy/deep/sleep [30m|2h] [note] | available\n• vip/silent/normal <no/name> — set contact tier\n• approve/say <no/name>: <reply> | reject <no/name>\n• remember [public|close|private] <fact> | remember <no>: <fact> | tidy memories\n• teach [<no/name>:] <rule> | profile <no/name> | memories | forget <id/word>\n• pause/resume <no/name> | block/unblock <no> | blocked\n• guard/unguard <group> | guarded | allow/disallow <site> | safelist\n• mode everyone | mode unsaved | bookings | flagged | status",
             BOT_NAME
         )));
     }

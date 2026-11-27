@@ -14,6 +14,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.util.Base64
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
@@ -119,7 +120,10 @@ class VoiceSessionController(
         tts = TextToSpeech(context.applicationContext) { status ->
             ttsReady = status == TextToSpeech.SUCCESS
             if (ttsReady) {
-                tts?.language = Locale.US
+                tts?.let { engine ->
+                    engine.language = Locale.US
+                    selectSweetJarvisFemaleVoice(engine)
+                }
             }
         }
         // Load persisted chat history from Room on startup
@@ -821,11 +825,63 @@ class VoiceSessionController(
             }
         }
 
+    /**
+     * Picks the warmest, cleanest female English neural voice available on the Android device
+     * (preferring crisp British/US Google female voices for a refined female J.A.R.V.I.S. / F.R.I.D.A.Y. tone).
+     */
+    private fun selectSweetJarvisFemaleVoice(engine: TextToSpeech) {
+        val voices = runCatching { engine.voices }.getOrNull() ?: return
+        val englishVoices = voices.filter { v ->
+            v.locale != null &&
+                v.locale.language.equals("en", ignoreCase = true) &&
+                v.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) != true
+        }
+        if (englishVoices.isEmpty()) return
+
+        // Well-known crisp Google female neural voice IDs across Android devices (en-GB & en-US)
+        val preferredFemaleIds = listOf(
+            "en-gb-x-gba",
+            "en-gb-x-gbc",
+            "en-gb-x-rjs",
+            "en-us-x-tpf",
+            "en-us-x-sfg",
+            "en-us-x-iob",
+            "en-us-x-tpc"
+        )
+        val maleHints = listOf("male", "-m-", "gbd", "gbb", "iom", "iol", "tpd", "sfb")
+
+        fun score(v: Voice): Int {
+            val name = v.name.lowercase(Locale.US)
+            var s = 0
+            // Strong boost for known refined female voices
+            val prefIdx = preferredFemaleIds.indexOfFirst { name.contains(it) }
+            if (prefIdx >= 0) s += 100 - (prefIdx * 5)
+            if (name.contains("female") || name.contains("#female")) s += 60
+            if (maleHints.any { name.contains(it) } && !name.contains("female")) s -= 80
+            // Prefer refined UK / US English for J.A.R.V.I.S.-like articulation
+            when (v.locale.country.uppercase(Locale.US)) {
+                "GB" -> s += 20
+                "US" -> s += 14
+                "AU", "IE" -> s += 10
+            }
+            if (v.quality >= Voice.QUALITY_HIGH) s += 18
+            else if (v.quality >= Voice.QUALITY_NORMAL) s += 8
+            // Prefer local installed neural voices so offline fallback works instantaneously
+            if (!v.isNetworkConnectionRequired) s += 12
+            return s
+        }
+
+        val best = englishVoices.maxByOrNull { score(it) } ?: return
+        runCatching { engine.voice = best }
+    }
+
     private suspend fun speakWithAndroidTts(raw: String) {
         val engine = tts
         if (!ttsReady || engine == null) return
         val clean = PronunciationMapper.toSpokenFalke(raw, maxChars = 700)
         if (clean.isEmpty()) return
+        selectSweetJarvisFemaleVoice(engine)
+        engine.setPitch(1.03f)
         engine.setSpeechRate(prefs.speechSpeed)
         withTimeoutOrNull(30_000L) {
             suspendCancellableCoroutine<Unit> { cont ->
