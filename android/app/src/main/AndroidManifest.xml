@@ -140,6 +140,13 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <!-- Floating Gemini/Claude-Style Assistant Pill & Bar Overlay -->
+        <service
+            android:name=".assist.FalkeOverlayService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Default Digital Assistant Registration -->
         <service
             android:name=".assist.FalkeVoiceInteractionService"

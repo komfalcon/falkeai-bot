@@ -1,15 +1,18 @@
 package tech.aurikrex.falkeai.monitors
 
+import android.Manifest
 import android.app.AlarmManager
 import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.TextUtils
+import androidx.core.content.ContextCompat
 
 data class SurvivalHealthReport(
     val isInfinixOrTranssion: Boolean,
@@ -19,13 +22,56 @@ data class SurvivalHealthReport(
     val accessibilityOn: Boolean,
     val dndPolicyGranted: Boolean,
     val overlayGranted: Boolean,
-    val exactAlarmsAllowed: Boolean
-)
+    val exactAlarmsAllowed: Boolean,
+    val defaultAssistantActive: Boolean,
+    val autoStartConfirmed: Boolean,
+    val micPermission: Boolean,
+    val phonePermission: Boolean,
+    val smsPermission: Boolean,
+    val contactsPermission: Boolean,
+    val calendarPermission: Boolean,
+    val cameraPermission: Boolean,
+    val postNotificationsPermission: Boolean
+) {
+    val runtimePermissionsList: List<Pair<String, Boolean>>
+        get() = listOf(
+            "Microphone" to micPermission,
+            "Phone & Calls" to phonePermission,
+            "SMS" to smsPermission,
+            "Contacts" to contactsPermission,
+            "Calendar" to calendarPermission,
+            "Camera / Torch" to cameraPermission,
+            "Notifications" to postNotificationsPermission
+        )
+
+    val grantedRuntimeCount: Int
+        get() = runtimePermissionsList.count { it.second }
+
+    val totalRuntimeCount: Int
+        get() = runtimePermissionsList.size
+
+    val allRuntimeGranted: Boolean
+        get() = grantedRuntimeCount == totalRuntimeCount
+
+    /** Live readiness score across ALL real system capabilities (0..7) */
+    val systemReadinessCount: Int
+        get() = listOf(
+            allRuntimeGranted,
+            batteryUnrestricted,
+            notificationListenerOn,
+            accessibilityOn,
+            dndPolicyGranted,
+            overlayGranted,
+            defaultAssistantActive
+        ).count { it }
+
+    val systemReadinessTotal: Int = 7
+}
 
 /**
- * Infinix Hot 10T (Android 11 / XOS 7.6 / 4GB RAM) Background Survival Helper.
- * Provides live checklist verification and 1-tap deep links straight into Infinix Phone Master,
- * Battery Unrestricted, Notification Access, Accessibility, DND, and Default Digital Assistant settings.
+ * Infinix Hot 10T (Android 11 / XOS 7.6 / 4GB RAM) Live Background Survival & Permission Inspector.
+ * Every field queries real Android OS state (nothing hardcoded!) so `ON_RESUME` always reflects
+ * live changes immediately after returning from Android Settings.
  */
 object OemSurvivalHelper {
     fun isTranssionDevice(): Boolean {
@@ -33,7 +79,10 @@ object OemSurvivalHelper {
         return m.contains("infinix") || m.contains("transsion") || m.contains("tecno") || m.contains("itel")
     }
 
-    fun inspectHealth(context: Context): SurvivalHealthReport {
+    private fun hasPerm(context: Context, perm: String): Boolean =
+        ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+
+    fun inspectHealth(context: Context, autoStartConfirmed: Boolean = false): SurvivalHealthReport {
         val pm = context.getSystemService(PowerManager::class.java)
         val nm = context.getSystemService(NotificationManager::class.java)
         val am = context.getSystemService(AlarmManager::class.java)
@@ -48,6 +97,21 @@ object OemSurvivalHelper {
         } else {
             true
         }
+        val assistOk = isDefaultDigitalAssistant(context)
+
+        val micOk = hasPerm(context, Manifest.permission.RECORD_AUDIO)
+        val phoneOk = hasPerm(context, Manifest.permission.CALL_PHONE) &&
+            hasPerm(context, Manifest.permission.READ_PHONE_STATE)
+        val smsOk = hasPerm(context, Manifest.permission.SEND_SMS)
+        val contactsOk = hasPerm(context, Manifest.permission.READ_CONTACTS)
+        val calOk = hasPerm(context, Manifest.permission.READ_CALENDAR) &&
+            hasPerm(context, Manifest.permission.WRITE_CALENDAR)
+        val camOk = hasPerm(context, Manifest.permission.CAMERA)
+        val postNotifOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            hasPerm(context, Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            true
+        }
 
         return SurvivalHealthReport(
             isInfinixOrTranssion = isTranssionDevice(),
@@ -57,8 +121,29 @@ object OemSurvivalHelper {
             accessibilityOn = accOk,
             dndPolicyGranted = dndOk,
             overlayGranted = overlayOk,
-            exactAlarmsAllowed = exactOk
+            exactAlarmsAllowed = exactOk,
+            defaultAssistantActive = assistOk,
+            autoStartConfirmed = autoStartConfirmed,
+            micPermission = micOk,
+            phonePermission = phoneOk,
+            smsPermission = smsOk,
+            contactsPermission = contactsOk,
+            calendarPermission = calOk,
+            cameraPermission = camOk,
+            postNotificationsPermission = postNotifOk
         )
+    }
+
+    /** Real OS check for Default Digital Assistant (`assistant` / `voice_interaction_service` in Settings.Secure). */
+    fun isDefaultDigitalAssistant(context: Context): Boolean {
+        val pkg = context.packageName.lowercase()
+        val assist = runCatching {
+            Settings.Secure.getString(context.contentResolver, "assistant")
+        }.getOrNull()?.lowercase().orEmpty()
+        val voiceSvc = runCatching {
+            Settings.Secure.getString(context.contentResolver, "voice_interaction_service")
+        }.getOrNull()?.lowercase().orEmpty()
+        return assist.contains(pkg) || voiceSvc.contains(pkg)
     }
 
     fun isNotificationListenerEnabled(context: Context): Boolean {

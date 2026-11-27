@@ -224,3 +224,15 @@ data class DashboardResponse(
     @SerialName("bank_alerts") val bankAlerts: List<BankAlertDto> = emptyList(),
     val bookings: List<BookingDto> = emptyList()
 )
+
+@Serializable
+data class ServerSettingsDto(
+    val ok: Boolean = false,
+    @SerialName("digest_hour_lagos") val digestHourLagos: Int = 7,
+    @SerialName("reply_mode") val replyMode: String = "everyone",
+    @SerialName("self_voice_mode") val selfVoiceMode: String = "auto",
+    @SerialName("ntfy_configured") val ntfyConfigured: Boolean = false,
+    @SerialName("gmail_count") val gmailCount: Int = 0,
+    @SerialName("paired_devices_count") val pairedDevicesCount: Int = 0,
+    val error: String? = null
+)

@@ -900,7 +900,15 @@ where
         .single()
         .unwrap_or_else(Utc::now);
     let lagos = now_utc.with_timezone(&Lagos);
-    if lagos.hour() < cfg.digest_hour_lagos {
+    let target_hour = db
+        .get_setting("digest_hour_lagos")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&h| h <= 23)
+        .unwrap_or(cfg.digest_hour_lagos);
+    if lagos.hour() < target_hour {
         return Ok(false);
     }
 
@@ -927,9 +935,16 @@ where
         return Ok(false);
     }
 
+    let hour_label = match target_hour {
+        0 => "12:00 AM".to_string(),
+        1..=11 => format!("{}:00 AM", target_hour),
+        12 => "12:00 PM".to_string(),
+        _ => format!("{}:00 PM", target_hour - 12),
+    };
     let header = format!(
-        "☀️ *{} 7:00 AM Morning Briefing ({})*",
+        "☀️ *{} {} Morning Briefing ({})*",
         BOT_NAME,
+        hour_label,
         lagos.format("%a, %d %b")
     );
     let msg = format_digest_message_full(

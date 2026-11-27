@@ -29,6 +29,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import tech.aurikrex.falkeai.data.CallNoteRequest
+import tech.aurikrex.falkeai.data.ChatHistoryEntity
 import tech.aurikrex.falkeai.data.DeviceContextPayload
 import tech.aurikrex.falkeai.data.FalkeApiClient
 import tech.aurikrex.falkeai.data.FalkeDatabase
@@ -41,6 +42,7 @@ import tech.aurikrex.falkeai.executors.LocalCommandRouter
 import tech.aurikrex.falkeai.executors.PendingUndoAction
 import tech.aurikrex.falkeai.monitors.BluetoothAndBatteryMonitor
 import tech.aurikrex.falkeai.monitors.FalkeAccessibilityService
+import tech.aurikrex.falkeai.security.DeviceCredentialGate
 import java.io.File
 import java.util.Locale
 import kotlin.coroutines.resume
@@ -71,24 +73,30 @@ data class VoiceUiState(
     val chatHistory: List<ChatMessage> = emptyList(),
     val pendingUndo: PendingUndoAction? = null,
     val undoSecondsLeft: Int = 0,
-    val screenVisionAttached: Boolean = false
+    val screenVisionAttached: Boolean = false,
+    val lastVoiceMatchScore: Float? = null,
+    val voiceRejectedNeedsPin: Boolean = false
+)
+
+private data class RecordedVoiceCapture(
+    val pcm16: ShortArray,
+    val wavBytes: ByteArray
 )
 
 /**
- * Full Voice-In -> Voice-Out Controller powering:
- * - VAD voice recording -> Groq Whisper STT -> Rust J.A.R.V.I.S. Brain -> Groq Orpheus WAV TTS
- * - Feature #1: Silent Android 11 Screen Vision (`takeScreenshot()`) when asked about screen
- * - Feature #2: 5-second Auto Follow-Up Conversation Window after TTS completes
- * - Feature #8: Hands-Free Interactive Morning Commute Briefing
- * - Feature B: Post-Call 1-Tap Voice Note recording -> Turso `contact_memory`
- * - Feature J: 6-second Cancel/Undo countdown before outgoing voice SMS fires
- * - Feature M: 0 MB Offline Cellular Mode fallback via `LocalCommandRouter`
+ * Unified Voice-In -> Speaker-Verify -> Brain -> Own-Voice / Cloud / Local TTS Controller:
+ * - On-device Speaker Verification (`SpeakerVerificationEngine`) blocks unauthorized voices before upload
+ * - On-device Own-Voice VITS/Piper TTS (`CustomVoiceTtsEngine`) speaks in Falcon's trained voice for $0
+ * - "Fall-K" pronunciation & transcript normalization (`PronunciationMapper`) across every engine
+ * - Persistent Room `chat_history` so conversations survive app restarts cleanly
  */
 class VoiceSessionController(
     private val context: Context,
     private val prefs: SecurePrefs,
     private val db: FalkeDatabase,
-    private val api: FalkeApiClient
+    private val api: FalkeApiClient,
+    private val speakerVerifier: SpeakerVerificationEngine,
+    private val customVoiceTts: CustomVoiceTtsEngine
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -114,13 +122,39 @@ class VoiceSessionController(
                 tts?.language = Locale.US
             }
         }
+        // Load persisted chat history from Room on startup
+        scope.launch(Dispatchers.IO) {
+            if (prefs.persistChatHistory) {
+                val saved = runCatching { db.chatDao().getRecentDesc(50).reversed() }.getOrDefault(emptyList())
+                if (saved.isNotEmpty()) {
+                    val mapped = saved.map { row ->
+                        ChatMessage(
+                            id = row.id,
+                            isUser = row.isUser,
+                            text = row.text,
+                            actions = if (row.actionsJoined.isBlank()) emptyList() else row.actionsJoined.split("||"),
+                            timestampMs = row.timestampMs,
+                            isError = row.isError
+                        )
+                    }
+                    withContext(Dispatchers.Main) {
+                        _uiState.value = _uiState.value.copy(
+                            chatHistory = mapped,
+                            lastReply = mapped.lastOrNull { !it.isUser }?.text.orEmpty(),
+                            lastTranscript = mapped.lastOrNull { it.isUser }?.text.orEmpty()
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fun startVoiceTurn(
         captureScreen: Boolean = false,
         followUpChain: Boolean = true,
         postCallPhone: String? = null,
-        postCallName: String? = null
+        postCallName: String? = null,
+        bypassVoiceLockOnce: Boolean = false
     ) {
         activeJob?.cancel()
         val myGen = ++sessionGen
@@ -129,25 +163,65 @@ class VoiceSessionController(
 
         activeJob = scope.launch {
             try {
-                // Capture silent Android 11 screenshot BEFORE the overlay obscures anything if requested
                 val screenshotB64 = if (captureScreen && prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
                     FalkeAccessibilityService.captureScreenJpegBase64()
-                } else {
-                    null
-                }
+                } else null
                 val screenText = if (prefs.screenVisionEnabled && FalkeAccessibilityService.isConnected()) {
                     FalkeAccessibilityService.readCurrentScreenText()
-                } else {
-                    null
+                } else null
+
+                _uiState.value = _uiState.value.copy(
+                    state = VoiceState.LISTENING,
+                    statusLine = if (postCallPhone != null) "Recording note for ${postCallName ?: postCallPhone}…" else "Listening…",
+                    screenVisionAttached = screenshotB64 != null,
+                    voiceRejectedNeedsPin = false
+                )
+
+                val capture = recordUtteranceCapture(maxSeconds = 14, silenceStopMs = 1350L)
+                if (capture == null) {
+                    _uiState.value = _uiState.value.copy(
+                        state = VoiceState.IDLE,
+                        statusLine = "Didn't catch speech — tap to try again."
+                    )
+                    return@launch
                 }
 
-                // Feature M: True 0 MB Offline Spoken Voice Mode via on-device SpeechRecognizer + LocalCommandRouter!
+                // On-Device Speaker Verification Gate ("Only Falcon's Voice Works")
+                val canBypass = bypassVoiceLockOnce || DeviceCredentialGate.isSensitiveActionRecentlyVerified()
+                if (!canBypass && prefs.voiceLockEnabled && prefs.hasVoiceprint()) {
+                    val outcome = withContext(Dispatchers.IO) {
+                        speakerVerifier.verifyUtterance(capture.pcm16, EnergyVad.SAMPLE_RATE)
+                    }
+                    when (outcome) {
+                        is SpeakerVerifyOutcome.Rejected -> {
+                            val pct = (outcome.similarity * 100).toInt().coerceAtLeast(0)
+                            val rejectMsg = "Voice not recognized ($pct% match). Fall-K responds only to Falcon's voice — unlock with PIN/Pattern to override."
+                            _uiState.value = _uiState.value.copy(
+                                state = VoiceState.IDLE,
+                                statusLine = "Blocked unknown speaker ($pct%)",
+                                lastVoiceMatchScore = outcome.similarity,
+                                voiceRejectedNeedsPin = true,
+                                lastReply = rejectMsg,
+                                chatHistory = recordAndAppendMessages(
+                                    ChatMessage(isUser = false, text = rejectMsg, isError = true)
+                                )
+                            )
+                            return@launch
+                        }
+                        is SpeakerVerifyOutcome.Verified -> {
+                            _uiState.value = _uiState.value.copy(
+                                lastVoiceMatchScore = outcome.similarity,
+                                voiceRejectedNeedsPin = false
+                            )
+                        }
+                        else -> Unit
+                    }
+                }
+
+                // Offline mode fallback if network unavailable or unpaired
                 if ((!isNetworkOnline() || !prefs.isPaired()) && postCallPhone == null) {
-                    _uiState.value = _uiState.value.copy(
-                        state = VoiceState.LISTENING,
-                        statusLine = "Offline voice mode (0 MB data) — speak command…"
-                    )
-                    val offlineSpoken = OfflineSpeechBridge.captureSinglePhrase(context)
+                    val offlineSpokenRaw = OfflineSpeechBridge.captureSinglePhrase(context)
+                    val offlineSpoken = offlineSpokenRaw?.let { PronunciationMapper.normalizeHeardTranscript(it) }
                     if (!offlineSpoken.isNullOrBlank()) {
                         val cmd = LocalCommandRouter.route(offlineSpoken)
                         val reply = if (cmd != null) {
@@ -160,41 +234,25 @@ class VoiceSessionController(
                             lastTranscript = offlineSpoken,
                             lastReply = reply,
                             lastActions = listOf("Offline 0MB Voice"),
-                            chatHistory = appendChatMessages(
-                                _uiState.value.chatHistory,
+                            chatHistory = recordAndAppendMessages(
                                 ChatMessage(isUser = true, text = offlineSpoken),
                                 ChatMessage(isUser = false, text = reply, actions = listOf("Offline 0MB Voice"))
                             ),
                             statusLine = "Speaking…"
                         )
-                        speakWithAndroidTts(reply)
+                        speakBestAvailable(reply, cloudAudioB64 = null, cloudMime = null)
                         _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
                         return@launch
                     }
-                    val fallbackMsg = "Offline and couldn't recognize speech — try typing your command below."
+                    val fallbackMsg = "You're offline — type your offline command below."
                     _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, lastReply = fallbackMsg, statusLine = fallbackMsg)
                     return@launch
                 }
 
-                _uiState.value = _uiState.value.copy(
-                    state = VoiceState.LISTENING,
-                    statusLine = if (postCallPhone != null) "Recording call note for ${postCallName ?: postCallPhone}…" else "Listening… speak naturally",
-                    screenVisionAttached = screenshotB64 != null
-                )
-
-                val wavBytes = recordUtteranceWav(maxSeconds = 14, silenceStopMs = 1350L)
-                if (wavBytes == null) {
-                    _uiState.value = _uiState.value.copy(
-                        state = VoiceState.IDLE,
-                        statusLine = "Didn't catch any speech — tap to try again."
-                    )
-                    return@launch
-                }
-
-                // Feature B: Post-Call 1-Tap Voice Note upload
+                // Post-Call 1-Tap Voice Note upload
                 if (postCallPhone != null) {
-                    _uiState.value = _uiState.value.copy(state = VoiceState.THINKING, statusLine = "Saving call note to FalkeAI memory…")
-                    val audioB64 = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+                    _uiState.value = _uiState.value.copy(state = VoiceState.THINKING, statusLine = "Saving call note…")
+                    val audioB64 = Base64.encodeToString(capture.wavBytes, Base64.NO_WRAP)
                     val res = api.sendCallNote(
                         CallNoteRequest(
                             phone = postCallPhone,
@@ -208,15 +266,17 @@ class VoiceSessionController(
                         onFailure = { "Couldn't save call note: ${it.message}" }
                     )
                     _uiState.value = _uiState.value.copy(state = VoiceState.SPEAKING, lastReply = msg, statusLine = msg)
-                    speakWithAndroidTts(msg)
+                    speakBestAvailable(msg, cloudAudioB64 = null, cloudMime = null)
                     _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Done.")
                     return@launch
                 }
 
                 _uiState.value = _uiState.value.copy(state = VoiceState.THINKING, statusLine = "Thinking…")
 
+                // If Falcon's custom own-voice VITS model is active locally, skip cloud WAV download for faster response!
+                val useLocalOwnVoice = customVoiceTts.inspectStatus().active
                 val devCtx = buildLiveDeviceContext(screenText)
-                val audioB64 = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+                val audioB64 = Base64.encodeToString(capture.wavBytes, Base64.NO_WRAP)
                 val resp = api.chat(
                     PhoneChatRequest(
                         audioBase64 = audioB64,
@@ -224,7 +284,7 @@ class VoiceSessionController(
                         screenshotBase64 = screenshotB64,
                         screenshotMime = if (screenshotB64 != null) "image/jpeg" else null,
                         multilingual = prefs.bilingualMode,
-                        wantTts = true,
+                        wantTts = !useLocalOwnVoice,
                         deviceContext = devCtx
                     )
                 )
@@ -251,11 +311,10 @@ class VoiceSessionController(
         captureScreen: Boolean = false,
         speakReply: Boolean? = null
     ) {
-        val text = rawText.trim()
+        val text = PronunciationMapper.normalizeHeardTranscript(rawText.trim())
         if (text.isEmpty()) return
         val shouldSpeak = speakReply ?: prefs.speakTypedReplies
 
-        // Handle "Cancel" / "Undo" immediately during 6-second Undo window (Feature J)
         if (_uiState.value.pendingUndo != null &&
             text.lowercase() in setOf("cancel", "undo", "stop", "don't send", "abort")
         ) {
@@ -268,7 +327,6 @@ class VoiceSessionController(
         stopAudioPlayback()
         activeJob = scope.launch {
             try {
-                // Feature M: Try instant <80ms LocalCommandRouter first when offline OR for pure local toggles!
                 val localCmd = LocalCommandRouter.route(text)
                 if (localCmd != null && (!isNetworkOnline() || !prefs.isPaired() || isInstantLocalOnly(localCmd))) {
                     val res = actionExecutor.executeLocalCommand(localCmd)
@@ -276,27 +334,25 @@ class VoiceSessionController(
                         state = if (shouldSpeak) VoiceState.SPEAKING else VoiceState.IDLE,
                         lastTranscript = text,
                         lastReply = res,
-                        lastActions = listOf("Offline Local Executor"),
-                        chatHistory = appendChatMessages(
-                            _uiState.value.chatHistory,
+                        lastActions = listOf("Local Device"),
+                        chatHistory = recordAndAppendMessages(
                             ChatMessage(isUser = true, text = text),
-                            ChatMessage(isUser = false, text = res, actions = listOf("Offline Local Executor"))
+                            ChatMessage(isUser = false, text = res, actions = listOf("Local Device"))
                         ),
                         statusLine = if (shouldSpeak) "Speaking…" else "Ready"
                     )
-                    if (shouldSpeak) speakWithAndroidTts(res)
+                    if (shouldSpeak) speakBestAvailable(res, null, null)
                     _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
                     return@launch
                 }
 
                 if (!prefs.isPaired()) {
-                    val pairMsg = "Pair your phone in Setup first (send `pair android` in WhatsApp self-chat)."
+                    val pairMsg = "Pair your phone in Settings first (send `pair android` in WhatsApp self-chat)."
                     _uiState.value = _uiState.value.copy(
                         state = VoiceState.IDLE,
                         lastTranscript = text,
                         lastReply = pairMsg,
-                        chatHistory = appendChatMessages(
-                            _uiState.value.chatHistory,
+                        chatHistory = recordAndAppendMessages(
                             ChatMessage(isUser = true, text = text),
                             ChatMessage(isUser = false, text = pairMsg, isError = true)
                         ),
@@ -308,8 +364,7 @@ class VoiceSessionController(
                 _uiState.value = _uiState.value.copy(
                     state = VoiceState.THINKING,
                     lastTranscript = text,
-                    chatHistory = appendChatMessages(
-                        _uiState.value.chatHistory,
+                    chatHistory = recordAndAppendMessages(
                         ChatMessage(isUser = true, text = text)
                     ),
                     statusLine = "Thinking…"
@@ -323,13 +378,14 @@ class VoiceSessionController(
                     FalkeAccessibilityService.readCurrentScreenText()
                 } else null
 
+                val useLocalOwnVoice = customVoiceTts.inspectStatus().active
                 val resp = api.chat(
                     PhoneChatRequest(
                         text = text,
                         screenshotBase64 = screenshotB64,
                         screenshotMime = if (screenshotB64 != null) "image/jpeg" else null,
                         multilingual = prefs.bilingualMode,
-                        wantTts = shouldSpeak,
+                        wantTts = shouldSpeak && !useLocalOwnVoice,
                         deviceContext = buildLiveDeviceContext(screenText)
                     )
                 )
@@ -347,7 +403,6 @@ class VoiceSessionController(
         }
     }
 
-    /** Feature #8: Hands-Free Interactive Morning Commute Briefing */
     fun startCommuteBriefing() {
         sendTextCommand(
             "Give me my concise spoken interactive morning commute briefing covering urgent alerts, priority Gmail, WhatsApp approvals, ready follow-ups, bank alerts, and today's calendar.",
@@ -363,13 +418,8 @@ class VoiceSessionController(
         stopAudioPlayback()
         activeJob = scope.launch {
             try {
-                _uiState.value = _uiState.value.copy(state = VoiceState.SPEAKING, statusLine = "Speaking… tap orb to stop")
-                requestDuckingAudioFocus()
-                try {
-                    speakWithAndroidTts(text)
-                } finally {
-                    abandonDuckingAudioFocus()
-                }
+                _uiState.value = _uiState.value.copy(state = VoiceState.SPEAKING, statusLine = "Speaking… tap to stop")
+                speakBestAvailable(text, cloudAudioB64 = null, cloudMime = null)
             } finally {
                 if (myGen == sessionGen) {
                     _uiState.value = _uiState.value.copy(state = VoiceState.IDLE, statusLine = "Ready")
@@ -379,11 +429,15 @@ class VoiceSessionController(
     }
 
     fun clearHistory() {
+        scope.launch(Dispatchers.IO) {
+            runCatching { db.chatDao().clearAll() }
+        }
         _uiState.value = _uiState.value.copy(
             chatHistory = emptyList(),
             lastTranscript = "",
             lastReply = "",
             lastActions = emptyList(),
+            voiceRejectedNeedsPin = false,
             statusLine = "Ready"
         )
     }
@@ -403,7 +457,7 @@ class VoiceSessionController(
     fun speakQuickAnnouncement(text: String) {
         if (text.isBlank()) return
         scope.launch {
-            speakWithAndroidTts(text)
+            speakBestAvailable(text, cloudAudioB64 = null, cloudMime = null)
         }
     }
 
@@ -415,15 +469,28 @@ class VoiceSessionController(
         FalkeWakeWordService.setSessionPaused(false)
     }
 
-    private fun appendChatMessages(
-        existing: List<ChatMessage>,
-        vararg added: ChatMessage
-    ): List<ChatMessage> {
-        val out = existing.toMutableList()
-        for (m in added) {
-            if (m.text.isNotBlank()) out.add(m)
+    private fun recordAndAppendMessages(vararg added: ChatMessage): List<ChatMessage> {
+        val valid = added.filter { it.text.isNotBlank() }
+        if (valid.isNotEmpty() && prefs.persistChatHistory) {
+            scope.launch(Dispatchers.IO) {
+                for (m in valid) {
+                    runCatching {
+                        db.chatDao().insert(
+                            ChatHistoryEntity(
+                                isUser = m.isUser,
+                                text = m.text,
+                                actionsJoined = m.actions.joinToString("||"),
+                                isError = m.isError,
+                                timestampMs = m.timestampMs
+                            )
+                        )
+                    }
+                }
+                runCatching { db.chatDao().pruneOld() }
+            }
         }
-        return if (out.size > 40) out.takeLast(40) else out
+        val out = (_uiState.value.chatHistory + valid)
+        return if (out.size > 60) out.takeLast(60) else out
     }
 
     private suspend fun handleChatResponse(
@@ -434,7 +501,6 @@ class VoiceSessionController(
     ) {
         result.fold(
             onSuccess = { resp ->
-                // Check if user said "cancel" or "undo" during an active 6s undo window!
                 if (_uiState.value.pendingUndo != null &&
                     resp.transcript.trim().lowercase() in setOf("cancel", "undo", "stop", "abort")
                 ) {
@@ -447,14 +513,12 @@ class VoiceSessionController(
                 val finalTranscript = resp.transcript.ifBlank { _uiState.value.lastTranscript }
 
                 val updatedHistory = if (!alreadyAppendedUserText && finalTranscript.isNotBlank()) {
-                    appendChatMessages(
-                        _uiState.value.chatHistory,
+                    recordAndAppendMessages(
                         ChatMessage(isUser = true, text = finalTranscript),
                         ChatMessage(isUser = false, text = resp.replyText, actions = allNotes)
                     )
                 } else {
-                    appendChatMessages(
-                        _uiState.value.chatHistory,
+                    recordAndAppendMessages(
                         ChatMessage(isUser = false, text = resp.replyText, actions = allNotes)
                     )
                 }
@@ -466,23 +530,9 @@ class VoiceSessionController(
                         lastReply = resp.replyText,
                         lastActions = allNotes,
                         chatHistory = updatedHistory,
-                        statusLine = "Speaking… tap orb to stop"
+                        statusLine = "Speaking… tap to stop"
                     )
-
-                    // Duck background music (e.g. Spotify) smoothly while FalkeAI speaks!
-                    requestDuckingAudioFocus()
-                    try {
-                        val playedCloudAudio = if (!resp.ttsAudioBase64.isNullOrBlank()) {
-                            playBase64Audio(resp.ttsAudioBase64, resp.ttsMime ?: "audio/wav")
-                        } else {
-                            false
-                        }
-                        if (!playedCloudAudio && resp.replyText.isNotBlank()) {
-                            speakWithAndroidTts(resp.replyText)
-                        }
-                    } finally {
-                        abandonDuckingAudioFocus()
-                    }
+                    speakBestAvailable(resp.replyText, resp.ttsAudioBase64, resp.ttsMime)
                 } else {
                     _uiState.value = _uiState.value.copy(
                         state = VoiceState.IDLE,
@@ -494,7 +544,6 @@ class VoiceSessionController(
                     )
                 }
 
-                // Feature #2: 5-second Auto Follow-Up Window (keep listening briefly without wake word!)
                 if (followUpChain) {
                     _uiState.value = _uiState.value.copy(
                         state = VoiceState.FOLLOW_UP_WINDOW,
@@ -502,7 +551,7 @@ class VoiceSessionController(
                     )
                     val heardFollowUp = detectSpeechWithinWindow(windowMs = 5_000L)
                     if (heardFollowUp) {
-                        startVoiceTurn(captureScreen = false, followUpChain = true)
+                        startVoiceTurn(captureScreen = false, followUpChain = true, bypassVoiceLockOnce = false)
                         return
                     }
                 }
@@ -515,8 +564,7 @@ class VoiceSessionController(
                 _uiState.value = _uiState.value.copy(
                     state = VoiceState.IDLE,
                     lastReply = errText,
-                    chatHistory = appendChatMessages(
-                        _uiState.value.chatHistory,
+                    chatHistory = recordAndAppendMessages(
                         ChatMessage(isUser = false, text = errText, isError = true)
                     ),
                     statusLine = "Connection issue"
@@ -524,6 +572,42 @@ class VoiceSessionController(
                 FalkeWakeWordService.setSessionPaused(false)
             }
         )
+    }
+
+    /**
+     * Priority Voice Synthesis Chain:
+     * 1) Falcon's Own Trained Voice (`CustomVoiceTtsEngine` — 100% offline ONNX VITS/Piper, $0)
+     * 2) Server Orpheus / Aura WAV (`cloudAudioB64` with "Fall-K" server pronunciation)
+     * 3) On-Device Android `TextToSpeech` (with `PronunciationMapper.toSpokenFalke` "Fall-K" mapping)
+     */
+    private suspend fun speakBestAvailable(
+        rawText: String,
+        cloudAudioB64: String?,
+        cloudMime: String?
+    ) {
+        if (rawText.isBlank() && cloudAudioB64.isNullOrBlank()) return
+        requestDuckingAudioFocus()
+        try {
+            // 1) Try Falcon's Own Trained Voice first!
+            if (rawText.isNotBlank() && customVoiceTts.inspectStatus().active) {
+                val ownWav = withContext(Dispatchers.IO) { customVoiceTts.synthesizeToWavFile(rawText) }
+                if (ownWav != null) {
+                    val ok = playAudioFile(ownWav, deleteWhenDone = true)
+                    if (ok) return
+                }
+            }
+            // 2) Try Cloud TTS audio if present
+            if (!cloudAudioB64.isNullOrBlank()) {
+                val ok = playBase64Audio(cloudAudioB64, cloudMime ?: "audio/wav")
+                if (ok) return
+            }
+            // 3) Fallback to Android System TTS with "Fall-K" pronunciation
+            if (rawText.isNotBlank()) {
+                speakWithAndroidTts(rawText)
+            }
+        } finally {
+            abandonDuckingAudioFocus()
+        }
     }
 
     private fun stageUndoableAction(pending: PendingUndoAction) {
@@ -582,7 +666,7 @@ class VoiceSessionController(
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    private suspend fun recordUtteranceWav(maxSeconds: Int, silenceStopMs: Long): ByteArray? =
+    private suspend fun recordUtteranceCapture(maxSeconds: Int, silenceStopMs: Long): RecordedVoiceCapture? =
         withContext(Dispatchers.IO) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 return@withContext null
@@ -603,7 +687,7 @@ class VoiceSessionController(
             }
 
             val allSamples = ArrayList<Short>(sr * 4)
-            val chunk = ShortArray(1600) // 100ms
+            val chunk = ShortArray(1600)
             var speechStarted = false
             var silenceMs = 0L
             val startAt = System.currentTimeMillis()
@@ -626,7 +710,7 @@ class VoiceSessionController(
                         silenceMs += 100L
                         if (silenceMs >= silenceStopMs) break
                     } else if (elapsed > 4_500L) {
-                        break // No speech within initial 4.5s
+                        break
                     }
                 }
             } finally {
@@ -635,8 +719,15 @@ class VoiceSessionController(
 
             if (!speechStarted || allSamples.size < sr / 4) return@withContext null
             val pcm = ShortArray(allSamples.size) { allSamples[it] }
-            EnergyVad.encodePcm16ToWav(pcm, sr)
+            RecordedVoiceCapture(
+                pcm16 = pcm,
+                wavBytes = EnergyVad.encodePcm16ToWav(pcm, sr)
+            )
         }
+
+    /** Records a single 3.5-second enrollment phrase at 16 kHz for Speaker Verification setup. */
+    suspend fun recordEnrollmentPhrasePcm16(): ShortArray? =
+        recordUtteranceCapture(maxSeconds = 7, silenceStopMs = 1100L)?.pcm16
 
     private suspend fun detectSpeechWithinWindow(windowMs: Long): Boolean =
         withContext(Dispatchers.IO) {
@@ -683,6 +774,11 @@ class VoiceSessionController(
             val ext = if (mime.contains("ogg")) "ogg" else if (mime.contains("mp3") || mime.contains("mpeg")) "mp3" else "wav"
             val tmp = File(context.cacheDir, "falke_tts_${System.currentTimeMillis()}.$ext")
             tmp.writeBytes(bytes)
+            playAudioFile(tmp, deleteWhenDone = true)
+        }
+
+    private suspend fun playAudioFile(file: File, deleteWhenDone: Boolean): Boolean =
+        withContext(Dispatchers.IO) {
             try {
                 withTimeoutOrNull(45_000L) {
                     suspendCancellableCoroutine { cont ->
@@ -694,7 +790,7 @@ class VoiceSessionController(
                                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                         .build()
                                 )
-                                setDataSource(tmp.absolutePath)
+                                setDataSource(file.absolutePath)
                                 setOnCompletionListener {
                                     release()
                                     if (activePlayer === this) activePlayer = null
@@ -721,16 +817,16 @@ class VoiceSessionController(
                 } ?: false
             } finally {
                 runCatching { activePlayer?.stop(); activePlayer?.release(); activePlayer = null }
-                runCatching { tmp.delete() }
+                if (deleteWhenDone) runCatching { file.delete() }
             }
         }
 
     private suspend fun speakWithAndroidTts(raw: String) {
         val engine = tts
         if (!ttsReady || engine == null) return
-        val clean = raw.replace(Regex("[*_`#•]"), " ").replace(Regex("\\s+"), " ").trim().take(700)
+        val clean = PronunciationMapper.toSpokenFalke(raw, maxChars = 700)
         if (clean.isEmpty()) return
-        // Bounded timeout + immediate resume on TextToSpeech.ERROR so the orb can NEVER stick in SPEAKING!
+        engine.setSpeechRate(prefs.speechSpeed)
         withTimeoutOrNull(30_000L) {
             suspendCancellableCoroutine<Unit> { cont ->
                 val id = "falke_${System.currentTimeMillis()}"

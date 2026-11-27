@@ -69,6 +69,17 @@ jobs:
           cp "$MODEL_DIR"/keywords.txt android/app/src/main/assets/kws/
           ls -lh android/app/src/main/assets/kws/
 
+      - name: Download On-Device Speaker Verification Model (CAM++ 192-D ~27 MB)
+        run: |
+          mkdir -p android/app/src/main/assets/speaker
+          curl -fL --retry 3 -o android/app/src/main/assets/speaker/campplus.onnx \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx" \
+          || curl -fL --retry 3 -o android/app/src/main/assets/speaker/campplus.onnx \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM++.onnx" \
+          || curl -fL --retry 3 -o android/app/src/main/assets/speaker/campplus.onnx \
+            "https://huggingface.co/FunAudioLLM/CosyVoice-300M/resolve/main/campplus.onnx"
+          ls -lh android/app/src/main/assets/speaker/campplus.onnx
+
       - name: Run Kotlin Unit Tests & Assemble Debug APK
         working-directory: android
         run: |

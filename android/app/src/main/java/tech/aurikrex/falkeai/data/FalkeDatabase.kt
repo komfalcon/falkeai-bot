@@ -47,6 +47,16 @@ data class CachedCallerEntity(
     val cachedAtMs: Long = System.currentTimeMillis()
 )
 
+@Entity(tableName = "chat_history")
+data class ChatHistoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val isUser: Boolean,
+    val text: String,
+    val actionsJoined: String = "",
+    val isError: Boolean = false,
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
 @Dao
 interface FalkeAlarmDao {
     @Query("SELECT * FROM falke_alarms ORDER BY hour ASC, minute ASC")
@@ -91,6 +101,9 @@ interface CapturedNotificationDao {
 
     @Query("DELETE FROM captured_notifications WHERE id NOT IN (SELECT id FROM captured_notifications ORDER BY postedAtMs DESC LIMIT 300)")
     suspend fun pruneOld()
+
+    @Query("DELETE FROM captured_notifications")
+    suspend fun clearAll()
 }
 
 @Dao
@@ -102,19 +115,39 @@ interface CachedCallerDao {
     suspend fun upsert(caller: CachedCallerEntity)
 }
 
+@Dao
+interface ChatHistoryDao {
+    @Query("SELECT * FROM chat_history ORDER BY id ASC")
+    fun observeAll(): Flow<List<ChatHistoryEntity>>
+
+    @Query("SELECT * FROM chat_history ORDER BY id DESC LIMIT :limit")
+    suspend fun getRecentDesc(limit: Int = 60): List<ChatHistoryEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(entry: ChatHistoryEntity): Long
+
+    @Query("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history ORDER BY id DESC LIMIT 120)")
+    suspend fun pruneOld()
+
+    @Query("DELETE FROM chat_history")
+    suspend fun clearAll()
+}
+
 @Database(
     entities = [
         FalkeAlarmEntity::class,
         CapturedNotificationEntity::class,
-        CachedCallerEntity::class
+        CachedCallerEntity::class,
+        ChatHistoryEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class FalkeDatabase : RoomDatabase() {
     abstract fun alarmDao(): FalkeAlarmDao
     abstract fun notificationDao(): CapturedNotificationDao
     abstract fun callerDao(): CachedCallerDao
+    abstract fun chatDao(): ChatHistoryDao
 
     companion object {
         @Volatile

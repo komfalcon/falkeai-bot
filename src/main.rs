@@ -4760,4 +4760,99 @@ mod tests {
         assert_eq!(resp["flags_dismissed"].as_u64(), Some(1));
         assert_eq!(db.count_flags().await.unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn test_falke_pronunciation_settings_whitelist_and_unpair() {
+        use crate::commands::generate_android_pair_code;
+        use crate::media::{
+            apply_falke_pronunciation, normalize_falke_transcript, prepare_spoken_script,
+        };
+        use crate::phone_api::{
+            handle_get_settings_endpoint, handle_pair_endpoint, handle_unpair_endpoint,
+            handle_update_settings_endpoint, sha256_hex,
+        };
+
+        // 1) "Fall-K" TTS pronunciation & Whisper STT normalization
+        assert_eq!(
+            apply_falke_pronunciation("Hey Falke from FalkeAI at Aurikrex!"),
+            "Hey Fall-Kay from Fall-Kay A I at Au-rik-rex!"
+        );
+        let spoken = prepare_spoken_script("**Falke** checked your **FalkeAI** inbox", 300);
+        assert!(spoken.contains("Fall-Kay"));
+        assert!(spoken.contains("Fall-Kay A I"));
+        assert!(!spoken.contains("Falke"));
+
+        assert_eq!(
+            normalize_falke_transcript("Hey Fall-K check my priority emails"),
+            "Hey Falke check my priority emails"
+        );
+        assert_eq!(
+            normalize_falke_transcript("Ask fall kay a i about tomorrow"),
+            "Ask FalkeAI about tomorrow"
+        );
+
+        // 2) Server settings whitelist & zero-secret enforcement
+        let db = Database::connect(":memory:", None).await.unwrap();
+        let cfg = test_cfg();
+        let now_ms = Utc::now().timestamp_millis();
+
+        let (st_get, initial) = handle_get_settings_endpoint(&db, &cfg).await;
+        assert_eq!(st_get, 200);
+        assert_eq!(initial["digest_hour_lagos"].as_u64(), Some(7));
+        assert_eq!(initial["reply_mode"].as_str(), Some("everyone"));
+        let dumped = initial.to_string();
+        assert!(!dumped.contains(&cfg.ai_key));
+        assert!(!dumped.contains(&cfg.ntfy_topic));
+        assert!(!dumped.contains(&cfg.phone_bridge_secret));
+
+        // Reject unknown / secret keys
+        let (st_bad, _) = handle_update_settings_endpoint(
+            &db,
+            &cfg,
+            &json!({"ai_key": "hacked", "digest_hour_lagos": 8}),
+        )
+        .await;
+        assert_eq!(st_bad, 400);
+
+        // Reject out-of-range hour
+        let (st_bad_hr, _) =
+            handle_update_settings_endpoint(&db, &cfg, &json!({"digest_hour_lagos": 29})).await;
+        assert_eq!(st_bad_hr, 400);
+
+        // Valid whitelisted update persists cleanly
+        let (st_ok, updated) = handle_update_settings_endpoint(
+            &db,
+            &cfg,
+            &json!({
+                "digest_hour_lagos": 8,
+                "reply_mode": "contacts",
+                "self_voice_mode": "on"
+            }),
+        )
+        .await;
+        assert_eq!(st_ok, 200);
+        assert_eq!(updated["digest_hour_lagos"].as_u64(), Some(8));
+        assert_eq!(updated["reply_mode"].as_str(), Some("contacts"));
+        assert_eq!(updated["self_voice_mode"].as_str(), Some("on"));
+
+        // 3) Remote Unpair revokes active Bearer token immediately
+        let (code, _) = generate_android_pair_code(&db, &cfg, now_ms).await.unwrap();
+        let (st_p, pair_res) = handle_pair_endpoint(
+            &db,
+            &cfg,
+            &json!({"code": code, "device_name": "Infinix Hot 10T"}),
+            now_ms,
+        )
+        .await;
+        assert_eq!(st_p, 200);
+        let tok = pair_res["device_token"].as_str().unwrap();
+        let tok_hash = sha256_hex(tok);
+        assert_eq!(db.list_active_phone_devices().await.unwrap().len(), 1);
+
+        let (st_unpair, unpair_res) =
+            handle_unpair_endpoint(&db, Some(&tok_hash), false).await;
+        assert_eq!(st_unpair, 200);
+        assert_eq!(unpair_res["revoked"].as_u64(), Some(1));
+        assert_eq!(db.list_active_phone_devices().await.unwrap().len(), 0);
+    }
 }

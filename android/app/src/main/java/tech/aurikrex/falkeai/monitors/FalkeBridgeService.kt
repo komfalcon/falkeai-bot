@@ -301,6 +301,10 @@ class FalkeBridgeService : Service() {
             runCatching { ContextCompat.startForegroundService(context, intent) }
         }
 
+        fun stop(context: Context) {
+            runCatching { context.stopService(Intent(context, FalkeBridgeService::class.java)) }
+        }
+
         fun scheduleHeartbeatPulse(context: Context, delayMs: Long = 10 * 60_000L) {
             val am = context.getSystemService(AlarmManager::class.java) ?: return
             val pi = PendingIntent.getBroadcast(

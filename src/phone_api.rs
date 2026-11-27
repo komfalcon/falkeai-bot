@@ -881,6 +881,154 @@ pub async fn handle_call_note_endpoint(
     )
 }
 
+/// `GET /api/v1/phone/settings` — returns strictly non-secret server preferences for the Settings screen.
+pub async fn handle_get_settings_endpoint(db: &Database, cfg: &Config) -> (u16, Value) {
+    let digest_hour = db
+        .get_setting("digest_hour_lagos")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&h| h <= 23)
+        .unwrap_or(cfg.digest_hour_lagos);
+    let reply_mode = db
+        .get_setting("reply_mode")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| matches!(s.as_str(), "everyone" | "contacts" | "off"))
+        .unwrap_or_else(|| cfg.default_reply_mode.clone());
+    let self_voice_mode = db
+        .get_setting("self_voice_mode")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| matches!(s.as_str(), "auto" | "on" | "off"))
+        .unwrap_or_else(|| "auto".to_string());
+    let active_devices = db
+        .list_active_phone_devices()
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let gmail_count = crate::gmail::resolve_gmail_accounts(db, cfg).await.len();
+    let ntfy_configured =
+        !crate::config::normalize_ntfy_topic(&cfg.ntfy_topic, &cfg.ntfy_url).is_empty();
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "digest_hour_lagos": digest_hour,
+            "reply_mode": reply_mode,
+            "self_voice_mode": self_voice_mode,
+            "ntfy_configured": ntfy_configured,
+            "gmail_count": gmail_count,
+            "paired_devices_count": active_devices
+        }),
+    )
+}
+
+/// `POST /api/v1/phone/settings` — updates whitelisted server settings ONLY (rejects unknown keys).
+pub async fn handle_update_settings_endpoint(
+    db: &Database,
+    cfg: &Config,
+    body: &Value,
+) -> (u16, Value) {
+    let Some(obj) = body.as_object() else {
+        return (400, json!({ "error": "Expected JSON object" }));
+    };
+    if obj.is_empty() {
+        return (400, json!({ "error": "Empty settings update" }));
+    }
+
+    const ALLOWED_KEYS: &[&str] = &["digest_hour_lagos", "reply_mode", "self_voice_mode"];
+    for k in obj.keys() {
+        if !ALLOWED_KEYS.contains(&k.as_str()) {
+            return (
+                400,
+                json!({ "error": format!("Disallowed or unknown setting key: {}", k) }),
+            );
+        }
+    }
+
+    if let Some(v) = obj.get("digest_hour_lagos") {
+        let Some(hour) = v.as_u64().filter(|&h| h <= 23) else {
+            return (
+                400,
+                json!({ "error": "digest_hour_lagos must be an integer 0..23" }),
+            );
+        };
+        if let Err(e) = db
+            .set_setting("digest_hour_lagos", &hour.to_string())
+            .await
+        {
+            return (
+                500,
+                json!({ "error": redact_secrets(&e.to_string(), cfg) }),
+            );
+        }
+    }
+
+    if let Some(v) = obj.get("reply_mode") {
+        let Some(mode) = v
+            .as_str()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|m| matches!(m.as_str(), "everyone" | "contacts" | "off"))
+        else {
+            return (
+                400,
+                json!({ "error": "reply_mode must be 'everyone', 'contacts', or 'off'" }),
+            );
+        };
+        if let Err(e) = db.set_setting("reply_mode", &mode).await {
+            return (
+                500,
+                json!({ "error": redact_secrets(&e.to_string(), cfg) }),
+            );
+        }
+    }
+
+    if let Some(v) = obj.get("self_voice_mode") {
+        let Some(mode) = v
+            .as_str()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|m| matches!(m.as_str(), "auto" | "on" | "off"))
+        else {
+            return (
+                400,
+                json!({ "error": "self_voice_mode must be 'auto', 'on', or 'off'" }),
+            );
+        };
+        if let Err(e) = db.set_setting("self_voice_mode", &mode).await {
+            return (
+                500,
+                json!({ "error": redact_secrets(&e.to_string(), cfg) }),
+            );
+        }
+    }
+
+    handle_get_settings_endpoint(db, cfg).await
+}
+
+/// `POST /api/v1/phone/unpair` — revokes this phone's token hash (or all paired phones if requested).
+pub async fn handle_unpair_endpoint(
+    db: &Database,
+    token_hash: Option<&str>,
+    revoke_all: bool,
+) -> (u16, Value) {
+    let res = if revoke_all {
+        db.revoke_all_phone_devices().await
+    } else if let Some(th) = token_hash.filter(|s| !s.is_empty()) {
+        db.revoke_phone_device_by_hash(th).await
+    } else {
+        Ok(0)
+    };
+    match res {
+        Ok(revoked) => (200, json!({ "ok": true, "revoked": revoked })),
+        Err(e) => (500, json!({ "error": e.to_string() })),
+    }
+}
+
 /// `POST /api/v1/phone/ack` — acknowledges urgent alerts from the Android full-screen alarm,
 /// and optionally sends an immediate WhatsApp reply straight from the lockscreen while syncing `ConversationState`!
 pub async fn handle_ack_endpoint(
@@ -1535,6 +1683,24 @@ async fn handle_client_connection(
             let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
             let (status, resp) =
                 handle_ack_endpoint(&state.db, Some(&state.wa_send_tx), &body, now_ms).await;
+            write_json_response(&mut stream, status, &resp).await;
+        }
+        ("GET", "/api/v1/phone/settings") => {
+            let (status, resp) = handle_get_settings_endpoint(&state.db, &state.cfg).await;
+            write_json_response(&mut stream, status, &resp).await;
+        }
+        ("POST", "/api/v1/phone/settings") => {
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
+            let (status, resp) =
+                handle_update_settings_endpoint(&state.db, &state.cfg, &body).await;
+            write_json_response(&mut stream, status, &resp).await;
+        }
+        ("POST", "/api/v1/phone/unpair") => {
+            let body: Value = serde_json::from_slice(&raw_body).unwrap_or(json!({}));
+            let revoke_all = body["revoke_all"].as_bool().unwrap_or(false);
+            let tok_hash = extract_bearer_token(&hdr.headers).map(|t| sha256_hex(&t));
+            let (status, resp) =
+                handle_unpair_endpoint(&state.db, tok_hash.as_deref(), revoke_all).await;
             write_json_response(&mut stream, status, &resp).await;
         }
         _ => {

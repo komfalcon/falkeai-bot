@@ -4079,6 +4079,32 @@ impl Database {
         }
     }
 
+    pub async fn revoke_phone_device_by_hash(&self, token_hash: &str) -> Result<u64> {
+        match &self.backend {
+            TursoBackend::Local(s) => {
+                let mut guard = s.lock().unwrap();
+                let mut cnt = 0u64;
+                for d in &mut guard.data.phone_devices {
+                    if d.active && d.token_hash == token_hash {
+                        d.active = false;
+                        cnt += 1;
+                    }
+                }
+                guard.flush()?;
+                Ok(cnt)
+            }
+            TursoBackend::Remote { .. } => {
+                let res = self
+                    .execute_remote(
+                        "UPDATE phone_devices SET active = 0 WHERE token_hash = ? AND active = 1",
+                        vec![SqlParam::from(token_hash)],
+                    )
+                    .await?;
+                Ok(res.rows_affected)
+            }
+        }
+    }
+
     pub async fn append_phone_event(
         &self,
         event_type: &str,

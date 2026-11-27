@@ -5,9 +5,10 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::config::{Config, GROQ_BASE_URL};
@@ -206,6 +207,44 @@ pub fn audio_filename_and_mime(mime: Option<&str>) -> (&'static str, &'static st
     }
 }
 
+pub const WHISPER_VOCAB_PROMPT: &str =
+    "Falke, FalkeAI, Fall-K, Aurikrex, SyncGrade, Lagos, Yoruba, Pidgin, Paystack";
+
+/// Normalizes common phonetic transcriptions of Falcon's pronunciation ("Fall-K", "Fall Kay", "Falky")
+/// back into canonical `"Falke"` / `"FalkeAI"` so wake/intent commands always match cleanly.
+pub fn normalize_falke_transcript(raw: &str) -> String {
+    static RE_AI: OnceLock<Regex> = OnceLock::new();
+    static RE_FALKE: OnceLock<Regex> = OnceLock::new();
+    let re_ai = RE_AI.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:fall[-\s]?k|fall[-\s]?kay|falky|folke)[-\s]*a[-\s]*i\b")
+            .expect("Valid FalkeAI STT regex")
+    });
+    let re_falke = RE_FALKE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:fall[-\s]?k|fall[-\s]?kay|falky|folke)\b")
+            .expect("Valid Falke STT regex")
+    });
+    let step1 = re_ai.replace_all(raw, "FalkeAI");
+    re_falke.replace_all(&step1, "Falke").into_owned()
+}
+
+/// Applies Falcon's exact spoken pronunciation ("Fall-K" / "Fall-Kay") before TTS synthesis.
+pub fn apply_falke_pronunciation(script: &str) -> String {
+    static RE_FALKE_AI: OnceLock<Regex> = OnceLock::new();
+    static RE_FALKE: OnceLock<Regex> = OnceLock::new();
+    static RE_AURIKREX: OnceLock<Regex> = OnceLock::new();
+    static RE_SYNCGRADE: OnceLock<Regex> = OnceLock::new();
+
+    let r_ai = RE_FALKE_AI.get_or_init(|| Regex::new(r"(?i)\bfalkeai\b").unwrap());
+    let r_f = RE_FALKE.get_or_init(|| Regex::new(r"(?i)\bfalke\b").unwrap());
+    let r_au = RE_AURIKREX.get_or_init(|| Regex::new(r"(?i)\baurikrex\b").unwrap());
+    let r_sg = RE_SYNCGRADE.get_or_init(|| Regex::new(r"(?i)\bsyncgrade\b").unwrap());
+
+    let s1 = r_ai.replace_all(script, "Fall-Kay A I");
+    let s2 = r_f.replace_all(&s1, "Fall-Kay");
+    let s3 = r_au.replace_all(&s2, "Au-rik-rex");
+    r_sg.replace_all(&s3, "Sync Grade").into_owned()
+}
+
 /// Zero-dependency RFC 7578 `multipart/form-data` builder for Groq `/audio/transcriptions`.
 pub fn build_whisper_multipart(
     boundary: &str,
@@ -214,9 +253,10 @@ pub fn build_whisper_multipart(
     mime: &str,
     audio_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(audio_bytes.len() + 384);
+    let mut body = Vec::with_capacity(audio_bytes.len() + 512);
     let head = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{WHISPER_VOCAB_PROMPT}\r\n\
          --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n\
          --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
          Content-Type: {mime}\r\n\r\n"
@@ -288,7 +328,8 @@ pub async fn transcribe_audio_bytes(
                                 .map(|s| s.trim())
                                 .filter(|s| !s.is_empty())
                             {
-                                let clean: String = t.chars().take(1200).collect();
+                                let clean: String =
+                                    normalize_falke_transcript(t).chars().take(1200).collect();
                                 tracing::info!(
                                     "Transcribed voice note via groq#{} / {} ({} chars)",
                                     idx + 1,
@@ -353,7 +394,7 @@ pub async fn transcribe_audio_bytes(
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {
-                    return Ok(t.chars().take(1200).collect());
+                    return Ok(normalize_falke_transcript(t).chars().take(1200).collect());
                 }
             }
         } else {
@@ -395,7 +436,7 @@ pub async fn transcribe_audio_bytes(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("Empty Whisper transcript"))?;
-    Ok(text.chars().take(1200).collect())
+    Ok(normalize_falke_transcript(text).chars().take(1200).collect())
 }
 
 /// Describes a downloaded WhatsApp image/screenshot using Cloudflare Workers AI Vision
@@ -615,7 +656,7 @@ pub fn prepare_spoken_script(raw_text: &str, max_chars: usize) -> String {
         }
     }
 
-    let joined = tokens.join(" ");
+    let joined = apply_falke_pronunciation(&tokens.join(" "));
     let cap = max_chars.max(80);
     if joined.chars().count() <= cap {
         return joined;

@@ -6,6 +6,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -178,6 +180,69 @@ class FalkeApiClient(private val prefs: SecurePrefs) {
                 val req = authedBuilder("/api/v1/phone/ack").post(body).build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) error("Dismiss all flags HTTP ${resp.code}")
+                }
+            }
+        }
+
+    suspend fun fetchServerSettings(): Result<ServerSettingsDto> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val req = authedBuilder("/api/v1/phone/settings").get().build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) error("Settings HTTP ${resp.code}")
+                    json.decodeFromString<ServerSettingsDto>(raw)
+                }
+            }
+        }
+
+    suspend fun updateServerSettings(
+        digestHourLagos: Int? = null,
+        replyMode: String? = null,
+        selfVoiceMode: String? = null
+    ): Result<ServerSettingsDto> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val payload = buildJsonObject {
+                    if (digestHourLagos != null) put("digest_hour_lagos", digestHourLagos)
+                    if (replyMode != null) put("reply_mode", replyMode)
+                    if (selfVoiceMode != null) put("self_voice_mode", selfVoiceMode)
+                }.toString()
+                val req = authedBuilder("/api/v1/phone/settings")
+                    .post(payload.toRequestBody(mediaJson))
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) error("Update settings HTTP ${resp.code}: $raw")
+                    json.decodeFromString<ServerSettingsDto>(raw)
+                }
+            }
+        }
+
+    suspend fun unpairThisDevice(revokeAll: Boolean = false): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                if (prefs.isPaired()) {
+                    val payload = buildJsonObject { put("revoke_all", revokeAll) }.toString()
+                    val req = authedBuilder("/api/v1/phone/unpair")
+                        .post(payload.toRequestBody(mediaJson))
+                        .build()
+                    runCatching {
+                        httpClient.newCall(req).execute().close()
+                    }
+                }
+                prefs.clearPairing()
+                markSseDisconnected()
+            }
+        }
+
+    suspend fun checkServerHealth(urlOverride: String? = null): Result<Boolean> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val target = normalizeHttpsUrl(urlOverride?.takeIf { it.isNotBlank() } ?: prefs.serverUrl)
+                val req = Request.Builder().url("$target/health").get().build()
+                httpClient.newCall(req).execute().use { resp ->
+                    resp.isSuccessful && resp.body?.string().orEmpty().contains("ok")
                 }
             }
         }
